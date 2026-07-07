@@ -19,3 +19,5 @@ Number,Artist,Title,Year,Parent Genre,Tags,Art URL,Notes
 18,Wilco,Yankee Hotel Foxtrot,2001,Folk,"alt-country, moody",https://picsum.photos/seed/wilco/500,"The one the label rejected."
 19,   ,   ,   ,   ,   ,   ,   ,
 20,A Really Extraordinarily Long Band Name That Keeps Going,An Even Longer Album Title To Test How The Wrapping Behaves On A Generated Placeholder Cover,2019,Experimental,"noise, long, weird",,Testing text wrapping and truncation on both card and placeholder.
+21-22,Billy Joel,Greatest Hits Volume I & Volume II,1985,Pop,"compilation, essential",,"Two-disc set — occupies slots 21 and 22 in the book. Tests a contiguous range."
+24, 26,Various Artists,The Complete Stax-Volt Singles,1991,Soul,"box set, compilation",,"Non-contiguous slots (24 and 26) — tests the comma-list label."

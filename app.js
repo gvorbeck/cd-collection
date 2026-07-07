@@ -109,6 +109,54 @@ function col(row, key) {
   return clean(row[CONFIG.COLUMNS[key]]);
 }
 
+/**
+ * Expand a catalog-Number cell into its individual slot numbers.
+ * Accepts:
+ *   ""         → []                 (blank / uncataloged)
+ *   "42"       → [42]               (single disc)
+ *   "42-43"    → [42, 43]           (range, hyphen or en/em dash)
+ *   "42, 43"   → [42, 43]           (explicit list)
+ *   "42-44, 50"→ [42, 43, 44, 50]   (mixed)
+ * Non-numeric junk is ignored; a descending or backwards range ("43-42") is
+ * normalized to ascending. Deduped and sorted so downstream code is simple.
+ */
+function parseNumbers(raw) {
+  if (!raw) return [];
+  const out = new Set();
+  // Split on commas first, then interpret each piece as a single or a range.
+  for (const piece of raw.split(',')) {
+    const part = piece.trim();
+    if (!part) continue;
+    // Range: two integers separated by a hyphen or dash. Anchored so stray
+    // dashes inside other text don't accidentally form a range.
+    const range = part.match(/^(\d+)\s*[-–—]\s*(\d+)$/);
+    if (range) {
+      let a = parseInt(range[1], 10);
+      let b = parseInt(range[2], 10);
+      if (a > b) [a, b] = [b, a];
+      // Guard against a pathological huge range from a typo.
+      if (b - a > 999) { out.add(a); out.add(b); continue; }
+      for (let n = a; n <= b; n++) out.add(n);
+      continue;
+    }
+    const single = part.match(/\d+/);
+    if (single) out.add(parseInt(single[0], 10));
+  }
+  return [...out].sort((x, y) => x - y);
+}
+
+// Build the display label for a set of slot numbers:
+//   [] → ""   [42] → "42"   [42,43] → "42–43"   [42,43,50] → "42, 43, 50"
+// A contiguous run collapses to a "first–last" range with an en-dash;
+// anything with gaps is shown as a comma list so it's not misleading.
+function formatNumbers(numbers) {
+  if (numbers.length === 0) return '';
+  if (numbers.length === 1) return String(numbers[0]);
+  const contiguous = numbers.every((n, i) => i === 0 || n === numbers[i - 1] + 1);
+  if (contiguous) return `${numbers[0]}–${numbers[numbers.length - 1]}`;
+  return numbers.join(', ');
+}
+
 // Escape text destined for innerHTML. We mostly use textContent, but a few
 // spots build markup — keep them safe.
 function escapeHtml(str) {
@@ -183,6 +231,12 @@ function normalizeRows(rows) {
     const art    = col(row, 'art');
     const notes  = col(row, 'notes');
 
+    // A single release can span several catalog slots in the book (e.g. a
+    // 2-disc greatest-hits set). The Number cell accepts a range ("42-43") or
+    // a comma list ("42, 43"); parseNumbers expands either into the actual
+    // slot numbers so one card can represent the whole physical release.
+    const numbers = parseNumbers(number);
+
     // Tags: comma-separated inside one cell. Split, trim, drop blanks.
     const tags = col(row, 'tags')
       .split(',')
@@ -191,7 +245,10 @@ function normalizeRows(rows) {
 
     const disc = {
       id: `disc-${index}`,
-      number,
+      number,                        // raw cell value, kept for reference
+      numbers,                       // expanded slot numbers, e.g. [42, 43]
+      numberLabel: formatNumbers(numbers), // display string: "42" or "42–43"
+      discCount: numbers.length || 1,      // how many book slots this occupies
       artist,
       title,
       year,
@@ -209,8 +266,10 @@ function normalizeRows(rows) {
 
     // Precompute one lowercased blob of every searchable field so the search
     // box can match across all columns (artist, title, year, genre, tags,
-    // notes, number) instead of just artist + title.
-    disc.searchText = [number, artist, title, year, genre, tags.join(' '), notes]
+    // notes, number) instead of just artist + title. Include the expanded slot
+    // numbers so a search for any single number in a range (e.g. "43" within
+    // "42-45") still matches.
+    disc.searchText = [number, numbers.join(' '), artist, title, year, genre, tags.join(' '), notes]
       .join(' ')
       .toLowerCase();
 
@@ -500,12 +559,12 @@ function generatePlaceholderCover(disc) {
   ctx.globalAlpha = 1;
 
   // 3. Catalog number as a small mark, top-left inside the frame.
-  if (disc.number) {
+  if (disc.numberLabel) {
     ctx.fillStyle = textColor;
     ctx.font = '700 20px "Space Mono", monospace';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    ctx.fillText(`#${disc.number}`, 34, 34);
+    ctx.fillText(`#${disc.numberLabel}`, 34, 34);
   }
 
   // 4. Title, bold and centered, wrapped to fit.
@@ -716,11 +775,12 @@ function buildCard(disc, index) {
   setCoverImage(img, disc, card);
   coverWrap.appendChild(img);
 
-  // Catalog number as an accession tag (omit entirely if blank).
-  if (disc.number) {
+  // Catalog number as an accession tag (omit entirely if blank). A multi-disc
+  // release shows its slot range, e.g. "#42–43".
+  if (disc.numberLabel) {
     const num = document.createElement('span');
     num.className = 'card-number';
-    num.textContent = `#${disc.number}`;
+    num.textContent = `#${disc.numberLabel}`;
     coverWrap.appendChild(num);
   }
 
@@ -852,7 +912,10 @@ async function resolveAndSwap(img, disc, card) {
 
 // Open the detail dialog for a disc.
 function openDetail(disc) {
-  dom.detailNumber.textContent = disc.number ? `Catalog #${disc.number}` : 'Uncataloged';
+  // Catalog line: "#42–43 (2 discs)" for a multi-disc set, "#7" for a single.
+  dom.detailNumber.textContent = disc.numberLabel
+    ? `Catalog #${disc.numberLabel}${disc.discCount > 1 ? ` (${disc.discCount} discs)` : ''}`
+    : 'Uncataloged';
   dom.detailTitle.textContent = disc.title;
   dom.detailArtist.textContent = disc.artist;
 
@@ -967,9 +1030,9 @@ function sortDiscs(discs) {
 
   switch (state.sort) {
     case 'number':
-      // Catalog numbers are usually numeric but may be blank or non-numeric;
-      // sort numerically when possible, push blanks to the end.
-      out.sort((a, b) => numOrInf(a.number) - numOrInf(b.number) || byStr(a.artist, b.artist));
+      // Sort by the first slot number a release occupies, so a multi-disc set
+      // sits where it starts on the shelf. Blank/uncataloged entries sort last.
+      out.sort((a, b) => firstNumberOrInf(a) - firstNumberOrInf(b) || byStr(a.artist, b.artist));
       break;
     case 'artist':
       out.sort((a, b) => byStr(a.artist, b.artist) || byStr(a.title, b.title));
@@ -991,10 +1054,9 @@ function sortDiscs(discs) {
   return out;
 }
 
-// Parse a catalog number to a sortable number; blank/non-numeric sorts last.
-function numOrInf(value) {
-  const n = parseInt(value, 10);
-  return Number.isNaN(n) ? Infinity : n;
+// First slot number of a disc for sorting; uncataloged entries sort last.
+function firstNumberOrInf(disc) {
+  return disc.numbers.length ? disc.numbers[0] : Infinity;
 }
 
 // Parse a disc's year to an int; `blankTo` decides where a missing year lands
