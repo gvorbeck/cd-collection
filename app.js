@@ -68,6 +68,30 @@ const CONFIG = {
   // bundled sample.csv instead of the live sheet, so layouts can be built out
   // with a full spread of dummy discs. Production (no query param) is untouched.
   SAMPLE_URL: 'sample.csv',
+
+  // Automatic cover-art lookup via MusicBrainz + the Cover Art Archive.
+  // Only used for discs with a BLANK Art URL — an explicit Art URL in the sheet
+  // always wins. Lookups fire lazily (only when a card scrolls on-screen) and
+  // are cached in localStorage, so we stay well under MusicBrainz's ~1 req/sec
+  // limit and never look a disc up more than once per browser.
+  MUSICBRAINZ: {
+    // MusicBrainz asks every client to identify itself with a descriptive
+    // User-Agent (app name/version + contact). Sent via a query param since
+    // browsers can't set User-Agent on fetch; MB reads either.
+    APP_IDENTITY: 'CDCollection/1.0 ( https://github.com/gvorbeck/cd-collection )',
+    // Release-group text search endpoint.
+    SEARCH_URL: 'https://musicbrainz.org/ws/2/release-group',
+    // Cover Art Archive front-image endpoint (CORS-enabled + canvas-readable).
+    // {mbid} is a release-group id; size is one of 250 / 500 / 1200.
+    CAA_URL: 'https://coverartarchive.org/release-group',
+    CAA_SIZE: 500,
+    // Minimum gap between MusicBrainz network calls (ms). MB's rule is 1/sec;
+    // 1100ms leaves a little headroom.
+    THROTTLE_MS: 1100,
+    // localStorage key + schema version. Bump the version to invalidate the
+    // whole cache if the lookup logic changes.
+    CACHE_KEY: 'cdc:art-cache:v1',
+  },
 };
 
 
@@ -291,6 +315,152 @@ function sampleDominantColor(img) {
 function rgbToHex(r, g, b) {
   const h = (n) => n.toString(16).padStart(2, '0');
   return `#${h(r)}${h(g)}${h(b)}`;
+}
+
+
+/* ============================================================
+   4b. Cover-art lookup: MusicBrainz → Cover Art Archive
+   ============================================================
+   For discs with no Art URL, find a cover automatically:
+     1. Ask MusicBrainz for the best-matching release group (artist + title).
+     2. Fetch that group's front image from the Cover Art Archive.
+   Results (hits AND misses) are cached in localStorage, and every network
+   lookup goes through a ~1/sec throttle to respect MusicBrainz's rate limit.
+   Lookups are triggered lazily by an IntersectionObserver (see rendering), so
+   only covers you actually scroll to are ever requested.
+*/
+
+// --- localStorage cache -------------------------------------------------
+// Maps a normalized "artist|title" key → a CAA image URL, or the MISS
+// sentinel when a prior lookup found nothing (so we don't re-query known
+// misses on every visit). Loaded once; written through on each update.
+const ART_MISS = ' miss'; // sentinel that can't collide with a real URL
+let artCache = loadArtCache();
+
+function loadArtCache() {
+  try {
+    const raw = localStorage.getItem(CONFIG.MUSICBRAINZ.CACHE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    // localStorage disabled/full or bad JSON — degrade to an in-memory cache.
+    return {};
+  }
+}
+
+function persistArtCache() {
+  try {
+    localStorage.setItem(CONFIG.MUSICBRAINZ.CACHE_KEY, JSON.stringify(artCache));
+  } catch (err) {
+    // Out of quota or unavailable — keep going with the in-memory copy.
+  }
+}
+
+// Stable cache key for a disc. Lowercased + whitespace-collapsed so trivial
+// formatting differences don't cause misses.
+function artCacheKey(disc) {
+  const norm = (s) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  return `${norm(disc.artist)}|${norm(disc.title)}`;
+}
+
+// --- throttle -----------------------------------------------------------
+// Serialize MusicBrainz network calls with a minimum gap between them. Cache
+// hits never enter this queue, so browsing cached discs stays instant.
+let mbChain = Promise.resolve();
+let mbLastCall = 0;
+
+function throttledMbFetch(url) {
+  const run = async () => {
+    const gap = CONFIG.MUSICBRAINZ.THROTTLE_MS - (nowMs() - mbLastCall);
+    if (gap > 0) await delay(gap);
+    mbLastCall = nowMs();
+    return fetch(url, { headers: { Accept: 'application/json' } });
+  };
+  // Chain so calls run one-at-a-time; a failure in one shouldn't break the
+  // chain for the next, so swallow errors on the chaining link only.
+  const result = mbChain.then(run, run);
+  mbChain = result.then(() => {}, () => {});
+  return result;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nowMs() {
+  return (typeof performance !== 'undefined' ? performance.now() : Date.now());
+}
+
+// --- resolution ---------------------------------------------------------
+/**
+ * Resolve a cover-art image URL for a disc that has no Art URL of its own.
+ * Returns a Promise<string|null> — a CAA image URL, or null if none was found.
+ * Cache-first; a real network lookup only happens on a cache miss.
+ */
+async function resolveCoverArt(disc) {
+  const key = artCacheKey(disc);
+
+  // Cached outcome (URL or known-miss) → no network at all.
+  if (Object.prototype.hasOwnProperty.call(artCache, key)) {
+    const cached = artCache[key];
+    return cached === ART_MISS ? null : cached;
+  }
+
+  // In-flight de-dupe: if this disc is already resolving (e.g. its card and the
+  // detail view both asked), reuse the same promise.
+  if (disc._artPromise) return disc._artPromise;
+
+  disc._artPromise = (async () => {
+    let url = null;
+    try {
+      const mbid = await findReleaseGroupMbid(disc);
+      if (mbid) {
+        url = `${CONFIG.MUSICBRAINZ.CAA_URL}/${mbid}/front-${CONFIG.MUSICBRAINZ.CAA_SIZE}`;
+      }
+    } catch (err) {
+      // Network/parse failure: treat as a miss for now, but DON'T cache it as a
+      // permanent miss — a transient failure shouldn't poison the disc forever.
+      disc._artPromise = null;
+      return null;
+    }
+    // Cache the settled outcome (real URL, or a permanent miss sentinel).
+    artCache[key] = url || ART_MISS;
+    persistArtCache();
+    return url;
+  })();
+
+  return disc._artPromise;
+}
+
+/**
+ * Query MusicBrainz for the release group that best matches this disc and
+ * return its MBID, or null. We search by artist + release title and take the
+ * top-scored result; MusicBrainz sorts by relevance.
+ */
+async function findReleaseGroupMbid(disc) {
+  // Lucene-style query: quote the values and escape embedded quotes.
+  const q = `artist:"${escapeLucene(disc.artist)}" AND releasegroup:"${escapeLucene(disc.title)}"`;
+  const params = new URLSearchParams({
+    query: q,
+    fmt: 'json',
+    limit: '3',
+    // Identify the app per MusicBrainz etiquette (can't set User-Agent header
+    // from a browser; the app= param is the sanctioned alternative).
+    app: CONFIG.MUSICBRAINZ.APP_IDENTITY,
+  });
+  const url = `${CONFIG.MUSICBRAINZ.SEARCH_URL}?${params.toString()}`;
+
+  const res = await throttledMbFetch(url);
+  if (!res.ok) throw new Error(`MusicBrainz ${res.status}`);
+  const data = await res.json();
+
+  const groups = data['release-groups'] || [];
+  if (groups.length === 0) return null;
+  return groups[0].id || null;
+}
+
+// Escape characters that are special to MusicBrainz's Lucene query syntax.
+function escapeLucene(str) {
+  return str.replace(/[+\-&|!(){}\[\]^"~*?:\\/]/g, '\\$&');
 }
 
 
@@ -594,27 +764,41 @@ function buildCard(disc, index) {
  */
 function setCoverImage(img, disc, card) {
   if (disc.art) {
-    img.crossOrigin = 'anonymous'; // so the canvas stays readable for sampling
-    img.src = disc.art;
-
-    img.addEventListener('load', () => {
-      // Skip if this load is the placeholder swapped in after an error (the
-      // error handler drops crossOrigin), or if we already have a sampled color
-      // cached from a previous render — re-sampling would just repeat the work.
-      if (!img.crossOrigin || disc._sampled) return;
-      const color = sampleDominantColor(img) || CONFIG.NEUTRAL_SHADOW;
-      disc.coverColor = color;
-      disc._sampled = true;
-      card.style.setProperty('--card-shadow', color);
-    });
-
-    img.addEventListener('error', () => {
-      // Broken/blocked image → fall back to a designed placeholder.
-      applyPlaceholder(img, disc, card);
-    });
+    // Explicit Art URL from the sheet always wins — load it directly.
+    loadRealCover(img, disc, card, disc.art);
   } else {
+    // No Art URL: show the generated placeholder now, then try to find real art
+    // via MusicBrainz — but only once this card scrolls on-screen (lazy), so we
+    // never look up covers the visitor doesn't actually see.
     applyPlaceholder(img, disc, card);
+    observeForArt(img, disc, card);
   }
+}
+
+/**
+ * Point an <img> at a real cover URL, CORS-enabled so its dominant color stays
+ * canvas-readable. On load, sample + tint the card shadow; on error, fall back
+ * to the generated placeholder.
+ */
+function loadRealCover(img, disc, card, url) {
+  img.crossOrigin = 'anonymous'; // so the canvas stays readable for sampling
+  img.src = url;
+
+  img.addEventListener('load', () => {
+    // Skip if this load is the placeholder swapped in after an error (the
+    // error handler drops crossOrigin), or if we already have a sampled color
+    // cached from a previous render — re-sampling would just repeat the work.
+    if (!img.crossOrigin || disc._sampled) return;
+    const color = sampleDominantColor(img) || CONFIG.NEUTRAL_SHADOW;
+    disc.coverColor = color;
+    disc._sampled = true;
+    card.style.setProperty('--card-shadow', color);
+  });
+
+  img.addEventListener('error', () => {
+    // Broken/blocked image → fall back to a designed placeholder.
+    applyPlaceholder(img, disc, card);
+  });
 }
 
 function applyPlaceholder(img, disc, card) {
@@ -623,6 +807,47 @@ function applyPlaceholder(img, disc, card) {
   const color = colorForArtist(disc.artist);
   disc.coverColor = color;
   card.style.setProperty('--card-shadow', color);
+}
+
+// --- Lazy, on-screen-only art resolution --------------------------------
+// One shared observer for the whole grid. When a placeholder card scrolls near
+// the viewport, resolve its real art (once) and swap it in if found. rootMargin
+// starts the lookup a bit before the card is fully visible.
+let artObserver = null;
+
+function getArtObserver() {
+  if (artObserver || typeof IntersectionObserver === 'undefined') return artObserver;
+  artObserver = new IntersectionObserver((entries, obs) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const card = entry.target;
+      obs.unobserve(card); // resolve at most once per card
+      const { disc, img } = card._artTarget || {};
+      if (disc && img) resolveAndSwap(img, disc, card);
+    }
+  }, { rootMargin: '200px' });
+  return artObserver;
+}
+
+function observeForArt(img, disc, card) {
+  // Stash what this card needs so the observer callback can act on it.
+  card._artTarget = { disc, img };
+  const obs = getArtObserver();
+  if (obs) {
+    obs.observe(card);
+  } else {
+    // No IntersectionObserver (very old browser): resolve immediately.
+    resolveAndSwap(img, disc, card);
+  }
+}
+
+// Resolve real art for a placeholder disc and, if found, swap it in. Always
+// loads the real cover when a URL exists — even after a re-render where the
+// disc was sampled on a prior card — so the freshly-built placeholder card
+// still gets the real art. loadRealCover's own guard skips re-sampling.
+async function resolveAndSwap(img, disc, card) {
+  const url = await resolveCoverArt(disc);
+  if (url) loadRealCover(img, disc, card, url);
 }
 
 // Open the detail dialog for a disc.
@@ -647,7 +872,18 @@ function openDetail(disc) {
     img.src = disc.art;
     img.addEventListener('error', () => { img.src = generatePlaceholderCover(disc); });
   } else {
+    // No sheet Art URL: show the placeholder now, then try MusicBrainz. Opening
+    // the detail is a deliberate on-screen action, so it's fair to resolve here;
+    // a cache hit swaps in instantly, a miss just leaves the placeholder.
     img.src = generatePlaceholderCover(disc);
+    resolveCoverArt(disc).then((url) => {
+      // Only swap if the dialog still shows this disc (guard against a fast
+      // close/reopen on another disc while the lookup was in flight).
+      if (url && dom.detail.open && dom.detailArtist.textContent === disc.artist
+          && dom.detailTitle.textContent === disc.title) {
+        img.src = url;
+      }
+    });
   }
   dom.detailCover.appendChild(img);
 

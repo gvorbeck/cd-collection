@@ -10,9 +10,15 @@ search, genre/tag filters, sorting, and a shuffle.
 - **Data** lives in a Google Sheet, published to the web as CSV. The page
   fetches and parses that CSV at load time with [PapaParse]; there is no
   server and no database.
-- **Covers** use the `Art URL` column when present. Discs without art get a
-  generated placeholder cover — a solid color hashed from the artist name,
-  the title in bold type, and the catalog number — drawn on a `<canvas>`.
+- **Covers** use the `Art URL` column when present (an explicit URL always
+  wins). For discs with a blank `Art URL`, the page looks up cover art
+  automatically via [MusicBrainz] → the [Cover Art Archive] — chosen for its
+  deep coverage of non-mainstream and obscure releases. Lookups happen only
+  when a card scrolls on-screen and are cached in `localStorage`, so usage
+  stays well under MusicBrainz's rate limit and no disc is looked up twice.
+  Anything still without art falls back to a generated placeholder cover — a
+  solid color hashed from the artist name, the title in bold type, and the
+  catalog number — drawn on a `<canvas>`.
 - **Card shadows** are tinted by the dominant color sampled from each cover,
   falling back to a neutral tint when a cover can't be read.
 
@@ -50,3 +56,5 @@ rows, a missing catalog number, very long names) so layout and fallbacks can
 be exercised without touching the real collection.
 
 [PapaParse]: https://www.papaparse.com/
+[MusicBrainz]: https://musicbrainz.org/
+[Cover Art Archive]: https://coverartarchive.org/
