@@ -770,6 +770,15 @@ function buildPillRail(rail, values, type) {
  * sampling for real art so the card shadow gets tinted once it loads.
  */
 function renderCards(discs) {
+  // Cancel any dwell timers armed on the cards we're about to discard, so a
+  // detached fly-by card can't fire a lookup after the grid re-renders.
+  dom.grid.querySelectorAll('.card').forEach((card) => {
+    if (card._artDwellTimer) {
+      clearTimeout(card._artDwellTimer);
+      card._artDwellTimer = null;
+    }
+  });
+
   dom.grid.innerHTML = '';
 
   const frag = document.createDocumentFragment();
@@ -892,20 +901,39 @@ function applyPlaceholder(img, disc, card) {
 }
 
 // --- Lazy, on-screen-only art resolution --------------------------------
-// One shared observer for the whole grid. When a placeholder card scrolls near
+// One shared observer for the whole grid. When a placeholder card lingers near
 // the viewport, resolve its real art (once) and swap it in if found. rootMargin
 // starts the lookup a bit before the card is fully visible.
+//
+// We do NOT fire on the intersecting edge directly: a fast scroll-past would
+// enter the margin and leave it a moment later, but the lookup — once queued —
+// runs unconditionally behind the ~1/sec MusicBrainz throttle, burning quota on
+// covers already off-screen and blocking cards you actually stopped on. Instead
+// each card must DWELL in the margin for ART_DWELL_MS before its lookup fires;
+// a fly-by enters and leaves before the timer elapses, so it never enqueues.
+const ART_DWELL_MS = 200;
 let artObserver = null;
 
 function getArtObserver() {
   if (artObserver || typeof IntersectionObserver === 'undefined') return artObserver;
   artObserver = new IntersectionObserver((entries, obs) => {
     for (const entry of entries) {
-      if (!entry.isIntersecting) continue;
       const card = entry.target;
-      obs.unobserve(card); // resolve at most once per card
-      const { disc, img } = card._artTarget || {};
-      if (disc && img) resolveAndSwap(img, disc, card);
+      if (entry.isIntersecting) {
+        // Entered the margin: arm a dwell timer. If the card is still here when
+        // it fires, resolve; a scroll-past clears it on the leave below.
+        if (card._artDwellTimer) continue; // already armed
+        card._artDwellTimer = setTimeout(() => {
+          card._artDwellTimer = null;
+          obs.unobserve(card); // resolve at most once per card
+          const { disc, img } = card._artTarget || {};
+          if (disc && img) resolveAndSwap(img, disc, card);
+        }, ART_DWELL_MS);
+      } else if (card._artDwellTimer) {
+        // Left the margin before dwelling long enough — cancel; nothing queued.
+        clearTimeout(card._artDwellTimer);
+        card._artDwellTimer = null;
+      }
     }
   }, { rootMargin: '200px' });
   return artObserver;
