@@ -46,7 +46,8 @@ below are what the site looks for.
 
 | Column         | Required? | What it does                                                                 |
 |----------------|-----------|------------------------------------------------------------------------------|
-| `Number`       | optional  | Catalog / shelf number. Blank shows as "Uncataloged." See multi-disc below.  |
+| `Book`         | optional  | Which physical book/binder the disc is in (a number: 1, 2, 3…). See below.    |
+| `Number`       | optional  | The page/slot **within that book**. Blank + no book shows as "Uncataloged." See multi-disc below. |
 | `Artist`       | optional  | Blank falls back to "Various Artists."                                        |
 | `Title`        | optional  | Blank falls back to "Self-Titled."                                            |
 | `Year`         | optional  | Blank simply shows nothing.                                                   |
@@ -58,6 +59,19 @@ below are what the site looks for.
 Every column is optional — a completely blank row is skipped, and any single
 missing cell just uses the fallback above. (To rename a column, update both the
 sheet header **and** the matching entry in `CONFIG.COLUMNS` in `app.js`.)
+
+### Books & shelf location
+
+`Number` is the page within a book, so on its own it isn't unique — page 3
+exists in every book. The `Book` column says which book, so together they pin
+the disc's physical spot.
+
+- The card tag and detail view show the combined location, e.g. **`B2 · #42`**
+  on the card and **`Book 2 · Catalog #42`** in the detail view.
+- The **Sort** dropdown has a **Book** option that puts discs in physical shelf
+  order — by book, then by page within the book.
+- Either field can be blank: `Book` blank just drops the `B#` prefix; both blank
+  reads as "Uncataloged" and the card shows no tag.
 
 ### Multi-disc releases
 

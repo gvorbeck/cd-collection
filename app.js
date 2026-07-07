@@ -23,7 +23,8 @@ const CONFIG = {
   // Column names as they appear in the sheet header row.
   // Change these if you rename a column; the rest of the code reads through here.
   COLUMNS: {
-    number: 'Number',
+    book:   'Book',        // which physical book/binder the disc lives in
+    number: 'Number',      // page/slot within that book
     artist: 'Artist',
     title:  'Title',
     year:   'Year',
@@ -157,6 +158,22 @@ function formatNumbers(numbers) {
   return numbers.join(', ');
 }
 
+/**
+ * Compact shelf-location label for the small card tag. The Number is the page
+ * within a book, so a book is needed to make the location unambiguous:
+ *   book "2" + numbers "42-43" → "B2 · #42–43"
+ *   book "2" only              → "B2"
+ *   number only (no book)      → "#42–43"
+ *   neither                    → "" (card shows no tag; detail says Uncataloged)
+ * "B2" is used on the tight card tag; the detail view spells out "Book 2".
+ */
+function formatLocation(disc) {
+  const parts = [];
+  if (disc.book) parts.push(`B${disc.book}`);
+  if (disc.numberLabel) parts.push(`#${disc.numberLabel}`);
+  return parts.join(' · ');
+}
+
 // Escape text destined for innerHTML. We mostly use textContent, but a few
 // spots build markup — keep them safe.
 function escapeHtml(str) {
@@ -227,6 +244,7 @@ function normalizeRows(rows) {
     const title  = col(row, 'title')  || CONFIG.FALLBACKS.title;
     const year   = col(row, 'year')   || CONFIG.FALLBACKS.year;
     const genre  = col(row, 'genre')  || CONFIG.FALLBACKS.genre;
+    const book   = col(row, 'book');   // which book/binder; may be blank
     const number = col(row, 'number'); // may be blank — card still renders
     const art    = col(row, 'art');
     const notes  = col(row, 'notes');
@@ -236,6 +254,8 @@ function normalizeRows(rows) {
     // a comma list ("42, 43"); parseNumbers expands either into the actual
     // slot numbers so one card can represent the whole physical release.
     const numbers = parseNumbers(number);
+    // Book number for sorting (books are numbered 1, 2, 3…). Blank sorts last.
+    const bookNum = book ? numOrInf(book) : Infinity;
 
     // Tags: comma-separated inside one cell. Split, trim, drop blanks.
     const tags = col(row, 'tags')
@@ -245,6 +265,8 @@ function normalizeRows(rows) {
 
     const disc = {
       id: `disc-${index}`,
+      book,                          // raw book value, e.g. "2"
+      bookNum,                       // parsed for sorting; Infinity if blank
       number,                        // raw cell value, kept for reference
       numbers,                       // expanded slot numbers, e.g. [42, 43]
       numberLabel: formatNumbers(numbers), // display string: "42" or "42–43"
@@ -269,9 +291,12 @@ function normalizeRows(rows) {
     // notes, number) instead of just artist + title. Include the expanded slot
     // numbers so a search for any single number in a range (e.g. "43" within
     // "42-45") still matches.
-    disc.searchText = [number, numbers.join(' '), artist, title, year, genre, tags.join(' '), notes]
+    disc.searchText = [book, number, numbers.join(' '), artist, title, year, genre, tags.join(' '), notes]
       .join(' ')
       .toLowerCase();
+
+    // Precompute the shelf-location label ("Book 2 · #42–43") once.
+    disc.locationLabel = formatLocation(disc);
 
     discs.push(disc);
   });
@@ -775,12 +800,12 @@ function buildCard(disc, index) {
   setCoverImage(img, disc, card);
   coverWrap.appendChild(img);
 
-  // Catalog number as an accession tag (omit entirely if blank). A multi-disc
-  // release shows its slot range, e.g. "#42–43".
-  if (disc.numberLabel) {
+  // Shelf-location accession tag (omit entirely if blank). Shows book + slot,
+  // e.g. "B2 · #42–43"; a multi-disc release shows its slot range.
+  if (disc.locationLabel) {
     const num = document.createElement('span');
     num.className = 'card-number';
-    num.textContent = `#${disc.numberLabel}`;
+    num.textContent = disc.locationLabel;
     coverWrap.appendChild(num);
   }
 
@@ -912,10 +937,14 @@ async function resolveAndSwap(img, disc, card) {
 
 // Open the detail dialog for a disc.
 function openDetail(disc) {
-  // Catalog line: "#42–43 (2 discs)" for a multi-disc set, "#7" for a single.
-  dom.detailNumber.textContent = disc.numberLabel
-    ? `Catalog #${disc.numberLabel}${disc.discCount > 1 ? ` (${disc.discCount} discs)` : ''}`
-    : 'Uncataloged';
+  // Location line, spelled out: "Book 2 · Catalog #42–43 (2 discs)".
+  // Each part is optional; if there's neither book nor number it's uncataloged.
+  const locParts = [];
+  if (disc.book) locParts.push(`Book ${disc.book}`);
+  if (disc.numberLabel) {
+    locParts.push(`Catalog #${disc.numberLabel}${disc.discCount > 1 ? ` (${disc.discCount} discs)` : ''}`);
+  }
+  dom.detailNumber.textContent = locParts.length ? locParts.join(' · ') : 'Uncataloged';
   dom.detailTitle.textContent = disc.title;
   dom.detailArtist.textContent = disc.artist;
 
@@ -1019,6 +1048,7 @@ const state = {
  * switching modes (or the "Random" key) can't corrupt anything else.
  *   random     → the stable per-load _rand key (different every page load)
  *   number     → catalog number ascending, blanks last
+ *   book       → by book, then page within the book (physical shelf order)
  *   artist     → artist A–Z (locale-aware), then title as a tiebreaker
  *   title      → title A–Z
  *   year-desc  → newest first, blanks last
@@ -1033,6 +1063,14 @@ function sortDiscs(discs) {
       // Sort by the first slot number a release occupies, so a multi-disc set
       // sits where it starts on the shelf. Blank/uncataloged entries sort last.
       out.sort((a, b) => firstNumberOrInf(a) - firstNumberOrInf(b) || byStr(a.artist, b.artist));
+      break;
+    case 'book':
+      // Physical shelf order: by book, then by page within the book. Discs with
+      // no book sort last; ties fall back to the first page number then artist.
+      out.sort((a, b) =>
+        a.bookNum - b.bookNum
+        || firstNumberOrInf(a) - firstNumberOrInf(b)
+        || byStr(a.artist, b.artist));
       break;
     case 'artist':
       out.sort((a, b) => byStr(a.artist, b.artist) || byStr(a.title, b.title));
@@ -1057,6 +1095,13 @@ function sortDiscs(discs) {
 // First slot number of a disc for sorting; uncataloged entries sort last.
 function firstNumberOrInf(disc) {
   return disc.numbers.length ? disc.numbers[0] : Infinity;
+}
+
+// Parse a leading integer from a string; blank/non-numeric → Infinity so it
+// sorts last. Used for the Book number.
+function numOrInf(value) {
+  const n = parseInt(value, 10);
+  return Number.isNaN(n) ? Infinity : n;
 }
 
 // Parse a disc's year to an int; `blankTo` decides where a missing year lands
