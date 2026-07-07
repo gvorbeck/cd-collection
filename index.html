@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CD Collection</title>
+  <meta name="description" content="A browsable archive of my CD collection, shelved by catalog number." />
+
+  <!-- Retro-infographic type: chunky display, slab/mono for numbers, clean sans for body -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Space+Mono:wght@400;700&family=Archivo:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Paper grain overlay: an SVG turbulence filter painted faintly over everything.
+       aria-hidden because it is pure decoration. -->
+  <svg class="grain" aria-hidden="true" focusable="false">
+    <filter id="grain-filter">
+      <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="3" stitchTiles="stitch" />
+      <feColorMatrix type="saturate" values="0" />
+    </filter>
+    <rect width="100%" height="100%" filter="url(#grain-filter)" />
+  </svg>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="masthead">
+        <p class="eyebrow">Physical Media · Shelved by Number</p>
+        <div class="title-row">
+          <h1 class="site-title">CD Collection</h1>
+          <!-- Pure-CSS compact disc, drawn with gradients. Decorative. -->
+          <span class="cd-logo" aria-hidden="true"></span>
+        </div>
+      </div>
+
+      <!-- Small printed "data card" of stats. Populated by app.js. -->
+      <aside class="stats-card" aria-label="Collection statistics">
+        <div class="stats-total">
+          <span class="stats-figure" id="stat-total">—</span>
+          <span class="stats-label">discs on the shelf</span>
+        </div>
+        <ul class="stats-genres" id="stat-genres"><!-- per-genre counts injected here --></ul>
+      </aside>
+    </div>
+  </header>
+
+  <main class="site-main">
+    <!-- Controls: search + shuffle -->
+    <section class="controls" aria-label="Browse controls">
+      <div class="search-wrap">
+        <label class="search-label" for="search">Search the collection</label>
+        <input
+          type="search"
+          id="search"
+          class="search-input"
+          placeholder="Search artist, title, genre, tag, year…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <button type="button" id="shuffle" class="shuffle-btn">
+        <!-- Standard shuffle glyph as inline SVG so it centers cleanly -->
+        <svg class="shuffle-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"
+             fill="none" stroke="currentColor" stroke-width="2.4"
+             stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="16 3 21 3 21 8" />
+          <line x1="4" y1="20" x2="21" y2="3" />
+          <polyline points="21 16 21 21 16 21" />
+          <line x1="15" y1="15" x2="21" y2="21" />
+          <line x1="4" y1="4" x2="9" y2="9" />
+        </svg>
+        <span class="shuffle-text">Shuffle</span>
+      </button>
+    </section>
+
+    <!-- Filter pills. Two horizontally-scrolling rails: genres and tags. -->
+    <section class="filters" aria-label="Filter discs">
+      <div class="filter-group">
+        <h2 class="filter-heading">Genre</h2>
+        <div class="pill-rail" id="genre-pills" role="group" aria-label="Filter by genre">
+          <!-- genre pills injected here -->
+        </div>
+      </div>
+      <div class="filter-group">
+        <h2 class="filter-heading">Tags</h2>
+        <div class="pill-rail" id="tag-pills" role="group" aria-label="Filter by tag">
+          <!-- tag pills injected here -->
+        </div>
+      </div>
+    </section>
+
+    <!-- Polite live region: announces result counts and shuffle landings to screen readers. -->
+    <p class="sr-only" role="status" aria-live="polite" id="live-region"></p>
+
+    <!-- Visible result summary + active-filter readout (never relies on color alone). -->
+    <div class="results-bar">
+      <p class="results-count" id="results-count"></p>
+      <div class="results-tools">
+        <button type="button" class="clear-filters" id="clear-filters" hidden>Clear filters</button>
+        <!-- Sort order. Default "random" reshuffles on every page load so the
+             shelf never looks identical two visits running. -->
+        <div class="sort-wrap">
+          <label class="sort-label" for="sort">Sort</label>
+          <select class="sort-select" id="sort">
+            <option value="random" selected>Random</option>
+            <option value="number">Catalog #</option>
+            <option value="artist">Artist (A–Z)</option>
+            <option value="title">Title (A–Z)</option>
+            <option value="year-desc">Year (newest)</option>
+            <option value="year-asc">Year (oldest)</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- The main grid. A real list of discs. -->
+    <ul class="grid" id="grid" aria-label="Album covers"><!-- cards injected here --></ul>
+
+    <!-- Empty / loading / error states (visual only — announcements go through
+         the single #live-region above to avoid double-speaking to AT). -->
+    <div class="state-msg" id="state-msg">Loading the collection…</div>
+  </main>
+
+  <footer class="site-footer">
+    <p>An archive of physical discs. Data lives in a Google Sheet; this page just reads it.</p>
+  </footer>
+
+  <!-- Detail view. Native <dialog> gives focus trapping + Esc-to-close for free.
+       Named by the album title (populated by JS) via aria-labelledby. -->
+  <dialog class="detail" id="detail" aria-labelledby="detail-title">
+    <div class="detail-inner">
+      <button type="button" class="detail-close" id="detail-close" aria-label="Close details">✕</button>
+      <div class="detail-cover" id="detail-cover"><!-- cover injected --></div>
+      <div class="detail-body">
+        <p class="detail-number" id="detail-number"></p>
+        <h2 class="detail-title" id="detail-title"></h2>
+        <p class="detail-artist" id="detail-artist"></p>
+        <dl class="detail-meta" id="detail-meta"><!-- year / genre / etc injected --></dl>
+        <div class="detail-tags" id="detail-tags"><!-- tag chips injected --></div>
+        <div class="detail-notes" id="detail-notes"><!-- notes injected --></div>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- PapaParse: robust CSV parsing (handles commas inside quoted Tags cells).
+       Version-pinned + Subresource Integrity: if the CDN ever serves altered
+       bytes the browser refuses to run them (the app then shows its error
+       state via the catch in init). crossorigin is required for SRI here. -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"
+          integrity="sha384-D/t0ZMqQW31H3az8ktEiNb39wyKnS82iFY52QPACM+IjKW3jDUhyIgh2PApRqJZs"
+          crossorigin="anonymous"></script>
+  <script src="app.js"></script>
+</body>
+</html>

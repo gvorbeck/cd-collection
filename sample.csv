@@ -1,0 +1,21 @@
+Number,Artist,Title,Year,Parent Genre,Tags,Art URL,Notes
+1,Cake,Comfort Eagle,2001,Alternative,"sardonic, horns",https://picsum.photos/seed/cake/500,"Bought used at Amoeba. Skips on track 7."
+2,Miles Davis,Kind of Blue,1959,Jazz,"modal, essential, quiet storm",https://picsum.photos/seed/miles/500,
+3,The Ramones,,1976,Punk,"CBGB, fast",https://picsum.photos/seed/ramones/500,Self-titled debut — left the Title blank on purpose to test the fallback.
+4,,Now That's What I Call Music 47,2013,Pop,"compilation, radio",,"Various-artists comp; Artist left blank."
+5,Radiohead,OK Computer,1997,Alternative,"art rock, essential, moody",https://picsum.photos/seed/okc/500,
+6,J Dilla,Donuts,2006,Hip-Hop,"instrumental, sampled, essential",https://picsum.photos/seed/dilla/500,"Reissue. One of the greats."
+7,Home Burn,,,,"mixtape, burned",,A blank artless home-burned disc — number present but everything else sparse.
+8,Nina Simone,I Put a Spell on You,1965,Jazz,"soul, vocal",https://picsum.photos/seed/nina/500,
+9,Fugazi,Repeater,1990,Punk,"post-hardcore, DC",https://picsum.photos/seed/fugazi/500,
+10,Boards of Canada,Music Has the Right to Children,1998,Electronic,"IDM, hazy, essential",https://picsum.photos/seed/boc/500,"Warp Records."
+11,Bill Evans Trio,Sunday at the Village Vanguard,1961,Jazz,"live, piano, quiet storm",,"Live recording, Scott LaFaro on bass."
+12,Outkast,Aquemini,1998,Hip-Hop,"southern, essential",https://picsum.photos/seed/outkast/500,
+13,,,,,,,"Almost entirely blank row — should still render with all fallbacks."
+14,Sufjan Stevens,Illinois,2005,Folk,"orchestral, concept",https://picsum.photos/seed/sufjan/500,"Very long official title on the sleeve; using the short one here."
+15,The Clash,London Calling,1979,Punk,"essential, reggae, dub",https://picsum.photos/seed/clash/500,
+16,Aphex Twin,Selected Ambient Works 85-92,1992,Electronic,"ambient, IDM",https://picsum.photos/seed/aphex/500,
+17,Erykah Badu,Baduizm,1997,Hip-Hop,"neo-soul, vocal, quiet storm",https://picsum.photos/seed/badu/500,
+18,Wilco,Yankee Hotel Foxtrot,2001,Folk,"alt-country, moody",https://picsum.photos/seed/wilco/500,"The one the label rejected."
+19,   ,   ,   ,   ,   ,   ,   ,
+20,A Really Extraordinarily Long Band Name That Keeps Going,An Even Longer Album Title To Test How The Wrapping Behaves On A Generated Placeholder Cover,2019,Experimental,"noise, long, weird",,Testing text wrapping and truncation on both card and placeholder.
