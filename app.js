@@ -177,6 +177,14 @@ function formatLocation(disc, { verbose = false } = {}) {
   return parts.join(' · ');
 }
 
+// Leading article ("The", "A", "An") to ignore when alphabetizing — so
+// "The Beatles" files under B and "A Tribe Called Quest" under T, the way a
+// record shelf does. Case-insensitive; requires a following space so a name
+// like "Anthrax" or "Theory of a Deadman" isn't mangled.
+function sortKey(str) {
+  return str.replace(/^(the|a|an)\s+/i, '').trim();
+}
+
 // Escape text destined for innerHTML. We mostly use textContent, but a few
 // spots build markup — keep them safe.
 function escapeHtml(str) {
@@ -237,6 +245,7 @@ function loadCollection() {
       skipEmptyLines: 'greedy', // drop rows that are entirely blank
       complete: (results) => {
         try {
+          assertExpectedHeaders(results.meta && results.meta.fields);
           resolve(normalizeRows(results.data));
         } catch (err) {
           reject(err);
@@ -245,6 +254,25 @@ function loadCollection() {
       error: (err) => reject(err),
     });
   });
+}
+
+/**
+ * Fail loudly if the sheet's header row doesn't carry the columns we read by.
+ * Without this, a renamed/moved column just makes col() return '' everywhere,
+ * so every disc silently falls back (all "Various Artists", all "Self-Titled")
+ * and the page looks "loaded" but wrong. Artist and Title are a disc's identity;
+ * if neither header is present the sheet is misconfigured, so throw and let
+ * init()'s catch show the error state instead of a wall of fallbacks.
+ */
+function assertExpectedHeaders(fields) {
+  const headers = Array.isArray(fields) ? fields.map(clean) : [];
+  const has = (name) => headers.includes(name);
+  if (!has(CONFIG.COLUMNS.artist) && !has(CONFIG.COLUMNS.title)) {
+    throw new Error(
+      `Sheet is missing its expected columns (looked for "${CONFIG.COLUMNS.artist}" ` +
+      `and "${CONFIG.COLUMNS.title}"). Found: ${headers.length ? headers.join(', ') : '(none)'}.`
+    );
+  }
 }
 
 /** Turn raw CSV row objects into clean disc objects with fallbacks applied. */
@@ -289,6 +317,11 @@ function normalizeRows(rows) {
       discCount: numbers.length || 1,      // how many book slots this occupies
       artist,
       title,
+      // Alphabetization keys with any leading article stripped, so "The Beatles"
+      // files under B and "A Hard Day's Night" under H. Computed once here; the
+      // sort comparators read these instead of the display strings.
+      sortArtist: sortKey(artist),
+      sortTitle:  sortKey(title),
       year,
       genre,
       tags,
@@ -974,6 +1007,12 @@ function openDetail(disc) {
   const tint = blendWithPaper(hexToRgb(safeHex(disc.coverColor)), 0.16);
   dom.detail.style.setProperty('--detail-bg', tint);
 
+  // Tag the dialog with the disc it's showing, so an async art lookup that
+  // resolves after a fast close/reopen can tell whether it's still the right
+  // disc — ids are unique per row, unlike artist+title which can collide
+  // (duplicates, reissues, same-named "Greatest Hits", etc.).
+  dom.detail.dataset.discId = disc.id;
+
   dom.detailCover.innerHTML = '';
   const img = document.createElement('img');
   // Intrinsic 1:1 dimensions so the browser reserves a square box before the
@@ -990,10 +1029,9 @@ function openDetail(disc) {
     // a cache hit swaps in instantly, a miss just leaves the placeholder.
     img.src = generatePlaceholderCover(disc);
     resolveCoverArt(disc).then((url) => {
-      // Only swap if the dialog still shows this disc (guard against a fast
-      // close/reopen on another disc while the lookup was in flight).
-      if (url && dom.detail.open && dom.detailArtist.textContent === disc.artist
-          && dom.detailTitle.textContent === disc.title) {
+      // Only swap if the dialog still shows this exact disc (guard against a
+      // fast close/reopen on another disc while the lookup was in flight).
+      if (url && dom.detail.open && dom.detail.dataset.discId === disc.id) {
         img.src = url;
       }
     });
@@ -1073,7 +1111,7 @@ function sortDiscs(discs) {
     case 'number':
       // Sort by the first slot number a release occupies, so a multi-disc set
       // sits where it starts on the shelf. Blank/uncataloged entries sort last.
-      out.sort((a, b) => firstNumberOrInf(a) - firstNumberOrInf(b) || byStr(a.artist, b.artist));
+      out.sort((a, b) => firstNumberOrInf(a) - firstNumberOrInf(b) || byStr(a.sortArtist, b.sortArtist));
       break;
     case 'book':
       // Physical shelf order: by book, then by page within the book. Discs with
@@ -1081,19 +1119,19 @@ function sortDiscs(discs) {
       out.sort((a, b) =>
         a.bookNum - b.bookNum
         || firstNumberOrInf(a) - firstNumberOrInf(b)
-        || byStr(a.artist, b.artist));
+        || byStr(a.sortArtist, b.sortArtist));
       break;
     case 'artist':
-      out.sort((a, b) => byStr(a.artist, b.artist) || byStr(a.title, b.title));
+      out.sort((a, b) => byStr(a.sortArtist, b.sortArtist) || byStr(a.sortTitle, b.sortTitle));
       break;
     case 'title':
-      out.sort((a, b) => byStr(a.title, b.title) || byStr(a.artist, b.artist));
+      out.sort((a, b) => byStr(a.sortTitle, b.sortTitle) || byStr(a.sortArtist, b.sortArtist));
       break;
     case 'year-desc':
-      out.sort((a, b) => yearOr(b, -Infinity) - yearOr(a, -Infinity) || byStr(a.artist, b.artist));
+      out.sort((a, b) => yearOr(b, -Infinity) - yearOr(a, -Infinity) || byStr(a.sortArtist, b.sortArtist));
       break;
     case 'year-asc':
-      out.sort((a, b) => yearOr(a, Infinity) - yearOr(b, Infinity) || byStr(a.artist, b.artist));
+      out.sort((a, b) => yearOr(a, Infinity) - yearOr(b, Infinity) || byStr(a.sortArtist, b.sortArtist));
       break;
     case 'random':
     default:
