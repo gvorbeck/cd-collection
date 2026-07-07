@@ -159,18 +159,21 @@ function formatNumbers(numbers) {
 }
 
 /**
- * Compact shelf-location label for the small card tag. The Number is the page
- * within a book, so a book is needed to make the location unambiguous:
- *   book "2" + numbers "42-43" → "B2 · #42–43"
- *   book "2" only              → "B2"
- *   number only (no book)      → "#42–43"
- *   neither                    → "" (card shows no tag; detail says Uncataloged)
- * "B2" is used on the tight card tag; the detail view spells out "Book 2".
+ * Shelf-location label from a disc's book + slot numbers. The Number is the
+ * page within a book, so a book is needed to make the location unambiguous.
+ * Two verbosities share one assembly:
+ *   terse   (card tag): "B2 · #42–43"   "B2"   "#42–43"
+ *   verbose (detail):   "Book 2 · Catalog #42–43 (2 discs)"
+ * Either way, no book and no number → "" (card shows no tag; detail's caller
+ * substitutes "Uncataloged").
  */
-function formatLocation(disc) {
+function formatLocation(disc, { verbose = false } = {}) {
   const parts = [];
-  if (disc.book) parts.push(`B${disc.book}`);
-  if (disc.numberLabel) parts.push(`#${disc.numberLabel}`);
+  if (disc.book) parts.push(verbose ? `Book ${disc.book}` : `B${disc.book}`);
+  if (disc.numberLabel) {
+    const count = verbose && disc.discCount > 1 ? ` (${disc.discCount} discs)` : '';
+    parts.push(`${verbose ? 'Catalog #' : '#'}${disc.numberLabel}${count}`);
+  }
   return parts.join(' · ');
 }
 
@@ -189,6 +192,19 @@ function reducedMotion() {
 
 // Grab an element by id (short alias).
 const $ = (id) => document.getElementById(id);
+
+// Create an element with an optional class and text content in one call.
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+// True for a "#rrggbb" string (the only color form we store/blend).
+function isHex6(str) {
+  return /^#[0-9a-f]{6}$/i.test(str);
+}
 
 // Read a CSS custom property off :root (trimmed). Lets the stylesheet stay the
 // single source of truth for shared colors instead of duplicating hexes in JS.
@@ -739,10 +755,8 @@ function renderPills(discs) {
 function buildPillRail(rail, values, type) {
   rail.innerHTML = '';
   for (const value of values) {
-    const btn = document.createElement('button');
+    const btn = el('button', 'pill', value);
     btn.type = 'button';
-    btn.className = 'pill';
-    btn.textContent = value;
     btn.setAttribute('aria-pressed', 'false');
     btn.dataset.filterType = type;
     btn.dataset.filterValue = value;
@@ -803,34 +817,17 @@ function buildCard(disc, index) {
   // Shelf-location accession tag (omit entirely if blank). Shows book + slot,
   // e.g. "B2 · #42–43"; a multi-disc release shows its slot range.
   if (disc.locationLabel) {
-    const num = document.createElement('span');
-    num.className = 'card-number';
-    num.textContent = disc.locationLabel;
-    coverWrap.appendChild(num);
+    coverWrap.appendChild(el('span', 'card-number', disc.locationLabel));
   }
 
   card.appendChild(coverWrap);
 
   // Body
-  const body = document.createElement('div');
-  body.className = 'card-body';
-
-  const artist = document.createElement('span');
-  artist.className = 'card-artist';
-  artist.textContent = disc.artist;
-
-  const title = document.createElement('span');
-  title.className = 'card-title';
-  title.textContent = disc.title;
-
-  body.appendChild(artist);
-  body.appendChild(title);
-
+  const body = el('div', 'card-body');
+  body.appendChild(el('span', 'card-artist', disc.artist));
+  body.appendChild(el('span', 'card-title', disc.title));
   if (disc.year) {
-    const year = document.createElement('span');
-    year.className = 'card-year';
-    year.textContent = disc.year;
-    body.appendChild(year);
+    body.appendChild(el('span', 'card-year', disc.year));
   }
 
   card.appendChild(body);
@@ -938,13 +935,9 @@ async function resolveAndSwap(img, disc, card) {
 // Open the detail dialog for a disc.
 function openDetail(disc) {
   // Location line, spelled out: "Book 2 · Catalog #42–43 (2 discs)".
-  // Each part is optional; if there's neither book nor number it's uncataloged.
-  const locParts = [];
-  if (disc.book) locParts.push(`Book ${disc.book}`);
-  if (disc.numberLabel) {
-    locParts.push(`Catalog #${disc.numberLabel}${disc.discCount > 1 ? ` (${disc.discCount} discs)` : ''}`);
-  }
-  dom.detailNumber.textContent = locParts.length ? locParts.join(' · ') : 'Uncataloged';
+  // Blank (no book and no number) reads as uncataloged.
+  const loc = formatLocation(disc, { verbose: true });
+  dom.detailNumber.textContent = loc || 'Uncataloged';
   dom.detailTitle.textContent = disc.title;
   dom.detailArtist.textContent = disc.artist;
 
@@ -986,12 +979,7 @@ function openDetail(disc) {
 
   // Tags
   dom.detailTags.innerHTML = '';
-  disc.tags.forEach((t) => {
-    const chip = document.createElement('span');
-    chip.className = 'detail-tag';
-    chip.textContent = t;
-    dom.detailTags.appendChild(chip);
-  });
+  disc.tags.forEach((t) => dom.detailTags.appendChild(el('span', 'detail-tag', t)));
 
   // Notes (hidden when empty via CSS :empty)
   dom.detailNotes.textContent = disc.notes || '';
@@ -1006,17 +994,12 @@ function openDetail(disc) {
 }
 
 function addMetaRow(label, value) {
-  const dt = document.createElement('dt');
-  dt.textContent = label;
-  const dd = document.createElement('dd');
-  dd.textContent = value;
-  dom.detailMeta.appendChild(dt);
-  dom.detailMeta.appendChild(dd);
+  dom.detailMeta.append(el('dt', null, label), el('dd', null, value));
 }
 
 // Guard against a non-hex color slipping into hexToRgb.
 function safeHex(hex) {
-  return /^#[0-9a-f]{6}$/i.test(hex) ? hex : CONFIG.NEUTRAL_SHADOW;
+  return isHex6(hex) ? hex : CONFIG.NEUTRAL_SHADOW;
 }
 
 // Mix a color with the paper base at `amount` (0–1), returning an opaque
@@ -1333,10 +1316,10 @@ function wireEvents() {
 // leaves the baked-in fallback in place rather than corrupting a color.
 function hydrateThemeConstants() {
   const shadow = cssVar('--shadow-neutral');
-  if (/^#[0-9a-f]{6}$/i.test(shadow)) CONFIG.NEUTRAL_SHADOW = shadow;
+  if (isHex6(shadow)) CONFIG.NEUTRAL_SHADOW = shadow;
 
   const paper = cssVar('--paper');
-  if (/^#[0-9a-f]{6}$/i.test(paper)) PAPER_RGB = hexToRgb(paper);
+  if (isHex6(paper)) PAPER_RGB = hexToRgb(paper);
 }
 
 async function init() {
