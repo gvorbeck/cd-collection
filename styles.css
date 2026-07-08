@@ -106,6 +106,7 @@ body {
   color: var(--ink-soft);
   margin: 0 0 0.35rem;
 }
+.eyebrow a { color: var(--brick); }
 .site-title {
   font-family: var(--font-display);
   font-size: clamp(2.6rem, 12vw, 5rem);
@@ -204,9 +205,32 @@ body {
   border-bottom: 2px dotted var(--paper-deep);
   transform: translateY(-0.15em);
 }
+/* Genres past the top N are hidden until the toggle expands the list. */
+.stats-genres li.is-collapsed { display: none; }
+.stats-genres.is-expanded li.is-collapsed { display: flex; }
+
+.stats-genres-toggle-row { justify-content: flex-start; }
+.stats-genres-toggle {
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 0;
+  margin-top: 0.15rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  cursor: pointer;
+  border-bottom: 1px dashed currentColor;
+}
+.stats-genres-toggle:hover { color: var(--ink); }
 
 @media (min-width: 720px) {
-  .header-inner { flex-direction: row; align-items: flex-end; gap: 2rem; }
+  /* Top-align so expanding the stats card grows it downward without
+     shoving the title down (bottom-align would re-anchor both children
+     to the taller row's new bottom edge). */
+  .header-inner { flex-direction: row; align-items: flex-start; gap: 2rem; }
   .masthead { flex: 0 1 auto; }
   /* stats card grows to fill the room left beside the title */
   .stats-card { flex: 1 1 auto; }

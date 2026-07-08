@@ -70,6 +70,10 @@ const CONFIG = {
   // with a full spread of dummy discs. Production (no query param) is untouched.
   SAMPLE_URL: 'sample.csv',
 
+  // How many genres the stats card shows before collapsing the rest behind a
+  // "show more" toggle. The top N (by count) stay visible.
+  STATS_GENRES_VISIBLE: 3,
+
   // Automatic cover-art lookup via MusicBrainz + the Cover Art Archive.
   // Only used for discs with a BLANK Art URL — an explicit Art URL in the sheet
   // always wins. Lookups fire lazily (only when a card scrolls on-screen) and
@@ -757,16 +761,46 @@ function renderStats(discs) {
   for (const d of discs) counts[d.genre] = (counts[d.genre] || 0) + 1;
 
   const ordered = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const visible = CONFIG.STATS_GENRES_VISIBLE;
 
   dom.statGenres.innerHTML = '';
-  for (const [genre, count] of ordered) {
+  ordered.forEach(([genre, count], i) => {
     const li = document.createElement('li');
+    // Genres past the top N start hidden; the toggle button reveals them.
+    if (i >= visible) li.classList.add('is-collapsed');
     li.innerHTML =
       `<span class="g-name">${escapeHtml(genre)}</span>` +
       `<span class="g-dots" aria-hidden="true"></span>` +
       `<span class="g-count">${count}</span>`;
     dom.statGenres.appendChild(li);
-  }
+  });
+
+  // Only offer the toggle when there's something hidden to reveal.
+  const hidden = ordered.length - visible;
+  if (hidden > 0) dom.statGenres.appendChild(makeGenresToggle(hidden));
+}
+
+// Build the "show more / show less" button that expands the collapsed genres.
+// Toggling flips a class on the list and rewrites the button's label + ARIA
+// state; the actual hiding is done in CSS via `.stats-genres li.is-collapsed`.
+function makeGenresToggle(hiddenCount) {
+  const btn = el('button', 'stats-genres-toggle');
+  btn.type = 'button';
+  btn.setAttribute('aria-expanded', 'false');
+
+  const label = (expanded) =>
+    expanded ? 'Show fewer' : `Show ${hiddenCount} more`;
+  btn.textContent = label(false);
+
+  btn.addEventListener('click', () => {
+    const expanded = dom.statGenres.classList.toggle('is-expanded');
+    btn.setAttribute('aria-expanded', String(expanded));
+    btn.textContent = label(expanded);
+  });
+
+  const li = el('li', 'stats-genres-toggle-row');
+  li.appendChild(btn);
+  return li;
 }
 
 // Build the filter pill rails for genres and tags.
