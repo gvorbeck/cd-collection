@@ -1064,9 +1064,11 @@ function openDetail(disc) {
     img.addEventListener('error', () => { img.src = generatePlaceholderCover(disc); });
   } else if (disc._resolvedArt) {
     // A card (or a prior detail open) already looked this disc up and found real
-    // art — reuse that URL directly instead of running another lookup.
-    img.src = disc._resolvedArt;
-    img.addEventListener('error', () => { img.src = generatePlaceholderCover(disc); });
+    // art — reuse that URL directly instead of running another lookup. Show the
+    // placeholder first so there's no blank box while the remote image loads,
+    // then swap to the real art once it has actually decoded.
+    img.src = generatePlaceholderCover(disc);
+    swapWhenLoaded(img, disc._resolvedArt, disc.id);
   } else {
     // No sheet Art URL and none resolved yet. Show the placeholder, then resolve.
     // resolveCoverArt is cache- and in-flight-aware: a URL already in the cache
@@ -1076,13 +1078,12 @@ function openDetail(disc) {
     // fires a duplicate request — it joins the existing one.
     img.src = generatePlaceholderCover(disc);
     resolveCoverArt(disc).then((url) => {
+      if (!url) return;
       // Remember a found URL on the disc so future opens skip the lookup path.
-      if (url) disc._resolvedArt = url;
-      // Only swap if the dialog still shows this exact disc (guard against a
-      // fast close/reopen on another disc while the lookup was in flight).
-      if (url && dom.detail.open && dom.detail.dataset.discId === disc.id) {
-        img.src = url;
-      }
+      disc._resolvedArt = url;
+      // Preload into a detached image and only swap the visible src once the
+      // real art has decoded, so the placeholder holds until then (no blank box).
+      swapWhenLoaded(img, url, disc.id);
     });
   }
   dom.detailCover.appendChild(img);
@@ -1106,6 +1107,22 @@ function openDetail(disc) {
   }
   // Lock background scroll while the dialog is up (see .modal-open in CSS).
   dom.body.classList.add('modal-open');
+}
+
+// Swap the detail cover's src to `url` only once that image has fully loaded,
+// so the placeholder already in the <img> stays visible until the real art is
+// ready — no blank box or flicker. Preloads via a detached Image; a load error
+// simply leaves the placeholder in place. Re-checks that the dialog still shows
+// this disc (by id) before swapping, since the load may finish after a
+// close/reopen. The preload is a plain (non-CORS) request to match the visible
+// <img>, so both share one browser cache entry and the swap is instant — a
+// crossOrigin preload would be cached separately and force a second fetch.
+function swapWhenLoaded(img, url, discId) {
+  const pre = new Image();
+  pre.onload = () => {
+    if (dom.detail.open && dom.detail.dataset.discId === discId) img.src = url;
+  };
+  pre.src = url;
 }
 
 function addMetaRow(label, value) {
