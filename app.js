@@ -1024,7 +1024,12 @@ function observeForArt(img, disc, card) {
 // still gets the real art. loadRealCover's own guard skips re-sampling.
 async function resolveAndSwap(img, disc, card) {
   const url = await resolveCoverArt(disc);
-  if (url) loadRealCover(img, disc, card, url);
+  if (url) {
+    // Remember the resolved URL on the disc so the detail view can reuse it
+    // directly instead of running another lookup.
+    disc._resolvedArt = url;
+    loadRealCover(img, disc, card, url);
+  }
 }
 
 // Open the detail dialog for a disc.
@@ -1057,12 +1062,22 @@ function openDetail(disc) {
   if (disc.art) {
     img.src = disc.art;
     img.addEventListener('error', () => { img.src = generatePlaceholderCover(disc); });
+  } else if (disc._resolvedArt) {
+    // A card (or a prior detail open) already looked this disc up and found real
+    // art — reuse that URL directly instead of running another lookup.
+    img.src = disc._resolvedArt;
+    img.addEventListener('error', () => { img.src = generatePlaceholderCover(disc); });
   } else {
-    // No sheet Art URL: show the placeholder now, then try MusicBrainz. Opening
-    // the detail is a deliberate on-screen action, so it's fair to resolve here;
-    // a cache hit swaps in instantly, a miss just leaves the placeholder.
+    // No sheet Art URL and none resolved yet. Show the placeholder, then resolve.
+    // resolveCoverArt is cache- and in-flight-aware: a URL already in the cache
+    // (or a lookup still running from the card) returns without a second API
+    // call, and a disc previously settled as a known-miss returns null without
+    // any network. So opening the detail before the card's art came back never
+    // fires a duplicate request — it joins the existing one.
     img.src = generatePlaceholderCover(disc);
     resolveCoverArt(disc).then((url) => {
+      // Remember a found URL on the disc so future opens skip the lookup path.
+      if (url) disc._resolvedArt = url;
       // Only swap if the dialog still shows this exact disc (guard against a
       // fast close/reopen on another disc while the lookup was in flight).
       if (url && dom.detail.open && dom.detail.dataset.discId === disc.id) {
