@@ -102,6 +102,15 @@
 
   button:hover { opacity: 0.85; }
 
+  .label-count {
+    margin-top: 12px;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #111;
+  }
+
   .stack-list {
     margin-top: 20px;
   }
@@ -271,6 +280,8 @@
         <button class="secondary" onclick="clearForm()">Clear form</button>
       </div>
 
+      <div class="label-count no-print" id="labelCount"></div>
+
       <div class="stack-list" id="stackList"></div>
       <div class="hint no-print">Click a saved CD above to load it back into the form for editing.</div>
 
@@ -358,6 +369,13 @@
   function render() {
     const stackList = document.getElementById('stackList');
     const previewArea = document.getElementById('previewArea');
+
+    // Count of saved labels + print pages (2 labels per printed page).
+    const count = labels.length;
+    const pages = Math.ceil(count / 2);
+    document.getElementById('labelCount').textContent = count === 0
+      ? ''
+      : `${count} label${count === 1 ? '' : 's'} · ${pages} print page${pages === 1 ? '' : 's'}`;
 
     stackList.innerHTML = '';
     labels.forEach((l, i) => {
