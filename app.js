@@ -83,9 +83,9 @@ const CONFIG = {
     // MusicBrainz asks every client to identify itself with a descriptive
     // User-Agent (app name/version + contact). Sent via a query param since
     // browsers can't set User-Agent on fetch; MB reads either.
-    APP_IDENTITY: 'CDCollection/1.0 ( https://github.com/gvorbeck/cd-collection )',
+    APP_IDENTITY: MB.APP_IDENTITY,
     // Release-group text search endpoint.
-    SEARCH_URL: 'https://musicbrainz.org/ws/2/release-group',
+    SEARCH_URL: `${MB.WS_BASE}/release-group`,
     // Cover Art Archive front-image endpoint (CORS-enabled + canvas-readable).
     // {mbid} is a release-group id; size is one of 250 / 500 / 1200.
     CAA_URL: 'https://coverartarchive.org/release-group',
@@ -508,7 +508,7 @@ let mbLastCall = 0;
 function throttledMbFetch(url) {
   const run = async () => {
     const gap = CONFIG.MUSICBRAINZ.THROTTLE_MS - (nowMs() - mbLastCall);
-    if (gap > 0) await delay(gap);
+    if (gap > 0) await MB.delay(gap);
     mbLastCall = nowMs();
     return fetch(url, { headers: { Accept: 'application/json' } });
   };
@@ -517,10 +517,6 @@ function throttledMbFetch(url) {
   const result = mbChain.then(run, run);
   mbChain = result.then(() => {}, () => {});
   return result;
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function nowMs() {
@@ -575,7 +571,7 @@ async function resolveCoverArt(disc) {
  */
 async function findReleaseGroupMbid(disc) {
   // Lucene-style query: quote the values and escape embedded quotes.
-  const q = `artist:"${escapeLucene(disc.artist)}" AND releasegroup:"${escapeLucene(disc.title)}"`;
+  const q = `artist:"${MB.escapeLucene(disc.artist)}" AND releasegroup:"${MB.escapeLucene(disc.title)}"`;
   const params = new URLSearchParams({
     query: q,
     fmt: 'json',
@@ -593,11 +589,6 @@ async function findReleaseGroupMbid(disc) {
   const groups = data['release-groups'] || [];
   if (groups.length === 0) return null;
   return groups[0].id || null;
-}
-
-// Escape characters that are special to MusicBrainz's Lucene query syntax.
-function escapeLucene(str) {
-  return str.replace(/[+\-&|!(){}\[\]^"~*?:\\/]/g, '\\$&');
 }
 
 

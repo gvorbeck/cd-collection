@@ -261,6 +261,10 @@
       <label>Track List</label>
       <textarea id="tracks" placeholder="One track per line"></textarea>
       <div class="hint">One song per line, in order.</div>
+      <div class="buttons">
+        <button class="secondary" id="fillBtn" onclick="autoFillTracks()">Auto-fill from artist + title</button>
+      </div>
+      <div class="hint" id="fillStatus"></div>
 
       <div class="buttons">
         <button id="addBtn" onclick="addLabel()">Add to print sheet</button>
@@ -283,6 +287,7 @@
   </div>
 </div>
 
+<script src="musicbrainz.js"></script>
 <script>
   let labels = JSON.parse(localStorage.getItem('cdLabels') || '[]');
   let editingIndex = null;
@@ -387,7 +392,7 @@
     let tracksHtml = '';
     if (l.tracks.length > 0) {
       tracksHtml = '<div class="label-tracks">' +
-        l.tracks.map((t, i) => `<div><span class="track-num">${i + 1}.</span><span>${escapeHtml(t)}</span></div>`).join('') +
+        l.tracks.map((t, i) => `<div><span class="track-num">${i + 1}.</span><span>${escapeHtml(stripTrackTime(t))}</span></div>`).join('') +
         '</div>';
     }
 
@@ -408,6 +413,138 @@
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+  }
+
+  // Remove a trailing " m:ss" (or " h:mm:ss") duration so the printed label
+  // shows names only, while the textarea keeps the times as a reference.
+  function stripTrackTime(str) {
+    return str.replace(/\s+\d+:\d{2}(?::\d{2})?\s*$/, '').trim();
+  }
+
+  /* ----------------------------------------------------------------
+     Auto-fill track list + lengths from MusicBrainz.
+     Key-free + CORS-friendly, same host the main collection app uses
+     for cover art. Two calls: search for the best release, then look
+     it up with recordings to get track titles and lengths.
+  ---------------------------------------------------------------- */
+  // Release endpoint; shared identity/escape/delay come from musicbrainz.js (MB).
+  const MB_RELEASE = `${MB.WS_BASE}/release`;
+
+  // One place for the shared query params (fmt/app), the Accept header, and the
+  // ok-check. `path` is appended to the release endpoint ('' to search).
+  async function mbFetch(path, extraParams) {
+    const params = new URLSearchParams({ fmt: 'json', app: MB.APP_IDENTITY, ...extraParams });
+    const res = await fetch(`${MB_RELEASE}${path}?${params}`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) throw new Error(`MusicBrainz ${res.status}`);
+    return res.json();
+  }
+
+  // A release's 4-digit year as a number, or null when MB has no date.
+  function releaseYear(rel) {
+    return parseInt((rel.date || '').slice(0, 4), 10) || null;
+  }
+
+  function msToTime(ms) {
+    const total = Math.round(ms / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const ss = String(s).padStart(2, '0');
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${ss}`;
+    return `${m}:${ss}`;
+  }
+
+  function setFillStatus(msg) {
+    document.getElementById('fillStatus').textContent = msg || '';
+  }
+
+  // Score a search result: prefer official CD releases, then a year match.
+  function scoreRelease(rel, wantYear) {
+    let score = 0;
+    if (rel.status === 'Official') score += 100;
+
+    const formats = (rel.media || [])
+      .map((m) => (m.format || '').toLowerCase())
+      .join(' ');
+    if (formats.includes('cd')) score += 50;
+
+    const relYear = releaseYear(rel);
+    if (wantYear && relYear) {
+      const diff = Math.abs(relYear - wantYear);
+      // Exact year wins big; otherwise closer is better.
+      score += diff === 0 ? 40 : Math.max(0, 30 - diff);
+    } else if (relYear) {
+      // No target year: gently prefer earlier (original) pressings.
+      score += Math.max(0, 30 - (relYear - 1900) / 10);
+    }
+
+    score += (rel.score || 0) / 100; // MB's own relevance as a tiebreaker.
+    return score;
+  }
+
+  async function autoFillTracks() {
+    const artist = document.getElementById('artist').value.trim();
+    const title = document.getElementById('title').value.trim();
+    const yearRaw = document.getElementById('year').value.trim();
+    const wantYear = parseInt(yearRaw, 10) || null;
+    const btn = document.getElementById('fillBtn');
+
+    if (!artist || !title) {
+      setFillStatus('Enter both an artist and a title first.');
+      return;
+    }
+
+    btn.disabled = true;
+    setFillStatus('Looking up…');
+
+    try {
+      // 1. Search for matching releases.
+      const q = `artist:"${MB.escapeLucene(artist)}" AND release:"${MB.escapeLucene(title)}"`;
+      const searchData = await mbFetch('', { query: q, limit: '25' });
+
+      const releases = searchData.releases || [];
+      if (releases.length === 0) {
+        setFillStatus('No match found. Try tweaking the artist or title.');
+        return;
+      }
+
+      // 2. Pick the best-scoring release.
+      const best = releases
+        .slice()
+        .sort((a, b) => scoreRelease(b, wantYear) - scoreRelease(a, wantYear))[0];
+
+      // Respect MB's ~1 req/sec rule between the two calls.
+      await MB.delay(1100);
+
+      // 3. Look it up with recordings to get track titles + lengths.
+      const release = await mbFetch(`/${best.id}`, { inc: 'recordings' });
+
+      // 4. Flatten every disc's tracks, in order.
+      const lines = [];
+      (release.media || []).forEach((medium) => {
+        (medium.tracks || []).forEach((track) => {
+          const name = track.title || (track.recording && track.recording.title) || '';
+          if (!name) return;
+          const len = track.length || (track.recording && track.recording.length);
+          lines.push(len ? `${name} ${msToTime(len)}` : name);
+        });
+      });
+
+      if (lines.length === 0) {
+        setFillStatus('Found a release but no track list was available.');
+        return;
+      }
+
+      document.getElementById('tracks').value = lines.join('\n');
+      const yr = releaseYear(release);
+      setFillStatus(`Filled ${lines.length} tracks${yr ? ` from the ${yr} release` : ''}. Edit as needed.`);
+    } catch (err) {
+      setFillStatus(`Lookup failed: ${err.message}. Check your connection and try again.`);
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   render();
