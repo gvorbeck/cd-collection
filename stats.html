@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Collection Statistics — CD Collection</title>
-  <meta name="description" content="A breakdown of the CD collection by decade, genre, artist, and shelf." />
+  <meta name="description" content="A breakdown of the CD collection by decade, genre, and artist." />
 
   <link rel="manifest" href="manifest.webmanifest" />
   <meta name="theme-color" content="#f5edd6" />
@@ -29,7 +29,10 @@
   <header class="site-header">
     <div class="header-inner">
       <div class="masthead">
-        <p class="eyebrow"><a href="index.html">The Collection</a> · <a href="labels.html">Labels</a> · Statistics</p>
+        <!-- Same four names in the same order on every page, so the row reads as
+             one nav rather than a different set of links per page. The current
+             page stays in place unlinked — it's what tells you where you are. -->
+        <p class="eyebrow"><a href="index.html">The Collection</a> · <a href="labels.html">Labels</a> · Statistics · <a href="https://docs.google.com/spreadsheets/d/18D6C4P16KTyaPtHCgJxq7Rzc0rt_09juUbIwM06Lnmc/edit" target="_blank" rel="noopener">Shelved by Number</a></p>
         <div class="title-row">
           <h1 class="site-title">Statistics</h1>
           <span class="cd-logo" aria-hidden="true"></span>

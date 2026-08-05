@@ -2,9 +2,9 @@
    stats.js — the infographic breakdown
    ------------------------------------------------------------
    Reads the same sheet as the grid, through Collection, and
-   counts it four ways: by decade, by genre, by artist, and by
-   shelf. Everything here is derived — there is no state to keep
-   and nothing to persist, so it renders once and stops.
+   counts it three ways: by decade, by genre, and by artist.
+   Everything here is derived — there is no state to keep and
+   nothing to persist, so it renders once and stops.
 
    Charts are plain DOM (a labelled row, a track, a filled bar)
    rather than a charting library. At this data size a bar is a
