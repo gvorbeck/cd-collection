@@ -2,46 +2,29 @@
    CD COLLECTION — app.js
    ------------------------------------------------------------
    Structure (kept deliberately separated so each can change alone):
-     1. CONFIG          — everything you'll want to edit lives here
+     1. CONFIG          — presentation settings live here
+                          (the SHEET and its columns live in collection.js)
      2. Utilities       — tiny shared helpers
-     3. Data loading    — PapaParse → normalized disc objects
-     4. Color           — hashing, brightness, cover sampling
-     5. Placeholder art — generated covers for disc with no image
-     6. Rendering       — stats, pills, cards, detail view
-     7. Filtering       — search + genre/tag pills + shuffle
+     3. Color           — hashing, brightness, cover sampling
+     4. Placeholder art — generated covers for disc with no image
+     5. Rendering       — stats, pills, cards, detail view
+     6. Filtering       — search + genre/tag pills + shuffle
+     7. URL state       — shareable filters + per-disc deep links
      8. Init            — wire it all together
+
+   Data loading is NOT here: collection.js owns the sheet URL, the
+   column names, and the CSV → disc-object parsing, because the
+   stats page reads the same collection and must agree on all of it.
    ============================================================ */
 
 
 /* ============================================================
-   1. CONFIG  — edit here
+   1. CONFIG  — presentation settings
+   ------------------------------------------------------------
+   Sheet URL, column names, and blank-cell fallbacks are NOT here —
+   they're in collection.js, shared with the stats page.
    ============================================================ */
 const CONFIG = {
-  // Published Google Sheet, CSV output.
-  CSV_URL: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSV9mf7fFJZ25gUb2PUNWqO6y6f5KUJDApmgiiYMZ0fiFr6FELE6IC-6tbvSOj31jDZ82tazs1jdUuR/pub?gid=1454994388&single=true&output=csv',
-
-  // Column names as they appear in the sheet header row.
-  // Change these if you rename a column; the rest of the code reads through here.
-  COLUMNS: {
-    book:   'Book',        // which physical book/binder the disc lives in
-    number: 'Number',      // page/slot within that book
-    artist: 'Artist',
-    title:  'Title',
-    year:   'Year',
-    genre:  'Parent Genre',
-    tags:   'Tags',
-    art:    'Art URL',
-    notes:  'Notes',
-  },
-
-  // Fallbacks for blank cells. Empty string means "show nothing".
-  FALLBACKS: {
-    artist: 'Various Artists',
-    title:  'Self-Titled',
-    year:   '',              // missing year shows nothing at all
-    genre:  'Uncategorized',
-  },
-
   // Palette used to color generated placeholder covers.
   // Any disc without art gets a color hashed from its artist name,
   // so one artist's untitled discs read as a set.
@@ -65,11 +48,6 @@ const CONFIG = {
   // this literal is just the pre-hydration fallback.
   NEUTRAL_SHADOW: '#3a3128',
 
-  // Design/preview aid: loading the page with ?sample in the URL reads the
-  // bundled sample.csv instead of the live sheet, so layouts can be built out
-  // with a full spread of dummy discs. Production (no query param) is untouched.
-  SAMPLE_URL: 'sample.csv',
-
   // How many genres the stats card shows before collapsing the rest behind a
   // "show more" toggle. The top N (by count) stay visible.
   STATS_GENRES_VISIBLE: 3,
@@ -86,6 +64,8 @@ const CONFIG = {
     APP_IDENTITY: MB.APP_IDENTITY,
     // Release-group text search endpoint.
     SEARCH_URL: `${MB.WS_BASE}/release-group`,
+    // Release browse endpoint — used to pull a tracklist for a release group.
+    RELEASE_URL: `${MB.WS_BASE}/release`,
     // Cover Art Archive front-image endpoint (CORS-enabled + canvas-readable).
     // {mbid} is a release-group id; size is one of 250 / 500 / 1200.
     CAA_URL: 'https://coverartarchive.org/release-group',
@@ -96,6 +76,11 @@ const CONFIG = {
     // localStorage key + schema version. Bump the version to invalidate the
     // whole cache if the lookup logic changes.
     CACHE_KEY: 'cdc:art-cache:v1',
+    // Cached tracklists, keyed by release-group MBID. Capped because these are
+    // much bigger than a cover URL and localStorage is a shared ~5MB budget —
+    // past the cap the least-recently-fetched entries are dropped.
+    TRACKS_CACHE_KEY: 'cdc:tracks:v1',
+    TRACKS_CACHE_MAX: 250,
   },
 };
 
@@ -104,98 +89,9 @@ const CONFIG = {
    2. Utilities
    ============================================================ */
 
-// Trim to a clean string; treats null/undefined/whitespace-only as ''.
-function clean(value) {
-  return (value == null ? '' : String(value)).trim();
-}
-
-// Read a column off a raw CSV row object using the configured name.
-function col(row, key) {
-  return clean(row[CONFIG.COLUMNS[key]]);
-}
-
-/**
- * Expand a catalog-Number cell into its individual slot numbers.
- * Accepts:
- *   ""         → []                 (blank / uncataloged)
- *   "42"       → [42]               (single disc)
- *   "42-43"    → [42, 43]           (range, hyphen or en/em dash)
- *   "42, 43"   → [42, 43]           (explicit list)
- *   "42-44, 50"→ [42, 43, 44, 50]   (mixed)
- * Non-numeric junk is ignored; a descending or backwards range ("43-42") is
- * normalized to ascending. Deduped and sorted so downstream code is simple.
- */
-function parseNumbers(raw) {
-  if (!raw) return [];
-  const out = new Set();
-  // Split on commas first, then interpret each piece as a single or a range.
-  for (const piece of raw.split(',')) {
-    const part = piece.trim();
-    if (!part) continue;
-    // Range: two integers separated by a hyphen or dash. Anchored so stray
-    // dashes inside other text don't accidentally form a range.
-    const range = part.match(/^(\d+)\s*[-–—]\s*(\d+)$/);
-    if (range) {
-      let a = parseInt(range[1], 10);
-      let b = parseInt(range[2], 10);
-      if (a > b) [a, b] = [b, a];
-      // Guard against a pathological huge range from a typo.
-      if (b - a > 999) { out.add(a); out.add(b); continue; }
-      for (let n = a; n <= b; n++) out.add(n);
-      continue;
-    }
-    const single = part.match(/\d+/);
-    if (single) out.add(parseInt(single[0], 10));
-  }
-  return [...out].sort((x, y) => x - y);
-}
-
-// Build the display label for a set of slot numbers:
-//   [] → ""   [42] → "42"   [42,43] → "42–43"   [42,43,50] → "42, 43, 50"
-// A contiguous run collapses to a "first–last" range with an en-dash;
-// anything with gaps is shown as a comma list so it's not misleading.
-function formatNumbers(numbers) {
-  if (numbers.length === 0) return '';
-  if (numbers.length === 1) return String(numbers[0]);
-  const contiguous = numbers.every((n, i) => i === 0 || n === numbers[i - 1] + 1);
-  if (contiguous) return `${numbers[0]}–${numbers[numbers.length - 1]}`;
-  return numbers.join(', ');
-}
-
-/**
- * Shelf-location label from a disc's book + slot numbers. The Number is the
- * page within a book, so a book is needed to make the location unambiguous.
- * Two verbosities share one assembly:
- *   terse   (card tag): "B2 · #42–43"   "B2"   "#42–43"
- *   verbose (detail):   "Book 2 · Catalog #42–43 (2 discs)"
- * Either way, no book and no number → "" (card shows no tag; detail's caller
- * substitutes "Uncataloged").
- */
-function formatLocation(disc, { verbose = false } = {}) {
-  const parts = [];
-  if (disc.book) parts.push(verbose ? `Book ${disc.book}` : `B${disc.book}`);
-  if (disc.numberLabel) {
-    const count = verbose && disc.discCount > 1 ? ` (${disc.discCount} discs)` : '';
-    parts.push(`${verbose ? 'Catalog #' : '#'}${disc.numberLabel}${count}`);
-  }
-  return parts.join(' · ');
-}
-
-// Leading article ("The", "A", "An") to ignore when alphabetizing — so
-// "The Beatles" files under B and "A Tribe Called Quest" under T, the way a
-// record shelf does. Case-insensitive; requires a following space so a name
-// like "Anthrax" or "Theory of a Deadman" isn't mangled.
-function sortKey(str) {
-  return str.replace(/^(the|a|an)\s+/i, '').trim();
-}
-
-// Escape text destined for innerHTML. We mostly use textContent, but a few
-// spots build markup — keep them safe.
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
-}
+// Helpers shared with the stats page live in collection.js; pull the ones this
+// page uses into local names so call sites stay short.
+const { el, formatLocation, escapeHtml } = Collection;
 
 // Whether the user prefers reduced motion (checked live, not cached).
 function reducedMotion() {
@@ -204,14 +100,6 @@ function reducedMotion() {
 
 // Grab an element by id (short alias).
 const $ = (id) => document.getElementById(id);
-
-// Create an element with an optional class and text content in one call.
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text != null) node.textContent = text;
-  return node;
-}
 
 // True for a "#rrggbb" string (the only color form we store/blend).
 function isHex6(str) {
@@ -226,136 +114,13 @@ function cssVar(name) {
 
 
 /* ============================================================
-   3. Data loading + normalization
-   ============================================================ */
+   3. The collection
+   ============================================================
+   Loading and parsing live in collection.js (shared with the stats
+   page). This page just holds the result. */
 
 // The full, immutable-ish collection once loaded.
 let DISCS = [];
-
-/**
- * Load the sheet with PapaParse and normalize into disc objects.
- * We read only the columns we know, but keep the raw row around so adding
- * a new column later never breaks parsing.
- */
-function loadCollection() {
-  // Use the bundled sample data when ?sample is present in the URL.
-  const useSample = new URLSearchParams(location.search).has('sample');
-  const source = useSample ? CONFIG.SAMPLE_URL : CONFIG.CSV_URL;
-
-  return new Promise((resolve, reject) => {
-    Papa.parse(source, {
-      download: true,
-      header: true,
-      skipEmptyLines: 'greedy', // drop rows that are entirely blank
-      complete: (results) => {
-        try {
-          assertExpectedHeaders(results.meta && results.meta.fields);
-          resolve(normalizeRows(results.data));
-        } catch (err) {
-          reject(err);
-        }
-      },
-      error: (err) => reject(err),
-    });
-  });
-}
-
-/**
- * Fail loudly if the sheet's header row doesn't carry the columns we read by.
- * Without this, a renamed/moved column just makes col() return '' everywhere,
- * so every disc silently falls back (all "Various Artists", all "Self-Titled")
- * and the page looks "loaded" but wrong. Artist and Title are a disc's identity;
- * if neither header is present the sheet is misconfigured, so throw and let
- * init()'s catch show the error state instead of a wall of fallbacks.
- */
-function assertExpectedHeaders(fields) {
-  const headers = Array.isArray(fields) ? fields.map(clean) : [];
-  const has = (name) => headers.includes(name);
-  if (!has(CONFIG.COLUMNS.artist) && !has(CONFIG.COLUMNS.title)) {
-    throw new Error(
-      `Sheet is missing its expected columns (looked for "${CONFIG.COLUMNS.artist}" ` +
-      `and "${CONFIG.COLUMNS.title}"). Found: ${headers.length ? headers.join(', ') : '(none)'}.`
-    );
-  }
-}
-
-/** Turn raw CSV row objects into clean disc objects with fallbacks applied. */
-function normalizeRows(rows) {
-  const discs = [];
-
-  rows.forEach((row, index) => {
-    // Consider a row empty if every configured field trims to nothing.
-    const rawValues = Object.keys(CONFIG.COLUMNS).map((k) => col(row, k));
-    if (rawValues.every((v) => v === '')) return;
-
-    const artist = col(row, 'artist') || CONFIG.FALLBACKS.artist;
-    const title  = col(row, 'title')  || CONFIG.FALLBACKS.title;
-    const year   = col(row, 'year')   || CONFIG.FALLBACKS.year;
-    const genre  = col(row, 'genre')  || CONFIG.FALLBACKS.genre;
-    const book   = col(row, 'book');   // which book/binder; may be blank
-    const number = col(row, 'number'); // may be blank — card still renders
-    const art    = col(row, 'art');
-    const notes  = col(row, 'notes');
-
-    // A single release can span several catalog slots in the book (e.g. a
-    // 2-disc greatest-hits set). The Number cell accepts a range ("42-43") or
-    // a comma list ("42, 43"); parseNumbers expands either into the actual
-    // slot numbers so one card can represent the whole physical release.
-    const numbers = parseNumbers(number);
-    // Book number for sorting (books are numbered 1, 2, 3…). Blank sorts last.
-    const bookNum = book ? numOrInf(book) : Infinity;
-
-    // Tags: comma-separated inside one cell. Split, trim, drop blanks.
-    const tags = col(row, 'tags')
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean);
-
-    const disc = {
-      id: `disc-${index}`,
-      book,                          // raw book value, e.g. "2"
-      bookNum,                       // parsed for sorting; Infinity if blank
-      number,                        // raw cell value, kept for reference
-      numbers,                       // expanded slot numbers, e.g. [42, 43]
-      numberLabel: formatNumbers(numbers), // display string: "42" or "42–43"
-      discCount: numbers.length || 1,      // how many book slots this occupies
-      artist,
-      title,
-      // Alphabetization keys with any leading article stripped, so "The Beatles"
-      // files under B and "A Hard Day's Night" under H. Computed once here; the
-      // sort comparators read these instead of the display strings.
-      sortArtist: sortKey(artist),
-      sortTitle:  sortKey(title),
-      year,
-      genre,
-      tags,
-      art,
-      notes,
-      // Filled in later once a cover color is known (sampled or hashed).
-      coverColor: CONFIG.NEUTRAL_SHADOW,
-      // Stable random key for the "Random" sort: assigned once per page load,
-      // so the shelf looks different every visit but doesn't reshuffle on each
-      // keystroke while filtering. A fresh load re-randomizes it.
-      _rand: Math.random(),
-    };
-
-    // Precompute one lowercased blob of every searchable field so the search
-    // box can match across all columns (artist, title, year, genre, tags,
-    // notes, number) instead of just artist + title. Include the expanded slot
-    // numbers so a search for any single number in a range (e.g. "43" within
-    // "42-45") still matches.
-    disc.searchText = [book, number, numbers.join(' '), artist, title, year, genre, tags.join(' '), notes]
-      .join(' ')
-      .toLowerCase();
-
-    // Precompute the shelf-location label ("Book 2 · #42–43") once.
-    disc.locationLabel = formatLocation(disc);
-
-    discs.push(disc);
-  });
-
-  return discs;
-}
 
 
 /* ============================================================
@@ -545,7 +310,7 @@ async function resolveCoverArt(disc) {
   disc._artPromise = (async () => {
     let url = null;
     try {
-      const mbid = await findReleaseGroupMbid(disc);
+      const mbid = await resolveReleaseGroupMbid(disc);
       if (mbid) {
         url = `${CONFIG.MUSICBRAINZ.CAA_URL}/${mbid}/front-${CONFIG.MUSICBRAINZ.CAA_SIZE}`;
       }
@@ -562,6 +327,52 @@ async function resolveCoverArt(disc) {
   })();
 
   return disc._artPromise;
+}
+
+/**
+ * The release-group MBID for a disc, or null if MusicBrainz doesn't know it.
+ *
+ * This is the join point for everything that needs MusicBrainz: cover art, the
+ * tracklist, and the "look it up" link all want the same id, and it costs a
+ * throttled search to find. So it's resolved once per disc and shared, with
+ * three chances to avoid the network entirely before making the call.
+ */
+async function resolveReleaseGroupMbid(disc) {
+  if (disc._mbid) return disc._mbid;
+
+  // The cover-art cache stores a Cover Art Archive URL, and that URL has the
+  // release-group MBID in it — so a disc whose art resolved on a previous visit
+  // already tells us the id for free.
+  const cached = disc._resolvedArt || artCache[artCacheKey(disc)];
+  if (cached === ART_MISS) return null; // a miss means no release group matched
+  const fromArt = mbidFromCaaUrl(cached);
+  if (fromArt) {
+    disc._mbid = fromArt;
+    return fromArt;
+  }
+
+  // In-flight de-dupe, so a card's art lookup and the detail view's tracklist
+  // opening at the same moment share one search rather than racing.
+  if (disc._mbidPromise) return disc._mbidPromise;
+
+  disc._mbidPromise = (async () => {
+    try {
+      disc._mbid = await findReleaseGroupMbid(disc);
+      return disc._mbid;
+    } catch (err) {
+      // Transient failure — clear the promise so a later attempt can retry.
+      disc._mbidPromise = null;
+      return null;
+    }
+  })();
+
+  return disc._mbidPromise;
+}
+
+// Pull the release-group MBID back out of a Cover Art Archive URL.
+function mbidFromCaaUrl(url) {
+  const match = /release-group\/([0-9a-f-]{36})\//i.exec(url || '');
+  return match ? match[1] : null;
 }
 
 /**
@@ -589,6 +400,128 @@ async function findReleaseGroupMbid(disc) {
   const groups = data['release-groups'] || [];
   if (groups.length === 0) return null;
   return groups[0].id || null;
+}
+
+
+/* ============================================================
+   4c. Tracklists
+   ============================================================
+   The sheet stores where a disc *is*, not what's on it. MusicBrainz knows the
+   latter, so the detail view fills it in on demand: resolve the release group
+   (usually already known from the cover-art lookup), browse one release from
+   it with recordings included, and flatten every medium's tracks in order.
+
+   Fetched only when a disc is actually opened, throttled with every other
+   MusicBrainz call, and cached in localStorage — so a disc you revisit shows
+   its tracklist instantly and offline.
+*/
+
+// mbid → { t: [[title, lengthMs], …], at: <last used ms> }
+let tracksCache = loadTracksCache();
+
+function loadTracksCache() {
+  try {
+    const raw = localStorage.getItem(CONFIG.MUSICBRAINZ.TRACKS_CACHE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    return {}; // unavailable or corrupt — degrade to in-memory
+  }
+}
+
+/**
+ * Persist the tracklist cache, evicting the least-recently-used entries first
+ * when it's over the cap. Tracklists are far bigger than the cover-art cache's
+ * one-line entries, and they share the same origin-wide storage budget.
+ */
+function persistTracksCache() {
+  try {
+    const keys = Object.keys(tracksCache);
+    const max = CONFIG.MUSICBRAINZ.TRACKS_CACHE_MAX;
+    if (keys.length > max) {
+      keys.sort((a, b) => (tracksCache[a].at || 0) - (tracksCache[b].at || 0))
+        .slice(0, keys.length - max)
+        .forEach((k) => { delete tracksCache[k]; });
+    }
+    localStorage.setItem(CONFIG.MUSICBRAINZ.TRACKS_CACHE_KEY, JSON.stringify(tracksCache));
+  } catch (err) {
+    // Out of quota or unavailable — keep going with the in-memory copy.
+  }
+}
+
+/**
+ * Tracklist for a disc as an array of { title, length } (length in ms, or 0
+ * when MusicBrainz doesn't have it). Returns null when nothing was found.
+ */
+async function resolveTracklist(disc) {
+  const mbid = await resolveReleaseGroupMbid(disc);
+  if (!mbid) return null;
+
+  const hit = tracksCache[mbid];
+  if (hit) {
+    // Touch it so the LRU eviction keeps the discs actually being browsed.
+    hit.at = Date.now();
+    persistTracksCache();
+    return hit.t.map(([title, length]) => ({ title, length }));
+  }
+
+  if (disc._tracksPromise) return disc._tracksPromise;
+
+  disc._tracksPromise = (async () => {
+    try {
+      const tracks = await fetchTracklist(mbid);
+      if (tracks && tracks.length) {
+        tracksCache[mbid] = { t: tracks.map((t) => [t.title, t.length]), at: Date.now() };
+        persistTracksCache();
+      }
+      return tracks;
+    } catch (err) {
+      // Don't cache a transient failure; allow a retry on the next open.
+      disc._tracksPromise = null;
+      return null;
+    }
+  })();
+
+  return disc._tracksPromise;
+}
+
+/**
+ * Browse one release from a release group, with its recordings, and flatten
+ * the tracks. A release group can hold many releases (reissues, regional
+ * pressings); any of them gives essentially the same running order, so we take
+ * the first rather than spending extra throttled requests choosing.
+ */
+async function fetchTracklist(mbid) {
+  const params = new URLSearchParams({
+    'release-group': mbid,
+    inc: 'recordings',
+    fmt: 'json',
+    limit: '1',
+    app: CONFIG.MUSICBRAINZ.APP_IDENTITY,
+  });
+  const res = await throttledMbFetch(`${CONFIG.MUSICBRAINZ.RELEASE_URL}?${params.toString()}`);
+  if (!res.ok) throw new Error(`MusicBrainz ${res.status}`);
+  const data = await res.json();
+
+  const release = (data.releases || [])[0];
+  if (!release) return null;
+
+  const out = [];
+  (release.media || []).forEach((medium) => {
+    (medium.tracks || []).forEach((track) => {
+      const title = track.title || (track.recording && track.recording.title) || '';
+      if (!title) return;
+      const length = track.length || (track.recording && track.recording.length) || 0;
+      out.push({ title, length });
+    });
+  });
+  return out.length ? out : null;
+}
+
+// Milliseconds → "m:ss". Blank for a track MusicBrainz has no timing for.
+function formatDuration(ms) {
+  if (!ms) return '';
+  const total = Math.round(ms / 1000);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 }
 
 
@@ -726,6 +659,8 @@ function cacheDom() {
   dom.resultsCount  = $('results-count');
   dom.clearFilters  = $('clear-filters');
   dom.sort          = $('sort');
+  dom.viewToggle    = $('view-toggle');
+  dom.exportBtn     = $('export-csv');
   dom.liveRegion    = $('live-region');
   dom.detail        = $('detail');
   dom.detailClose   = $('detail-close');
@@ -736,6 +671,8 @@ function cacheDom() {
   dom.detailMeta    = $('detail-meta');
   dom.detailTags    = $('detail-tags');
   dom.detailNotes   = $('detail-notes');
+  dom.detailLinks   = $('detail-links');
+  dom.detailTracks  = $('detail-tracks');
   dom.body          = document.body;
 }
 
@@ -797,17 +734,25 @@ function makeGenresToggle(hiddenCount) {
 // Build the filter pill rails for genres and tags.
 function renderPills(discs) {
   const genres = new Set();
-  const tags = new Set();
+  const tagCounts = new Map();
   for (const d of discs) {
     genres.add(d.genre);
-    d.tags.forEach((t) => tags.add(t));
+    d.tags.forEach((t) => tagCounts.set(t, (tagCounts.get(t) || 0) + 1));
   }
 
   buildPillRail(dom.genrePills, [...genres].sort(), 'genre');
-  buildPillRail(dom.tagPills, [...tags].sort((a, b) => a.localeCompare(b)), 'tag');
+
+  // Tags go in popularity order, ties A–Z. The cloud shows one line by default,
+  // so which tags win that line has to mean something — alphabetical would put
+  // whatever happens to start with "a" ahead of the tag on half the shelf.
+  const tags = [...tagCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([tag]) => tag);
+  buildPillRail(dom.tagPills, tags, 'tag');
+  buildTagToggle();
 
   // Hide the tags group heading area gracefully if there are no tags at all.
-  dom.tagPills.closest('.filter-group').hidden = tags.size === 0;
+  dom.tagPills.closest('.filter-group').hidden = tags.length === 0;
 }
 
 function buildPillRail(rail, values, type) {
@@ -820,6 +765,92 @@ function buildPillRail(rail, values, type) {
     btn.dataset.filterValue = value;
     rail.appendChild(btn);
   }
+}
+
+/**
+ * The tag cloud's expand control, appended inside the cloud rather than under
+ * it so it flows at the end of the visible line.
+ */
+function buildTagToggle() {
+  const btn = el('button', 'pill-more');
+  btn.type = 'button';
+  btn.hidden = true;               // layoutTagCloud decides whether it's needed
+  btn.setAttribute('aria-expanded', 'false');
+  btn.addEventListener('click', () => {
+    tagsExpanded = !tagsExpanded;
+    layoutTagCloud();
+    // Focus stays on a button whose label just changed under it; say why.
+    announce(tagsExpanded ? 'Showing all tags.' : 'Showing the most common tags.');
+  });
+  dom.tagMore = btn;
+  dom.tagPills.appendChild(btn);
+}
+
+/**
+ * Decide how much of the tag cloud is on screen.
+ *
+ * Collapsed, it's one line: the pills are measured and greedily packed until
+ * the next one wouldn't leave room for the toggle, and everything past that
+ * gets `hidden` — the attribute, not a class, so the overflow leaves the tab
+ * order instead of sitting invisible and still focusable.
+ *
+ * A pressed pill is never hidden, even if that spills onto a second line. An
+ * active filter you can't see is one you can't turn off, and arriving on a
+ * ?tag= deep link can press a pill well down the popularity order.
+ *
+ * Every width is read in one pass while the whole cloud is visible, so this
+ * costs a single layout rather than one per pill.
+ */
+function layoutTagCloud() {
+  const btn = dom.tagMore;
+  if (!btn) return;
+
+  const pills = [...dom.tagPills.querySelectorAll('.pill')];
+  if (!pills.length) return;
+
+  // Show everything first — widths are only measurable once laid out, and this
+  // is also the finished expanded state.
+  pills.forEach((pill) => { pill.hidden = false; });
+
+  if (tagsExpanded) {
+    btn.hidden = false;
+    btn.setAttribute('aria-expanded', 'true');
+    btn.textContent = 'Show fewer';
+    return;
+  }
+
+  // Measure the toggle at its widest possible label, so the space reserved for
+  // it can't come up short once the real count is known.
+  btn.hidden = false;
+  btn.textContent = `Show ${pills.length} more`;
+  const btnWidth = btn.offsetWidth;
+
+  const gap = parseFloat(getComputedStyle(dom.tagPills).columnGap) || 8;
+  const avail = dom.tagPills.clientWidth;
+  const widths = pills.map((pill) => pill.offsetWidth);
+
+  let used = 0;
+  let fit = 0;
+  for (let i = 0; i < pills.length; i++) {
+    const next = used + (i ? gap : 0) + widths[i];
+    if (next + gap + btnWidth > avail) break;
+    used = next;
+    fit++;
+  }
+
+  pills.forEach((pill, i) => {
+    pill.hidden = i >= fit && pill.getAttribute('aria-pressed') !== 'true';
+  });
+
+  const hidden = pills.reduce((n, pill) => n + (pill.hidden ? 1 : 0), 0);
+  if (hidden === 0) {
+    // Everything fit, or everything that didn't is pressed. Either way there's
+    // nothing behind the toggle, so there's no toggle.
+    btn.hidden = true;
+    return;
+  }
+  btn.setAttribute('aria-expanded', 'false');
+  btn.textContent = `Show ${hidden} more`;
 }
 
 /**
@@ -838,16 +869,22 @@ function renderCards(discs) {
   });
 
   dom.grid.innerHTML = '';
+  // The grid and the list are the same <ul> wearing a different class, so the
+  // art pipeline, the observer, and the shuffle-landing code all keep working
+  // unchanged across a view switch.
+  const isList = state.view === 'list';
+  dom.grid.classList.toggle('is-list', isList);
 
   const frag = document.createDocumentFragment();
   discs.forEach((disc, i) => {
-    frag.appendChild(buildCard(disc, i));
+    frag.appendChild(isList ? buildRow(disc) : buildCard(disc, i));
   });
   dom.grid.appendChild(frag);
 
-  // Stagger the fade/slide-in. Reduced motion → show immediately.
+  // Stagger the fade/slide-in. Reduced motion → show immediately. The list is
+  // dense enough that a staggered reveal reads as jitter, so it just appears.
   const cards = dom.grid.querySelectorAll('.card');
-  if (reducedMotion()) {
+  if (isList || reducedMotion()) {
     cards.forEach((c) => c.classList.add('is-in'));
   } else {
     cards.forEach((card, i) => {
@@ -864,7 +901,10 @@ function buildCard(disc, index) {
   const card = document.createElement('button');
   card.type = 'button';
   card.className = 'card';
-  card.style.setProperty('--card-shadow', disc.coverColor);
+  // Only once there's a sampled color — setting the property to `undefined`
+  // stringifies, which invalidates the box-shadow that reads it and leaves the
+  // card with no shadow at all instead of the neutral one the CSS defines.
+  if (disc.coverColor) card.style.setProperty('--card-shadow', disc.coverColor);
   card.addEventListener('click', () => openDetail(disc));
 
   // Cover
@@ -902,6 +942,56 @@ function buildCard(disc, index) {
 
   // Remember the card node so shuffle can scroll/pulse it.
   disc._cardEl = card;
+  return li;
+}
+
+/**
+ * The list view's row: the same disc, one line high.
+ * A cover wall is the nicest way to browse and the worst way to *scan* — at a
+ * few hundred discs you want to run your eye down a column of titles, or print
+ * the thing and take it to a shop. Rows keep a small thumbnail (so the art
+ * pipeline is identical to the grid's) and lay the rest out as columns.
+ *
+ * No `index` counterpart to buildCard's: the list skips the staggered reveal,
+ * so there's nothing to offset.
+ */
+function buildRow(disc) {
+  const li = document.createElement('li');
+  li.className = 'grid-item';
+
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'card row';
+  if (disc.coverColor) row.style.setProperty('--card-shadow', disc.coverColor);
+  row.addEventListener('click', () => openDetail(disc));
+
+  // Thumbnail. Same wrapper class as the grid so setCoverImage/observeForArt
+  // need no special case; CSS sizes it down.
+  const coverWrap = el('div', 'card-cover-wrap row-thumb');
+  const img = document.createElement('img');
+  img.className = 'card-cover';
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.alt = ''; // decorative: the text beside it says the same thing
+  setCoverImage(img, disc, row);
+  coverWrap.appendChild(img);
+  row.appendChild(coverWrap);
+
+  // Shelf location, in the mono "accession number" voice used everywhere else.
+  // Spelled out rather than a dash: a screen reader reads this row as one
+  // string, and "em dash" in the middle of it means nothing.
+  row.appendChild(el('span', 'row-loc', disc.locationLabel || 'Uncataloged'));
+
+  const text = el('div', 'row-text');
+  text.appendChild(el('span', 'row-artist', disc.artist));
+  text.appendChild(el('span', 'row-title', disc.title));
+  row.appendChild(text);
+
+  row.appendChild(el('span', 'row-genre', disc.genre));
+  row.appendChild(el('span', 'row-year', disc.year || ''));
+
+  li.appendChild(row);
+  disc._cardEl = row;
   return li;
 }
 
@@ -1023,8 +1113,18 @@ async function resolveAndSwap(img, disc, card) {
   }
 }
 
-// Open the detail dialog for a disc.
-function openDetail(disc) {
+/**
+ * Open (or re-point) the detail dialog for a disc.
+ *
+ * `pushUrl` controls the history entry. A normal click pushes `#disc-<slug>`
+ * so the dialog becomes shareable and the browser's Back button closes it;
+ * opening in response to the URL itself (a deep link, or a popstate) passes
+ * false, because the history entry is already the reason we're here.
+ *
+ * Re-points in place when the dialog is already open — showModal() throws on an
+ * open dialog, and closing/reopening would flicker.
+ */
+function openDetail(disc, { pushUrl = true } = {}) {
   // Location line, spelled out: "Book 2 · Catalog #42–43 (2 discs)".
   // Blank (no book and no number) reads as uncataloged.
   const loc = formatLocation(disc, { verbose: true });
@@ -1091,13 +1191,31 @@ function openDetail(disc) {
   // Notes (hidden when empty via CSS :empty)
   dom.detailNotes.textContent = disc.notes || '';
 
-  if (typeof dom.detail.showModal === 'function') {
-    dom.detail.showModal();
-  } else {
-    dom.detail.setAttribute('open', ''); // very old browsers
+  // "Look it up" links out to the streaming shops and databases.
+  renderDetailLinks(disc);
+
+  // Tracklist: fetched from MusicBrainz on demand, so it only costs a request
+  // for discs someone actually opens.
+  renderTracklist(disc);
+
+  // Only show a dialog that isn't already showing — showModal() on an open
+  // dialog throws, and everything above has already re-pointed it at `disc`.
+  if (!dom.detail.open) {
+    if (typeof dom.detail.showModal === 'function') {
+      dom.detail.showModal();
+    } else {
+      dom.detail.setAttribute('open', ''); // very old browsers
+    }
+    // Lock background scroll while the dialog is up (see .modal-open in CSS).
+    dom.body.classList.add('modal-open');
+    // Arm the close cleanup for this showing.
+    detailCleanedUp = false;
   }
-  // Lock background scroll while the dialog is up (see .modal-open in CSS).
-  dom.body.classList.add('modal-open');
+
+  // Owned here rather than by the caller: the flag means "did opening this
+  // dialog add a history entry", which is exactly what `pushUrl` decides.
+  if (pushUrl) pushDiscUrl(disc);
+  else detailPushedHistory = false;
 }
 
 // Swap the detail cover's src to `url` only once that image has fully loaded,
@@ -1120,6 +1238,134 @@ function addMetaRow(label, value) {
   dom.detailMeta.append(el('dt', null, label), el('dd', null, value));
 }
 
+/* ---------- "Look it up" links ----------
+   The detail view knows where a disc sits on the shelf; these say where to go
+   next with it. All are plain search URLs built from artist + title, so they
+   need no API keys and no network of our own — except MusicBrainz, which gets
+   a direct link when a release group has already been identified. */
+const SERVICE_LINKS = [
+  { name: 'Discogs',  href: (q) => `https://www.discogs.com/search/?type=release&q=${q}` },
+  { name: 'Bandcamp', href: (q) => `https://bandcamp.com/search?q=${q}` },
+  // The iTunes Store's music catalogue lives at music.apple.com now; this is
+  // where an itms:// store link resolves to on the web.
+  { name: 'iTunes',   href: (q) => `https://music.apple.com/search?term=${q}` },
+  { name: 'Spotify',  href: (q) => `https://open.spotify.com/search/${q}` },
+];
+
+function renderDetailLinks(disc) {
+  const query = encodeURIComponent(`${disc.artist} ${disc.title}`);
+  dom.detailLinks.innerHTML = '';
+
+  for (const svc of SERVICE_LINKS) {
+    dom.detailLinks.appendChild(makeDetailLink(svc.name, svc.href(query)));
+  }
+
+  // MusicBrainz last: a direct release-group link if we already resolved one
+  // (from the cover-art lookup), otherwise its search page. Never fires a
+  // lookup of its own — a link shouldn't cost a request to draw.
+  const mbid = disc._mbid || mbidFromCaaUrl(disc._resolvedArt || artCache[artCacheKey(disc)]);
+  dom.detailLinks.appendChild(makeDetailLink(
+    'MusicBrainz',
+    mbid
+      ? `https://musicbrainz.org/release-group/${mbid}`
+      : `https://musicbrainz.org/search?type=release_group&query=${query}`
+  ));
+}
+
+function makeDetailLink(name, href) {
+  const a = el('a', 'detail-link');
+  a.href = href;
+  a.target = '_blank';
+  // noopener/noreferrer: these are third-party sites opened in a new tab.
+  a.rel = 'noopener noreferrer';
+  // The icon says "this leaves the site" to anyone looking; the sr-only text
+  // says the same thing to anyone listening. Both, or the cue is sighted-only.
+  a.append(
+    el('span', 'detail-link-name', name),
+    externalIcon(),
+    el('span', 'sr-only', '(opens in a new tab)')
+  );
+  return a;
+}
+
+/**
+ * The box-and-arrow "leaves this site" glyph. Drawn with square caps and no
+ * corner radii to match the hard-edged borders it sits inside, and stroked in
+ * currentColor so it inverts along with the text on hover.
+ */
+function externalIcon() {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('class', 'detail-link-icon');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2.5');
+  svg.setAttribute('stroke-linecap', 'square');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+
+  for (const [tag, attrs] of [
+    ['path',     { d: 'M17 13v7H4V7h7' }],            // frame, open at the corner
+    ['polyline', { points: '14 3 21 3 21 10' }],      // arrowhead
+    ['line',     { x1: '10', y1: '14', x2: '21', y2: '3' }],
+  ]) {
+    const node = document.createElementNS(NS, tag);
+    for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+    svg.appendChild(node);
+  }
+  return svg;
+}
+
+/* ---------- Tracklist ---------- */
+
+/**
+ * Fill in the tracklist panel for a disc.
+ * Async and best-effort: the panel shows a loading line, then either the
+ * tracks or nothing at all. A disc MusicBrainz doesn't know simply has no
+ * tracklist section, rather than an apology where content should be.
+ */
+function renderTracklist(disc) {
+  const box = dom.detailTracks;
+  box.innerHTML = '';
+  box.hidden = true;
+
+  const paint = (tracks) => {
+    // The dialog may have moved on to another disc while we were waiting.
+    if (dom.detail.dataset.discId !== disc.id) return;
+    box.innerHTML = '';
+    if (!tracks || !tracks.length) { box.hidden = true; return; }
+
+    box.hidden = false;
+    box.appendChild(el('h3', 'detail-tracks-heading', 'Tracklist'));
+    const ol = el('ol', 'tracklist');
+    tracks.forEach((t) => {
+      const li = el('li', 'tracklist-item');
+      li.appendChild(el('span', 'track-title', t.title));
+      const len = formatDuration(t.length);
+      if (len) li.appendChild(el('span', 'track-len', len));
+      ol.appendChild(li);
+    });
+    box.appendChild(ol);
+  };
+
+  // A cached tracklist resolves in a microtask, so only show the loading line
+  // if we're actually about to hit the network.
+  const pending = resolveTracklist(disc);
+  let settled = false;
+  // resolveTracklist swallows its own failures, but a rejection here would be
+  // an unhandled one — and "no tracklist" is the right answer either way.
+  pending.then((tracks) => { settled = true; paint(tracks); })
+         .catch(() => { settled = true; paint(null); });
+  setTimeout(() => {
+    if (settled || dom.detail.dataset.discId !== disc.id) return;
+    box.hidden = false;
+    box.innerHTML = '';
+    box.appendChild(el('h3', 'detail-tracks-heading', 'Tracklist'));
+    box.appendChild(el('p', 'tracklist-loading', 'Looking it up…'));
+  }, 150);
+}
+
 // Guard against a non-hex color slipping into hexToRgb.
 function safeHex(hex) {
   return isHex6(hex) ? hex : CONFIG.NEUTRAL_SHADOW;
@@ -1140,13 +1386,26 @@ function blendWithPaper(rgb, amount) {
    7. Filtering: search + pills + shuffle
    ============================================================ */
 
-// Current filter state.
+// Defaults. A value equal to its default is left OUT of the URL, so a plain
+// visit stays at a clean `/` rather than carrying a string of no-op params.
+const DEFAULT_SORT = 'random'; // matches the #sort <select> default
+const DEFAULT_VIEW = 'grid';
+const VIEWS = ['grid', 'list'];
+
+// Current filter state. Mirrored to the querystring (see section 7a) so any
+// view of the collection is a shareable link.
 const state = {
   search: '',
   genres: new Set(),
   tags: new Set(),
-  sort: 'random',   // matches the #sort <select> default
+  sort: DEFAULT_SORT,
+  view: DEFAULT_VIEW,   // 'grid' (cover wall) or 'list' (dense shelf list)
 };
+
+// Whether the tag cloud is showing every tag or just the first line of them.
+// Deliberately not in `state`: it's how much of a control is unrolled, not a
+// view of the collection, so it has no business in a shared link.
+let tagsExpanded = false;
 
 /**
  * Return a new array of discs ordered per the current sort mode.
@@ -1201,13 +1460,6 @@ function sortDiscs(discs) {
 // First slot number of a disc for sorting; uncataloged entries sort last.
 function firstNumberOrInf(disc) {
   return disc.numbers.length ? disc.numbers[0] : Infinity;
-}
-
-// Parse a leading integer from a string; blank/non-numeric → Infinity so it
-// sorts last. Used for the Book number.
-function numOrInf(value) {
-  const n = parseInt(value, 10);
-  return Number.isNaN(n) ? Infinity : n;
 }
 
 // Parse a disc's year to an int; `blankTo` decides where a missing year lands
@@ -1273,7 +1525,9 @@ function togglePill(btn) {
     set.add(filterValue);
     btn.setAttribute('aria-pressed', 'true');
   }
+  if (filterType === 'tag') layoutTagCloud();
   applyFilters();
+  syncUrl();
 }
 
 // Reset everything.
@@ -1284,7 +1538,86 @@ function clearAllFilters() {
   dom.search.value = '';
   document.querySelectorAll('.pill[aria-pressed="true"]')
     .forEach((p) => p.setAttribute('aria-pressed', 'false'));
+  layoutTagCloud();   // nothing is pinned visible by being pressed any more
   applyFilters();
+  syncUrl();
+}
+
+/**
+ * Switch between the cover grid and the dense list.
+ * Like sort, this is a display preference rather than a filter, so it survives
+ * "Clear filters" — and it lands in the URL so a shared link arrives in the
+ * same view it was sent from.
+ */
+function setView(view) {
+  if (!VIEWS.includes(view) || view === state.view) return;
+  state.view = view;
+  syncViewControls();
+  applyFilters({ announceResults: false });
+  syncUrl();
+  announce(view === 'list' ? 'Switched to list view.' : 'Switched to grid view.');
+}
+
+// Reflect the current view on the toggle buttons.
+function syncViewControls() {
+  dom.viewToggle.querySelectorAll('[data-view]').forEach((btn) => {
+    btn.setAttribute('aria-pressed', String(btn.dataset.view === state.view));
+  });
+}
+
+/**
+ * Download the discs currently on screen as a CSV, in the order they're shown.
+ * Columns match the sheet's, so an export can be pasted straight back into a
+ * spreadsheet — handy for taking a filtered slice somewhere else, or keeping a
+ * dated snapshot of the collection.
+ */
+function exportCurrentCsv() {
+  const discs = sortDiscs(currentMatches());
+  if (discs.length === 0) {
+    announce('Nothing to export — no discs match your filters.');
+    return;
+  }
+
+  const C = Collection.CONFIG.COLUMNS;
+  const headers = [C.book, C.number, C.artist, C.title, C.year, C.genre, C.tags, C.notes];
+  const rows = discs.map((d) => [
+    d.book, d.number, d.artist, d.title, d.year, d.genre, d.tags.join(', '), d.notes,
+  ]);
+
+  const csv = [headers, ...rows].map((r) => r.map(csvCell).join(',')).join('\r\n');
+  // A BOM so Excel opens UTF-8 as UTF-8 rather than mangling accented names.
+  // Written as an escape, not a literal: a raw U+FEFF is invisible in every
+  // editor and the next whitespace cleanup would silently delete it.
+  downloadFile(`\uFEFF${csv}`, 'text/csv;charset=utf-8', exportFilename());
+  announce(`Exported ${discs.length} disc${discs.length === 1 ? '' : 's'}.`);
+}
+
+// Quote a CSV field per RFC 4180: wrap in quotes when it contains a comma,
+// quote, or newline, and double any embedded quotes.
+function csvCell(value) {
+  const str = value == null ? '' : String(value);
+  return /[",\r\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+}
+
+// Name the download after what it contains: filtered exports say so, and every
+// file is dated so successive snapshots don't overwrite each other.
+function exportFilename() {
+  const stamp = new Date().toISOString().slice(0, 10);
+  const filtered = state.search || state.genres.size || state.tags.size;
+  return `cd-collection${filtered ? '-filtered' : ''}-${stamp}.csv`;
+}
+
+// Hand a generated string to the browser as a file download.
+function downloadFile(text, mime, filename) {
+  const url = URL.createObjectURL(new Blob([text], { type: mime }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Release the blob once the download has been handed off.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /**
@@ -1325,6 +1658,203 @@ function shuffle() {
       dom.shuffle.classList.remove('is-shuffling');
       land();
     }, 500);
+  }
+}
+
+
+/* ============================================================
+   7a. URL state: shareable filters + per-disc deep links
+   ============================================================
+   Every browsable state of this page is a URL, so a view can be
+   sent to someone else (or bookmarked, or reloaded) and come back:
+
+     ?q=miles&genre=Jazz&sort=year-asc&view=list
+     #disc-radiohead-ok-computer
+
+   Two different history behaviours, deliberately:
+   - Filters/sort/view REPLACE the current entry. Typing six letters
+     into the search box should not bury the previous page under six
+     history entries.
+   - Opening a disc PUSHES an entry, so Back closes the dialog. On a
+     phone that makes the system back gesture do the obvious thing,
+     which is otherwise the roughest edge on the whole site.
+*/
+
+// The hash prefix for a disc deep link: "#disc-<slug>".
+const DISC_HASH_PREFIX = '#disc-';
+
+// True when the dialog currently open was opened by us pushing a history
+// entry (a click), rather than by the URL already pointing at it (a deep
+// link or a Back/Forward). It decides how closing the dialog gets rid of the
+// hash: go Back if we pushed, or rewrite the URL in place if we didn't —
+// calling history.back() on a fresh deep link would leave the site entirely.
+let detailPushedHistory = false;
+
+// Set while WE are closing the dialog to match the URL, so the resulting
+// `close` event doesn't try to drive history in turn and loop.
+let closingForHistory = false;
+
+// Guards the close cleanup against running twice for one dismissal (it is
+// invoked directly by dismissDetail and again by the native `close` event).
+// Starts true so a stray event before anything has opened does nothing.
+let detailCleanedUp = true;
+
+// The disc slug named by the current URL hash, or '' if there isn't one.
+function discSlugFromHash() {
+  const hash = location.hash;
+  return hash.startsWith(DISC_HASH_PREFIX) ? hash.slice(DISC_HASH_PREFIX.length) : '';
+}
+
+// Look up a disc by its URL slug.
+function discBySlug(slug) {
+  return slug ? DISCS.find((d) => d.slug === slug) || null : null;
+}
+
+/**
+ * Build the URL for the current filter state.
+ * Values equal to their default are omitted, so an unfiltered page is a bare
+ * path. `hash` defaults to whatever the address bar already has, so updating a
+ * filter while the dialog is open doesn't drop the disc it's showing.
+ */
+function buildUrl(hash = location.hash) {
+  const parts = [];
+  // Preserve ?sample as a bare flag — it's a dev switch and reads better
+  // spelled the way the README documents it.
+  if (Collection.usingSample()) parts.push('sample');
+  if (state.search) parts.push(`q=${encodeURIComponent(state.search)}`);
+  // Repeated keys for the multi-selects: ?genre=Jazz&genre=Soul.
+  for (const g of state.genres) parts.push(`genre=${encodeURIComponent(g)}`);
+  for (const t of state.tags)   parts.push(`tag=${encodeURIComponent(t)}`);
+  if (state.sort !== DEFAULT_SORT) parts.push(`sort=${encodeURIComponent(state.sort)}`);
+  if (state.view !== DEFAULT_VIEW) parts.push(`view=${encodeURIComponent(state.view)}`);
+
+  const query = parts.length ? `?${parts.join('&')}` : '';
+  return `${location.pathname}${query}${hash || ''}`;
+}
+
+// Write the current filter state into the address bar without adding history.
+function syncUrl() {
+  history.replaceState(history.state, '', buildUrl());
+}
+
+// Push a history entry for an opened disc, so Back closes the dialog.
+function pushDiscUrl(disc) {
+  history.pushState({ discSlug: disc.slug }, '', buildUrl(`${DISC_HASH_PREFIX}${disc.slug}`));
+  detailPushedHistory = true;
+}
+
+/**
+ * Read filter state out of the querystring. Every value is validated against
+ * what the controls actually offer — a hand-edited `sort=chaos` should fall
+ * back to the default, not put the page in a state its UI can't represent.
+ * Genre/tag values are NOT validated here: the pills aren't built until the
+ * sheet has loaded, and an unknown value simply matches no discs.
+ *
+ * `sortFallback` is what a URL that says nothing about sorting falls back to.
+ * At startup that's whatever the browser restored into the <select>; on a
+ * Back/Forward it's the plain default, because an entry without ?sort really
+ * does mean the default.
+ */
+function readStateFromUrl({ sortFallback = DEFAULT_SORT } = {}) {
+  const params = new URLSearchParams(location.search);
+
+  state.search = params.get('q') || '';
+  state.genres = new Set(params.getAll('genre').filter(Boolean));
+  state.tags   = new Set(params.getAll('tag').filter(Boolean));
+
+  const sort = params.get('sort');
+  const sortable = [...dom.sort.options].some((o) => o.value === sort);
+  state.sort = sortable ? sort : sortFallback;
+
+  const view = params.get('view');
+  state.view = VIEWS.includes(view) ? view : DEFAULT_VIEW;
+}
+
+// Push the current state back out to the controls, so what's on screen always
+// matches what's in the URL (after a deep link, or a Back/Forward).
+function syncControlsToState() {
+  dom.search.value = state.search;
+  dom.sort.value = state.sort;
+  document.querySelectorAll('.pill').forEach((pill) => {
+    const set = pill.dataset.filterType === 'genre' ? state.genres : state.tags;
+    pill.setAttribute('aria-pressed', String(set.has(pill.dataset.filterValue)));
+  });
+  // Pressed pills are wider (the ✓) and are never hidden, so both inputs to the
+  // cloud's one-line fit just changed.
+  layoutTagCloud();
+  syncViewControls();
+}
+
+/**
+ * Bring the page in line with the URL after a Back/Forward. Handles both
+ * halves — the filter state and whether a disc dialog should be showing.
+ */
+function onPopState() {
+  readStateFromUrl();
+  syncControlsToState();
+  applyFilters({ announceResults: false });
+
+  const disc = discBySlug(discSlugFromHash());
+  if (disc) {
+    // The entry we landed on names a disc: show it (re-pointing the dialog in
+    // place if it's already open). No push — this entry already exists.
+    openDetail(disc, { pushUrl: false });
+  } else if (dom.detail.open) {
+    closeDetailForHistory();
+  }
+}
+
+/**
+ * Close the dialog and tidy up after it.
+ *
+ * close() is synchronous but its event is only queued, so for the routes we
+ * drive ourselves (close button, backdrop, Back) the cleanup runs here rather
+ * than a task later — the page is scrollable and the URL is honest in the same
+ * frame the dialog disappears. The `close` listener still fires afterwards and
+ * covers Esc, which the browser handles without going through this function;
+ * onDetailClosed is written to be safe to run twice.
+ */
+function dismissDetail() {
+  dom.detail.close();
+  onDetailClosed();
+}
+
+// Close the dialog because the URL says it shouldn't be open, without letting
+// the close handler push history back the other way.
+function closeDetailForHistory() {
+  closingForHistory = true;
+  dismissDetail();
+}
+
+/**
+ * Release the scroll lock and clean the disc hash out of the URL once the
+ * dialog is gone. Runs from dismissDetail for the routes we control and from
+ * the dialog's native `close` event for the ones we don't (Esc) — so it runs
+ * twice for most dismissals and must be idempotent. `detailCleanedUp` is what
+ * makes the second run a no-op; openDetail arms it again.
+ */
+function onDetailClosed() {
+  if (detailCleanedUp) return;
+  detailCleanedUp = true;
+
+  dom.body.classList.remove('modal-open');
+
+  // We closed it ourselves to match a Back/Forward — history is already right.
+  if (closingForHistory) {
+    closingForHistory = false;
+    return;
+  }
+  if (!discSlugFromHash()) return; // nothing to clean up
+
+  if (detailPushedHistory) {
+    // We added this entry, so unwinding it is the honest way back: it also
+    // restores whatever scroll position and filters preceded the dialog.
+    detailPushedHistory = false;
+    history.back();
+  } else {
+    // Arrived here by deep link, so there is nothing of ours to go back to —
+    // going back would leave the site. Drop the hash in place instead.
+    history.replaceState(history.state, '', buildUrl(''));
   }
 }
 
@@ -1390,10 +1920,11 @@ function wireEvents() {
     searchTimer = setTimeout(() => {
       state.search = value.trim();
       applyFilters();
+      syncUrl();
     }, 120);
   });
 
-  // Pills (event delegation on each rail) + mouse drag-to-scroll.
+  // Pills (event delegation on each container).
   [dom.genrePills, dom.tagPills].forEach((rail) => {
     rail.addEventListener('click', (e) => {
       // A drag that scrolled the rail shouldn't also toggle a pill.
@@ -1401,7 +1932,15 @@ function wireEvents() {
       const pill = e.target.closest('.pill');
       if (pill) togglePill(pill);
     });
-    enableDragScroll(rail);
+  });
+  // Only the genre rail scrolls sideways — the tag cloud wraps instead.
+  enableDragScroll(dom.genrePills);
+
+  // How many tags fit on one line is a function of the container's width.
+  let tagLayoutTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(tagLayoutTimer);
+    tagLayoutTimer = setTimeout(layoutTagCloud, 150);
   });
 
   dom.clearFilters.addEventListener('click', clearAllFilters);
@@ -1412,12 +1951,23 @@ function wireEvents() {
   dom.sort.addEventListener('change', () => {
     state.sort = dom.sort.value;
     applyFilters({ announceResults: false });
+    syncUrl();
     const label = dom.sort.options[dom.sort.selectedIndex].text;
     announce(`Sorted by ${label}.`);
   });
 
+  // View toggle: cover grid vs dense list. Delegated over the whole group so
+  // both buttons share one handler.
+  dom.viewToggle.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-view]');
+    if (btn) setView(btn.dataset.view);
+  });
+
+  // Download whatever is currently on screen as a CSV.
+  dom.exportBtn.addEventListener('click', exportCurrentCsv);
+
   // Detail dialog close.
-  dom.detailClose.addEventListener('click', () => dom.detail.close());
+  dom.detailClose.addEventListener('click', dismissDetail);
   // Click on the backdrop (outside the inner panel) closes it too. A click that
   // lands on the dialog element itself is the backdrop — but the dialog's own
   // scrollbar reports the same target, so only treat clicks that fall outside
@@ -1427,11 +1977,16 @@ function wireEvents() {
     const r = dom.detail.getBoundingClientRect();
     const inside = e.clientX >= r.left && e.clientX <= r.right &&
                    e.clientY >= r.top  && e.clientY <= r.bottom;
-    if (!inside) dom.detail.close();
+    if (!inside) dismissDetail();
   });
-  // Release the background scroll lock however the dialog was dismissed
-  // (button, backdrop, or Esc — all funnel through the native close event).
-  dom.detail.addEventListener('close', () => dom.body.classList.remove('modal-open'));
+  // Tidy the URL however the dialog was dismissed (button, backdrop, or Esc —
+  // all of them fire the native close event). Esc is the only route that
+  // doesn't also pass through dismissDetail, so this is what releases the
+  // scroll lock for it.
+  dom.detail.addEventListener('close', onDetailClosed);
+
+  // Back/Forward: the URL is the source of truth, so re-derive everything.
+  window.addEventListener('popstate', onPopState);
 }
 
 // Pull shared theme colors from the stylesheet so CSS stays canonical. Each
@@ -1448,13 +2003,18 @@ function hydrateThemeConstants() {
 async function init() {
   cacheDom();
   hydrateThemeConstants();
-  // Sync state with the select's actual value — browsers may restore a
-  // previously-chosen option across reloads, and state must match what's shown.
-  state.sort = dom.sort.value;
+  // The URL wins — an explicit link beats anything the browser remembers. But
+  // a URL with no ?sort is silent rather than opinionated, so a select the
+  // browser restored across a reload stands in as the fallback.
+  readStateFromUrl({ sortFallback: dom.sort.value });
+  dom.sort.value = state.sort;
+  syncViewControls();
+  dom.search.value = state.search;
   wireEvents();
+  Collection.registerServiceWorker();
 
   try {
-    DISCS = await loadCollection();
+    DISCS = await Collection.load();
 
     if (DISCS.length === 0) {
       dom.stateMsg.textContent = 'The collection is empty right now.';
@@ -1464,9 +2024,17 @@ async function init() {
 
     renderStats(DISCS);
     renderPills(DISCS);
+    // The pills only exist now, so this is the first point at which genre/tag
+    // filters from the URL can be shown as pressed.
+    syncControlsToState();
     dom.stateMsg.hidden = true;
     applyFilters({ announceResults: false });
     announce(`Loaded ${DISCS.length} discs.`);
+
+    // A deep link straight to a disc: open it once the collection exists.
+    // No push — this history entry is what brought us here.
+    const linked = discBySlug(discSlugFromHash());
+    if (linked) openDetail(linked, { pushUrl: false });
   } catch (err) {
     console.error('Failed to load collection:', err);
     dom.stateMsg.hidden = false;

@@ -85,6 +85,39 @@ body {
   outline-offset: 2px;
 }
 
+/* ---------- Scrollbars ----------
+   The default bar is a floating grey pill on a page that has no other rounded,
+   grey, or floating anything. Rebuilt as a hard-edged ink block on a paper
+   track — the same two colors and square corners as every other control.
+
+   Kept wide and always-drawn on purpose: the detail dialog scrolls, and the
+   whole reason its links went unnoticed was that nothing on screen said there
+   was more below. Standard properties first (Firefox), WebKit's pseudo-elements
+   after, since the two ignore each other. */
+/* Firefox only. Scoped away from Chrome and Safari deliberately: setting
+   scrollbar-color there switches the browser to its own scrollbar rendering and
+   disables every ::-webkit-scrollbar rule below, rounded thumb and all. Firefox
+   has no equivalent, so it takes the colors and its native shape. */
+@supports not selector(::-webkit-scrollbar) {
+  html { scrollbar-color: var(--ink) var(--paper-deep); }
+}
+
+::-webkit-scrollbar { width: 14px; height: 14px; }
+::-webkit-scrollbar-track { background: var(--paper-deep); }
+/* The rule between track and content runs along whichever edge faces it. */
+::-webkit-scrollbar-track:vertical   { border-left: 2px solid var(--ink); }
+::-webkit-scrollbar-track:horizontal { border-top:  2px solid var(--ink); }
+::-webkit-scrollbar-thumb {
+  background: var(--ink);
+  /* No border-radius anywhere on this site, and none here. The paper border is
+     what separates the thumb from the track — WebKit has no margin on a thumb,
+     so the gap has to be drawn as part of it. */
+  border: 2px solid var(--paper-deep);
+}
+::-webkit-scrollbar-thumb:hover  { background: var(--brick); }
+::-webkit-scrollbar-thumb:active { background: var(--brick); }
+::-webkit-scrollbar-corner { background: var(--paper-deep); }
+
 /* ============================================================
    Header + stats
    ============================================================ */
@@ -105,6 +138,13 @@ body {
   font-size: 0.66rem;
   color: var(--ink-soft);
   margin: 0 0 0.35rem;
+  /* Lifted above the <h1> below it. Anton's ascent is far taller than the
+     0.9 line-height the title is set on, so the title's text box overflows
+     roughly 20px upward and covers this whole line. Nothing overlaps visually —
+     that overflow is the font's empty space above the caps — but it lands on
+     top in paint order and swallowed every click on these links. */
+  position: relative;
+  z-index: 1;
 }
 .eyebrow a { color: var(--brick); }
 .site-title {
@@ -130,10 +170,14 @@ body {
 }
 
 /* ---------- Flat icon-style compact disc ----------
-   Bold, hard-edged concentric bands in the palette — matches the flat
-   construction-paper language (no gradients, sheen, or spin). The whole shape
-   is drawn with hard-stop radial bands and finished with the same hard offset
-   shadow the cards use. */
+   The app icon itself, not a second drawing of one — the mark in the header, on
+   the home screen, and in the browser tab should be the same artwork, so this
+   points at icons/icon.svg rather than re-deriving it in radial-gradient stops.
+
+   Sized past 100% because the icon is a disc drawn on a square paper field
+   (r=44 of a 100 viewBox). At its natural size the round badge would show a
+   ring of that field between the artwork and the border; scaling up pushes the
+   disc's edge just past the clip so the border sits right on it. */
 .cd-logo {
   --cd-size: clamp(2.75rem, 9vw, 4.75rem);
   flex: 0 0 auto;
@@ -141,14 +185,12 @@ body {
   height: var(--cd-size);
   border-radius: 50%;
   border: 3px solid var(--ink);
-  box-shadow: 4px 4px 0 var(--ink);
-  background: radial-gradient(circle at 50% 50%,
-    var(--paper)   0 14%,     /* spindle hole */
-    var(--ink)     14% 20%,   /* hole rim */
-    var(--paper)   20% 30%,   /* clear hub band */
-    var(--ink)     30% 35%,   /* inner groove */
-    var(--mustard) 35% 100%   /* flat disc face */
-  );
+  /* Softer than the cards' shadow, and deliberately not --ink. The cards are
+     rectangles, so an ink offset behind one reads as a second plane. Behind a
+     circle whose own rim is ink, the same color just fuses with the disc and
+     the whole mark looks stretched down-right. A lighter value stays a shadow. */
+  box-shadow: 3px 3px 0 var(--ink-soft);
+  background: var(--ink) url('icons/icon.svg') center / 116% 116% no-repeat;
 }
 
 /* Stats "data card" — looks like a printed index card, not a dashboard.
@@ -366,6 +408,36 @@ body {
   user-select: none;
 }
 .pill-rail.is-dragging .pill { cursor: grabbing; }
+
+/* Tags wrap instead of scrolling. Which of them are on screen is decided in JS,
+   not here — pills past the first line get the `hidden` attribute, so they
+   leave the tab order too rather than sitting invisible and still focusable. */
+.pill-cloud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding-bottom: 0.4rem;
+}
+/* The expand control. Same block proportions as a pill so the line stays even,
+   dashed and unfilled so it doesn't read as one more thing you can filter by. */
+.pill-more {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+  padding: 0.4rem 0.8rem;
+  border: 2px dashed var(--ink-soft);
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+.pill-more:hover {
+  background: var(--paper-deep);
+  color: var(--ink);
+  border-color: var(--ink);
+}
 .pill {
   flex: 0 0 auto;
   scroll-snap-align: start;
@@ -430,6 +502,50 @@ body {
   cursor: pointer;
   padding: 0.1rem 0;
 }
+
+/* ---------- Export button ---------- */
+.export-btn {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  background: var(--surface);
+  border: 2px solid var(--ink);
+  box-shadow: 2px 2px 0 var(--ink);
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+  transition: transform 0.1s var(--ease), box-shadow 0.1s var(--ease), background-color 0.1s var(--ease);
+}
+.export-btn:hover { background: var(--mustard); }
+.export-btn:active { transform: translate(2px, 2px); box-shadow: none; }
+
+/* ---------- View toggle ----------
+   Two segmented buttons sharing one border, so they read as a single control
+   with two positions rather than two unrelated buttons. */
+.view-toggle {
+  display: flex;
+  border: 2px solid var(--ink);
+  box-shadow: 2px 2px 0 var(--ink);
+  background: var(--surface);
+}
+.view-toggle button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 1.85rem;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--ink);
+  cursor: pointer;
+}
+.view-toggle button + button { border-left: 2px solid var(--ink); }
+.view-toggle button svg { width: 0.85rem; height: 0.85rem; }
+.view-toggle button:hover { background: var(--mustard); }
+.view-toggle button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
 
 /* ---------- Sort dropdown ----------
    Same construction-paper language as the pills/inputs: hard 2px border, offset
@@ -572,6 +688,81 @@ body {
   margin-top: 0.1rem;
 }
 
+/* ============================================================
+   List view
+   ============================================================
+   The same <ul> as the grid, switched to a single column of rows. A cover wall
+   is for browsing; this is for scanning a few hundred titles at once — and for
+   printing, where it becomes a shelf inventory. */
+.grid.is-list {
+  grid-template-columns: 1fr;
+  gap: 0.4rem;
+}
+.card.row {
+  display: grid;
+  /* thumb | location | artist+title | genre | year */
+  grid-template-columns: 2.5rem 5.5rem 1fr auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.3rem 0.6rem 0.3rem 0.3rem;
+  box-shadow: 3px 3px 0 var(--card-shadow);
+}
+.card.row:hover { transform: translateY(-2px); box-shadow: 5px 6px 0 var(--card-shadow); }
+.card.row:active { transform: translateY(1px); box-shadow: 2px 2px 0 var(--card-shadow); }
+
+.row-thumb {
+  width: 2.5rem;
+  border-bottom: none;
+  border: 2px solid var(--ink);
+}
+.row-loc {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+/* Artist and title share the flexible column: artist above on a phone, side by
+   side once there's room. */
+.row-text { display: flex; flex-direction: column; min-width: 0; }
+.row-artist {
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-title {
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-genre {
+  display: none;                  /* too tight for a genre on a phone */
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.row-year {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+  text-align: right;
+  min-width: 2.5rem;
+}
+@media (min-width: 720px) {
+  .card.row { grid-template-columns: 2.5rem 6rem 1fr 10rem 3rem; }
+  .row-text { flex-direction: row; align-items: baseline; gap: 0.6rem; }
+  .row-artist { flex: 0 1 auto; }
+  .row-title { flex: 1 1 auto; }
+  .row-genre { display: block; }
+}
+
 /* Briefly pulse the card the shuffle landed on */
 .card.is-shuffled { animation: shuffleLand 0.9s var(--ease); }
 @keyframes shuffleLand {
@@ -619,6 +810,8 @@ body.modal-open { overflow: hidden; }
 .detail-close:active,
 .detail-close:focus-visible { transform: translate(2px, 2px); }   /* 2px shadow */
 .detail-cover {
+  /* Square and full width: a CD sleeve is square, so this shows the whole
+     artwork at the largest size the dialog allows, uncropped. */
   aspect-ratio: 1 / 1;
   border-bottom: 3px solid var(--ink);
   overflow: hidden;
@@ -688,6 +881,233 @@ body.modal-open { overflow: hidden; }
 }
 .detail-notes:empty { display: none; }
 
+/* ---------- "Look it up" links ----------
+   Shaped like the tag chips so they read as part of the same printed card, but
+   given the brick accent and a hover lift so they're obviously clickable. */
+.detail-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 1rem;
+  padding-top: 0.9rem;
+  border-top: 1.5px dashed var(--ink-soft);
+}
+.detail-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  text-decoration: none;
+  color: var(--ink);
+  padding: 0.25rem 0.6rem;
+  background: var(--surface);
+  border: 2px solid var(--ink);
+  box-shadow: 2px 2px 0 var(--ink);
+  transition: transform 0.1s var(--ease), box-shadow 0.1s var(--ease), background-color 0.1s var(--ease);
+}
+.detail-link:hover { background: var(--mustard); }
+.detail-link:active { transform: translate(2px, 2px); box-shadow: none; }
+/* Sized in em so it tracks the label rather than needing its own breakpoints.
+   The last letter's tracking would otherwise crowd it — the label's
+   letter-spacing puts a gap after the final glyph, so pull it back a touch. */
+.detail-link-icon {
+  flex: 0 0 auto;
+  width: 0.95em;
+  height: 0.95em;
+  margin-left: -0.04em;
+}
+
+/* ---------- Tracklist ----------
+   A numbered running order with a dotted leader out to the duration, matching
+   the genre counts on the stats card. */
+.detail-tracks { margin-top: 1.1rem; }
+.detail-tracks[hidden] { display: none; }
+.detail-tracks-heading {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-soft);
+  margin: 0 0 0.5rem;
+}
+.tracklist {
+  margin: 0;
+  /* No marker gutter: the items are flex containers, which Blink refuses to
+     paint a ::marker on, so the indent was reserving space for numbers that
+     never appear. Still an <ol> — the running order is meaningful even with the
+     numbers off — so list-style is turned off explicitly rather than left to
+     depend on that quirk. */
+  padding: 0;
+  list-style: none;
+  font-size: 0.85rem;
+}
+.tracklist-item {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.16rem 0;
+}
+.track-title { flex: 0 1 auto; min-width: 0; }
+/* Dotted leader out to the duration, same device as the genre counts. Drawn on
+   the item rather than an extra element so the markup stays two spans. */
+.tracklist-item::after {
+  content: "";
+  order: 1;                 /* between the title and the duration */
+  flex: 1 1 0.75rem;
+  border-bottom: 2px dotted var(--paper-deep);
+  transform: translateY(-0.3em);
+}
+.track-len {
+  order: 2;
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+}
+.tracklist-loading {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  margin: 0;
+}
+
+/* ============================================================
+   Statistics page (stats.html)
+   ============================================================
+   Same construction-paper vocabulary as the grid — hard borders, offset
+   shadows, mono labels — applied to counts instead of covers. The charts are
+   plain DOM: a label, a track, a filled bar. No canvas, no library. */
+.stats-page {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+/* ---------- Headline figures ---------- */
+.figure-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  gap: 0.75rem;
+}
+.figure-card {
+  border: 2px solid var(--ink);
+  background: var(--surface);
+  box-shadow: 5px 5px 0 var(--ink);
+  padding: 0.85rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.figure-value {
+  font-family: var(--font-display);
+  font-size: clamp(1.9rem, 6vw, 2.6rem);
+  line-height: 1;
+  color: var(--orange);
+}
+/* The year span is text, not a count — let it size to fit rather than
+   matching the big numerals and wrapping mid-range. */
+.figure-card.is-wide .figure-value {
+  font-size: clamp(1.4rem, 4.5vw, 1.9rem);
+  color: var(--teal);
+}
+.figure-label {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+}
+
+/* ---------- Panels ---------- */
+.panel {
+  border: 2px solid var(--ink);
+  background: var(--surface);
+  box-shadow: 6px 6px 0 var(--ink);
+  padding: 1rem 1.1rem 1.2rem;
+}
+.panel-title {
+  font-family: var(--font-display);
+  text-transform: uppercase;
+  font-size: clamp(1.4rem, 5vw, 2rem);
+  line-height: 1;
+  margin: 0;
+  color: var(--ink);
+}
+.panel-note {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--ink-soft);
+  margin: 0.35rem 0 1rem;
+}
+
+/* ---------- Bar charts ---------- */
+.chart {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.bar-row {
+  display: grid;
+  /* label | bar | count — the label column is fixed so every bar starts at the
+     same x and the lengths are actually comparable by eye. */
+  grid-template-columns: minmax(0, 7.5rem) 1fr 2.5rem;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.15rem 0.2rem;
+  text-decoration: none;
+  color: inherit;
+}
+.bar-label {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  /* Long artist names truncate rather than wrapping every row to two lines. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bar-track {
+  height: 1.1rem;
+  border: 1.5px solid var(--ink);
+  background: var(--paper-deep);
+  overflow: hidden;
+}
+.bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--ink-soft);
+  /* Bars grow in on load; the transition is on width only so a zero-count row
+     doesn't animate from somewhere it never was. */
+  transition: width 0.5s var(--ease);
+}
+.bar-value {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.75rem;
+  text-align: right;
+}
+.bar-row.is-link:hover .bar-track,
+.bar-row.is-link:focus-visible .bar-track { box-shadow: 3px 3px 0 var(--ink); }
+.bar-row.is-link:hover .bar-label { text-decoration: underline; }
+
+.chart-tail {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--ink-soft);
+  margin: 0.6rem 0 0;
+  padding-top: 0.5rem;
+  border-top: 1.5px dashed var(--ink-soft);
+}
+
+@media (min-width: 720px) {
+  .bar-row { grid-template-columns: minmax(0, 11rem) 1fr 3rem; }
+}
+
 /* ============================================================
    States + footer
    ============================================================ */
@@ -711,6 +1131,43 @@ body.modal-open { overflow: hidden; }
   border-top: 2px solid var(--ink);
 }
 .site-footer p { margin: 0; }
+
+/* ============================================================
+   Print
+   ============================================================
+   Printing is really only useful for the list view — a shelf inventory you can
+   carry into a shop. So: drop the controls and the paper texture, flatten the
+   rows to plain ruled lines, and let the browser paginate. */
+@media print {
+  body { background: #fff; }
+  .grain,
+  .controls,
+  .filters,
+  .results-tools,
+  .site-footer,
+  .cd-logo,
+  .detail { display: none !important; }
+
+  .site-header { border-bottom: 2px solid #000; }
+  .stats-card,
+  .panel,
+  .figure-card { box-shadow: none; }
+  .panel { break-inside: avoid; }
+
+  .grid.is-list { gap: 0; }
+  /* Thumbnails are the first thing to go: they cost ink and add nothing to a
+     list you're scanning by catalog number — so the columns lose theirs too. */
+  .row-thumb { display: none; }
+  .card.row {
+    box-shadow: none;
+    border: none;
+    border-bottom: 1px solid #999;
+    padding: 0.18rem 0;
+    break-inside: avoid;
+    grid-template-columns: 5rem 1fr 9rem 3rem;
+  }
+  .card { opacity: 1 !important; transform: none !important; }
+}
 
 /* ============================================================
    Reduced motion: drop slides/staggers/spins to simple fades
