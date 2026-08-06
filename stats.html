@@ -79,7 +79,9 @@
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"
           integrity="sha384-D/t0ZMqQW31H3az8ktEiNb39wyKnS82iFY52QPACM+IjKW3jDUhyIgh2PApRqJZs"
           crossorigin="anonymous"></script>
-  <script src="collection.js"></script>
-  <script src="stats.js"></script>
+
+  <!-- ES module; it imports collection.js itself. Module scripts are deferred
+       and PapaParse above is not, so window.Papa is ready before this runs. -->
+  <script type="module" src="js/stats.js"></script>
 </body>
 </html>

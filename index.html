@@ -196,8 +196,10 @@
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"
           integrity="sha384-D/t0ZMqQW31H3az8ktEiNb39wyKnS82iFY52QPACM+IjKW3jDUhyIgh2PApRqJZs"
           crossorigin="anonymous"></script>
-  <script src="musicbrainz.js"></script>
-  <script src="collection.js"></script>
-  <script src="app.js"></script>
+
+  <!-- The app is ES modules: js/app.js pulls in the rest through imports, so
+       this is the only one the page names. A module script is deferred, and
+       PapaParse above is not, so window.Papa exists before any module runs. -->
+  <script type="module" src="js/app.js"></script>
 </body>
 </html>

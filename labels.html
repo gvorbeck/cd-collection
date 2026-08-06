@@ -110,12 +110,10 @@
     <p>An archive of physical discs. Labels are stored in this browser, not the sheet.</p>
   </footer>
 
-  <!-- collection.js is loaded for escapeHtml alone: this page builds its label
-       markup as HTML strings, and the escaping rule is one that has to be the
-       same everywhere or it isn't a rule. Nothing here calls Collection.load(),
+  <!-- labels.js imports escapeHtml from collection.js: this page builds its
+       label markup as HTML strings, and the escaping rule is one that has to
+       be the same everywhere or it isn't a rule. Nothing here calls load(),
        so PapaParse isn't needed and isn't loaded. -->
-  <script src="collection.js"></script>
-  <script src="musicbrainz.js"></script>
-  <script src="labels.js"></script>
+  <script type="module" src="js/labels.js"></script>
 </body>
 </html>

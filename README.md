@@ -37,8 +37,9 @@ Three pages. Two read the sheet; the third is a print tool that doesn't:
   cover art once it's been fetched. See [Offline & installing](#offline--installing).
 
 The sheet URL, column names, and blank-cell fallbacks are in the `CONFIG` block
-at the top of `collection.js` — the shared data layer every page loads. The
-placeholder-cover palette is display-only and stays in `CONFIG` in `app.js`.
+at the top of `js/collection.js` — the shared data layer every page imports.
+The placeholder-cover palette is display-only and stays in `CONFIG` in
+`js/config.js`.
 
 ## What the site does
 
@@ -112,7 +113,7 @@ below are what the site looks for.
 
 Every column is optional — a completely blank row is skipped, and any single
 missing cell just uses the fallback above. (To rename a column, update both the
-sheet header **and** the matching entry in `CONFIG.COLUMNS` in `collection.js`.)
+sheet header **and** the matching entry in `CONFIG.COLUMNS` in `js/collection.js`.)
 
 ### Books & shelf location
 
@@ -150,13 +151,11 @@ places it at its first slot.
 | File                    | What it is                                                        |
 |-------------------------|-------------------------------------------------------------------|
 | `index.html`            | The grid page — markup and the loading/empty/error states.        |
-| `stats.html` / `stats.js` | The breakdowns page and the counting behind it.                 |
-| `labels.html` / `labels.js` | The label generator and the editing behind it.                |
+| `stats.html`            | The breakdowns page.                                              |
+| `labels.html`           | The label generator.                                              |
 | `styles.css`            | All styling for every page (construction-paper / retro-infographic). |
 | `labels.css`            | The labels page only: its form UI, and the frozen printed label. See below. |
-| `collection.js`         | Shared data layer: `CONFIG`, sheet fetch, CSV parsing, disc model, `escapeHtml`. |
-| `musicbrainz.js`        | Shared MusicBrainz primitives: the site-wide 1/sec throttle (`MB.throttledFetch`), Lucene escaping, release search + scoring, tracklist flattening, duration formatting. |
-| `app.js`                | The grid page: rendering, filtering, sorting, URL state, detail view. |
+| `js/`                   | All JavaScript, as ES modules. See the table below.               |
 | `sw.js`                 | Service worker — offline caching (see above).                     |
 | `manifest.webmanifest`  | PWA manifest: name, colors, icons, shortcuts.                     |
 | `icons/`                | App icons, generated and committed.                               |
@@ -164,6 +163,31 @@ places it at its first slot.
 | `sample.csv`            | Dummy data for local development (see below).                     |
 | `CNAME`                 | Custom-domain config for GitHub Pages (`cd.iamgarrett.com`).      |
 | `qr.svg` / `qr.png`     | QR code linking to the live site.                                 |
+
+### The modules in `js/`
+
+Native ES modules — no bundler, no build step. Each page loads exactly one
+entry point with `<script type="module">` and the browser follows the imports
+from there. There is no global namespace: everything crosses a module boundary
+by being imported by name.
+
+| Module            | What it is                                                      |
+|-------------------|-----------------------------------------------------------------|
+| `collection.js`   | Shared data layer: `CONFIG`, sheet fetch, CSV parsing, disc model, `escapeHtml`. Imported by all three pages. |
+| `musicbrainz.js`  | Shared MusicBrainz primitives: the site-wide 1/sec throttle, Lucene escaping, release search + scoring, tracklist flattening, duration formatting. |
+| `app.js`          | **Entry point for `index.html`.** Wiring only — reads the URL, loads the sheet, binds the event listeners, and hands off. |
+| `stats.js`        | **Entry point for `stats.html`.** Counts the collection three ways and draws the bar charts. |
+| `labels.js`       | **Entry point for `labels.html`.** The label list, the form, and the print sheet. |
+| `config.js`       | Grid-page tunables: timings, thresholds, sheet column names, the placeholder palette. |
+| `util.js`         | Tiny shared helpers — element lookup, reduced-motion check, hex test, CSS-variable read, the `localStorage` wrapper. |
+| `color.js`        | Per-artist accent colors, hex/RGB math, contrast, dominant-color sampling from cover art. |
+| `art.js`          | Cover-art and tracklist resolution: MusicBrainz lookups, the Cover Art Archive, and the caches over both. |
+| `cover.js`        | The generated placeholder cover — canvas, drawn per disc when no art exists. |
+| `dom.js`          | The one cache of grid-page element references. |
+| `render.js`       | Everything that writes to the grid: cards, rows, pills, the tag cloud, the stats card, screen-reader announcements. |
+| `detail.js`       | The disc dialog — opening, populating, and closing it. |
+| `state.js`        | The grid's state and the operations on it: filter, sort, view, shuffle, export. |
+| `url.js`          | The URL as state: reading it on load, writing it on change, and Back/Forward. |
 
 ### The labels page's two layers
 
@@ -194,11 +218,14 @@ python3 -m http.server 4173
 
 Then open <http://localhost:4173/>.
 
-Opening the files directly (`file://`) mostly works, but the service worker
-won't register — it needs `https` or `localhost`. If a change to a page or
-script doesn't seem to take effect locally, it's the service worker serving
-the cached copy; unregister it in DevTools → Application, or bump
-`CACHE_VERSION` in `sw.js`.
+A server is required — opening the files directly (`file://`) no longer works
+at all. Module scripts are fetched with CORS, and `file://` has no origin to
+satisfy it, so nothing loads. (The service worker never worked over `file://`
+either; it needs `https` or `localhost`.)
+
+If a change to a page or script doesn't seem to take effect locally, it's the
+service worker serving the cached copy; unregister it in DevTools →
+Application, or bump `CACHE_VERSION` in `sw.js`.
 
 ### Preview mode
 

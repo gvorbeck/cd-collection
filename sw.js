@@ -20,13 +20,13 @@
 
    Known trade-off: the HTML is network-first but its scripts are
    stale-while-revalidate, so the first load after a deploy can
-   pair fresh markup with the previous app.js before the refetch
+   pair fresh markup with the previous modules before the refetch
    lands. Nothing here is content-hashed (no build step to do it),
    so bumping CACHE_VERSION is the fix when a release changes the
    contract between the two.
    ============================================================ */
 
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v4';
 const SHELL_CACHE = `cdc-shell-${CACHE_VERSION}`;
 const DATA_CACHE  = `cdc-data-${CACHE_VERSION}`;
 const ART_CACHE   = `cdc-art-${CACHE_VERSION}`;
@@ -44,11 +44,24 @@ const SHELL_ASSETS = [
   'stats.html',
   'styles.css',
   'labels.css',
-  'collection.js',
-  'musicbrainz.js',
-  'app.js',
-  'stats.js',
-  'labels.js',
+  // Every module, listed one by one. A page names only its entry point, but
+  // the browser resolves imports at fetch time, so an unlisted module is a
+  // network request the offline shell can't answer.
+  'js/collection.js',
+  'js/musicbrainz.js',
+  'js/config.js',
+  'js/util.js',
+  'js/color.js',
+  'js/art.js',
+  'js/cover.js',
+  'js/dom.js',
+  'js/render.js',
+  'js/detail.js',
+  'js/state.js',
+  'js/url.js',
+  'js/app.js',
+  'js/stats.js',
+  'js/labels.js',
   'sample.csv',
   'manifest.webmanifest',
   'icons/icon.svg',
