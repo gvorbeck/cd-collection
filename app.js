@@ -70,9 +70,6 @@ const CONFIG = {
     // {mbid} is a release-group id; size is one of 250 / 500 / 1200.
     CAA_URL: 'https://coverartarchive.org/release-group',
     CAA_SIZE: 500,
-    // Minimum gap between MusicBrainz network calls (ms). MB's rule is 1/sec;
-    // 1100ms leaves a little headroom.
-    THROTTLE_MS: 1100,
     // localStorage key + schema version. Bump the version to invalidate the
     // whole cache if the lookup logic changes.
     CACHE_KEY: 'cdc:art-cache:v1',
@@ -91,7 +88,7 @@ const CONFIG = {
 
 // Helpers shared with the stats page live in collection.js; pull the ones this
 // page uses into local names so call sites stay short.
-const { el, formatLocation, escapeHtml } = Collection;
+const { el, formatLocation } = Collection;
 
 // Whether the user prefers reduced motion (checked live, not cached).
 function reducedMotion() {
@@ -221,6 +218,41 @@ function rgbToHex(r, g, b) {
 
 
 /* ============================================================
+   Persistent caches: localStorage, read and written as JSON
+   ============================================================
+   Two caches live here — cover art and tracklists — and both want the same
+   thing: read a JSON blob at startup, write it back on every update, and never
+   let a failure matter. localStorage can be disabled outright (private mode,
+   a locked-down profile), full, or holding something a previous version wrote
+   that no longer parses. In all three cases the right answer is the same: fall
+   back to an in-memory object and carry on with a slower session, not a broken
+   one. That's why nothing below rethrows.
+*/
+
+/** Parse a stored JSON object, or `{}` if it's missing, corrupt, or blocked. */
+function readStore(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed = raw ? JSON.parse(raw) : null;
+    // A stored array or scalar would break every `cache[k]` read below, so only
+    // a real object counts as a hit.
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (err) {
+    return {};
+  }
+}
+
+/** Write a JSON object back. Silent on failure — see the note above. */
+function writeStore(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (err) {
+    // Out of quota or unavailable — keep going with the in-memory copy.
+  }
+}
+
+
+/* ============================================================
    4b. Cover-art lookup: MusicBrainz → Cover Art Archive
    ============================================================
    For discs with no Art URL, find a cover automatically:
@@ -236,25 +268,13 @@ function rgbToHex(r, g, b) {
 // Maps a normalized "artist|title" key → a CAA image URL, or the MISS
 // sentinel when a prior lookup found nothing (so we don't re-query known
 // misses on every visit). Loaded once; written through on each update.
-const ART_MISS = ' miss'; // sentinel that can't collide with a real URL
-let artCache = loadArtCache();
-
-function loadArtCache() {
-  try {
-    const raw = localStorage.getItem(CONFIG.MUSICBRAINZ.CACHE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch (err) {
-    // localStorage disabled/full or bad JSON — degrade to an in-memory cache.
-    return {};
-  }
-}
+const ART_MISS = '\u0000miss'; // sentinel that can't collide with a real URL
+// Written as an escape, not a literal NUL: a raw NUL byte makes git treat
+// this file as binary and makes grep skip it silently.
+let artCache = readStore(CONFIG.MUSICBRAINZ.CACHE_KEY);
 
 function persistArtCache() {
-  try {
-    localStorage.setItem(CONFIG.MUSICBRAINZ.CACHE_KEY, JSON.stringify(artCache));
-  } catch (err) {
-    // Out of quota or unavailable — keep going with the in-memory copy.
-  }
+  writeStore(CONFIG.MUSICBRAINZ.CACHE_KEY, artCache);
 }
 
 // Stable cache key for a disc. Lowercased + whitespace-collapsed so trivial
@@ -264,29 +284,11 @@ function artCacheKey(disc) {
   return `${norm(disc.artist)}|${norm(disc.title)}`;
 }
 
-// --- throttle -----------------------------------------------------------
-// Serialize MusicBrainz network calls with a minimum gap between them. Cache
-// hits never enter this queue, so browsing cached discs stays instant.
-let mbChain = Promise.resolve();
-let mbLastCall = 0;
-
-function throttledMbFetch(url) {
-  const run = async () => {
-    const gap = CONFIG.MUSICBRAINZ.THROTTLE_MS - (nowMs() - mbLastCall);
-    if (gap > 0) await MB.delay(gap);
-    mbLastCall = nowMs();
-    return fetch(url, { headers: { Accept: 'application/json' } });
-  };
-  // Chain so calls run one-at-a-time; a failure in one shouldn't break the
-  // chain for the next, so swallow errors on the chaining link only.
-  const result = mbChain.then(run, run);
-  mbChain = result.then(() => {}, () => {});
-  return result;
-}
-
-function nowMs() {
-  return (typeof performance !== 'undefined' ? performance.now() : Date.now());
-}
+// The throttle itself lives in musicbrainz.js, shared with the labels page —
+// MB's 1/sec rule is per client, and this page and that one are the same
+// client. Cache hits never enter the queue, so browsing cached discs stays
+// instant.
+const throttledMbFetch = MB.throttledFetch;
 
 // --- resolution ---------------------------------------------------------
 /**
@@ -417,16 +419,7 @@ async function findReleaseGroupMbid(disc) {
 */
 
 // mbid → { t: [[title, lengthMs], …], at: <last used ms> }
-let tracksCache = loadTracksCache();
-
-function loadTracksCache() {
-  try {
-    const raw = localStorage.getItem(CONFIG.MUSICBRAINZ.TRACKS_CACHE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch (err) {
-    return {}; // unavailable or corrupt — degrade to in-memory
-  }
-}
+let tracksCache = readStore(CONFIG.MUSICBRAINZ.TRACKS_CACHE_KEY);
 
 /**
  * Persist the tracklist cache, evicting the least-recently-used entries first
@@ -434,18 +427,14 @@ function loadTracksCache() {
  * one-line entries, and they share the same origin-wide storage budget.
  */
 function persistTracksCache() {
-  try {
-    const keys = Object.keys(tracksCache);
-    const max = CONFIG.MUSICBRAINZ.TRACKS_CACHE_MAX;
-    if (keys.length > max) {
-      keys.sort((a, b) => (tracksCache[a].at || 0) - (tracksCache[b].at || 0))
-        .slice(0, keys.length - max)
-        .forEach((k) => { delete tracksCache[k]; });
-    }
-    localStorage.setItem(CONFIG.MUSICBRAINZ.TRACKS_CACHE_KEY, JSON.stringify(tracksCache));
-  } catch (err) {
-    // Out of quota or unavailable — keep going with the in-memory copy.
+  const keys = Object.keys(tracksCache);
+  const max = CONFIG.MUSICBRAINZ.TRACKS_CACHE_MAX;
+  if (keys.length > max) {
+    keys.sort((a, b) => (tracksCache[a].at || 0) - (tracksCache[b].at || 0))
+      .slice(0, keys.length - max)
+      .forEach((k) => { delete tracksCache[k]; });
   }
+  writeStore(CONFIG.MUSICBRAINZ.TRACKS_CACHE_KEY, tracksCache);
 }
 
 /**
@@ -517,12 +506,9 @@ async function fetchTracklist(mbid) {
   return out.length ? out : null;
 }
 
-// Milliseconds → "m:ss". Blank for a track MusicBrainz has no timing for.
-function formatDuration(ms) {
-  if (!ms) return '';
-  const total = Math.round(ms / 1000);
-  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
-}
+// Milliseconds → "m:ss". Shared with the labels page, which formats the same
+// MusicBrainz lengths onto printed spines.
+const formatDuration = MB.formatDuration;
 
 
 /* ============================================================
@@ -676,36 +662,69 @@ function cacheDom() {
   dom.body          = document.body;
 }
 
-// Announce something to screen readers via the polite live region.
+// Announce something to screen readers via the polite live region. Discrete
+// events (shuffle, export, view switch) go straight through — they're user
+// actions, and one action deserves one announcement.
 function announce(message) {
+  // Any pending count would land on top of this one; drop it.
+  clearTimeout(countAnnounceTimer);
+  lastCountAnnounced = '';
   dom.liveRegion.textContent = message;
+}
+
+let countAnnounceTimer;
+let lastCountAnnounced = '';
+
+/**
+ * Announce the result count — the one announcement that isn't tied to a
+ * discrete action.
+ *
+ * The search box refilters every 120ms while you type, and a polite live region
+ * rewritten that often is one a screen reader spends its whole time restarting:
+ * you hear the first syllable of a dozen counts and the end of none. So wait for
+ * typing to settle, and say nothing when the number didn't actually change —
+ * three keystrokes that keep narrowing to the same 4 discs are one result.
+ */
+function announceCount(message) {
+  clearTimeout(countAnnounceTimer);
+  countAnnounceTimer = setTimeout(() => {
+    if (message === lastCountAnnounced) return;
+    lastCountAnnounced = message;
+    dom.liveRegion.textContent = message;
+  }, 700);
 }
 
 // Build the stats "data card": total + per-genre counts.
 function renderStats(discs) {
   dom.statTotal.textContent = discs.length;
 
-  const counts = {};
-  for (const d of discs) counts[d.genre] = (counts[d.genre] || 0) + 1;
+  // A Map, not a plain object: genres come from a spreadsheet anyone can type
+  // into, and a genre literally named "constructor" or "__proto__" would
+  // otherwise read back an inherited function instead of a count.
+  const counts = new Map();
+  for (const d of discs) counts.set(d.genre, (counts.get(d.genre) || 0) + 1);
 
-  const ordered = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1]);
   const visible = CONFIG.STATS_GENRES_VISIBLE;
 
-  dom.statGenres.innerHTML = '';
-  ordered.forEach(([genre, count], i) => {
+  const rows = ordered.map(([genre, count], i) => {
     const li = document.createElement('li');
     // Genres past the top N start hidden; the toggle button reveals them.
     if (i >= visible) li.classList.add('is-collapsed');
-    li.innerHTML =
-      `<span class="g-name">${escapeHtml(genre)}</span>` +
-      `<span class="g-dots" aria-hidden="true"></span>` +
-      `<span class="g-count">${count}</span>`;
-    dom.statGenres.appendChild(li);
+    const dots = el('span', 'g-dots');
+    dots.setAttribute('aria-hidden', 'true');
+    // Built as nodes rather than an innerHTML string — every other renderer
+    // here does, and it's the one construction that can't go wrong no matter
+    // what the sheet contains.
+    li.append(el('span', 'g-name', genre), dots, el('span', 'g-count', String(count)));
+    return li;
   });
 
   // Only offer the toggle when there's something hidden to reveal.
   const hidden = ordered.length - visible;
-  if (hidden > 0) dom.statGenres.appendChild(makeGenresToggle(hidden));
+  if (hidden > 0) rows.push(makeGenresToggle(hidden));
+
+  dom.statGenres.replaceChildren(...rows);
 }
 
 // Build the "show more / show less" button that expands the collapsed genres.
@@ -859,13 +878,19 @@ function layoutTagCloud() {
  * sampling for real art so the card shadow gets tinted once it loads.
  */
 function renderCards(discs) {
-  // Cancel any dwell timers armed on the cards we're about to discard, so a
-  // detached fly-by card can't fire a lookup after the grid re-renders.
+  // Retire the cards we're about to discard. Two things have to happen here:
+  // cancel any armed dwell timer, so a detached fly-by card can't fire a lookup
+  // after the grid re-renders; and unobserve, because an IntersectionObserver
+  // holds a STRONG reference to every target it was given. Dropping the node
+  // out of the DOM doesn't release it — over a session of filtering and sorting
+  // the observer accumulates every card ever rendered.
   dom.grid.querySelectorAll('.card').forEach((card) => {
     if (card._artDwellTimer) {
       clearTimeout(card._artDwellTimer);
       card._artDwellTimer = null;
     }
+    if (artObserver) artObserver.unobserve(card);
+    card._artTarget = null;
   });
 
   dom.grid.innerHTML = '';
@@ -894,40 +919,54 @@ function renderCards(discs) {
   }
 }
 
-function buildCard(disc, index) {
+/**
+ * Everything the grid card and the list row have in common: the <li> wrapper,
+ * the <button> that opens the detail view, and the cover <img> wired into the
+ * art pipeline. The two views differ in what they arrange around this, not in
+ * any of it — and the parts that were duplicated (the shadow-property guard,
+ * the click handler, the lazy/decorative <img>, the _cardEl backref) are all
+ * ones where a change to one copy and not the other is a silent bug.
+ */
+function buildCardShell(disc, { className = 'card', coverClass = 'card-cover-wrap' } = {}) {
   const li = document.createElement('li');
   li.className = 'grid-item';
 
   const card = document.createElement('button');
   card.type = 'button';
-  card.className = 'card';
+  card.className = className;
   // Only once there's a sampled color — setting the property to `undefined`
   // stringifies, which invalidates the box-shadow that reads it and leaves the
   // card with no shadow at all instead of the neutral one the CSS defines.
   if (disc.coverColor) card.style.setProperty('--card-shadow', disc.coverColor);
   card.addEventListener('click', () => openDetail(disc));
 
-  // Cover
-  const coverWrap = document.createElement('div');
-  coverWrap.className = 'card-cover-wrap';
-
+  const coverWrap = el('div', coverClass);
   const img = document.createElement('img');
   img.className = 'card-cover';
   img.loading = 'lazy';
   img.decoding = 'async';
-  // Decorative here: the artist + title are already text inside the button, so
+  // Decorative: the artist + title are already text inside the button, so
   // giving the image alt text would make screen readers announce them twice.
   img.alt = '';
   setCoverImage(img, disc, card);
   coverWrap.appendChild(img);
+  card.appendChild(coverWrap);
+
+  li.appendChild(card);
+
+  // Remember the card node so shuffle can scroll/pulse it.
+  disc._cardEl = card;
+  return { li, card, coverWrap };
+}
+
+function buildCard(disc, index) {
+  const { li, card, coverWrap } = buildCardShell(disc);
 
   // Shelf-location accession tag (omit entirely if blank). Shows book + slot,
   // e.g. "B2 · #42–43"; a multi-disc release shows its slot range.
   if (disc.locationLabel) {
     coverWrap.appendChild(el('span', 'card-number', disc.locationLabel));
   }
-
-  card.appendChild(coverWrap);
 
   // Body
   const body = el('div', 'card-body');
@@ -938,10 +977,6 @@ function buildCard(disc, index) {
   }
 
   card.appendChild(body);
-  li.appendChild(card);
-
-  // Remember the card node so shuffle can scroll/pulse it.
-  disc._cardEl = card;
   return li;
 }
 
@@ -956,26 +991,12 @@ function buildCard(disc, index) {
  * so there's nothing to offset.
  */
 function buildRow(disc) {
-  const li = document.createElement('li');
-  li.className = 'grid-item';
-
-  const row = document.createElement('button');
-  row.type = 'button';
-  row.className = 'card row';
-  if (disc.coverColor) row.style.setProperty('--card-shadow', disc.coverColor);
-  row.addEventListener('click', () => openDetail(disc));
-
-  // Thumbnail. Same wrapper class as the grid so setCoverImage/observeForArt
-  // need no special case; CSS sizes it down.
-  const coverWrap = el('div', 'card-cover-wrap row-thumb');
-  const img = document.createElement('img');
-  img.className = 'card-cover';
-  img.loading = 'lazy';
-  img.decoding = 'async';
-  img.alt = ''; // decorative: the text beside it says the same thing
-  setCoverImage(img, disc, row);
-  coverWrap.appendChild(img);
-  row.appendChild(coverWrap);
+  // Same cover wrapper class as the grid (plus a sizing hook) so setCoverImage
+  // and observeForArt need no special case here.
+  const { li, card: row } = buildCardShell(disc, {
+    className: 'card row',
+    coverClass: 'card-cover-wrap row-thumb',
+  });
 
   // Shelf location, in the mono "accession number" voice used everywhere else.
   // Spelled out rather than a dash: a screen reader reads this row as one
@@ -990,8 +1011,6 @@ function buildRow(disc) {
   row.appendChild(el('span', 'row-genre', disc.genre));
   row.appendChild(el('span', 'row-year', disc.year || ''));
 
-  li.appendChild(row);
-  disc._cardEl = row;
   return li;
 }
 
@@ -1149,7 +1168,9 @@ function openDetail(disc, { pushUrl = true } = {}) {
   // art loads — no layout shift as it streams in. CSS scales it to fit.
   img.width = 400;
   img.height = 400;
-  img.alt = `${disc.artist} — ${disc.title}`;
+  // Decorative, same as the cards: the dialog is labelled by the title and the
+  // artist is the line under it, so alt text here reads them a second time.
+  img.alt = '';
   if (disc.art) {
     img.src = disc.art;
     img.addEventListener('error', () => { img.src = generatePlaceholderCover(disc); });
@@ -1509,7 +1530,7 @@ function applyFilters({ announceResults = true } = {}) {
   }
 
   if (announceResults) {
-    announce(anyFilter ? `${n} disc${n === 1 ? '' : 's'} match your filters.` : `Showing all ${total} discs.`);
+    announceCount(anyFilter ? `${n} disc${n === 1 ? '' : 's'} match your filters.` : `Showing all ${total} discs.`);
   }
 }
 
@@ -1786,13 +1807,36 @@ function syncControlsToState() {
 }
 
 /**
+ * A comparable summary of everything that changes what the grid shows. Used to
+ * tell "the filters moved" apart from "only the disc in the hash moved".
+ */
+function stateSignature() {
+  return JSON.stringify([
+    state.search,
+    [...state.genres].sort(),
+    [...state.tags].sort(),
+    state.sort,
+    state.view,
+  ]);
+}
+
+/**
  * Bring the page in line with the URL after a Back/Forward. Handles both
  * halves — the filter state and whether a disc dialog should be showing.
  */
 function onPopState() {
+  const before = stateSignature();
   readStateFromUrl();
-  syncControlsToState();
-  applyFilters({ announceResults: false });
+
+  // Opening and closing a disc are history entries too, and they move only the
+  // hash. Re-rendering the grid for them is not just wasted work: it destroys
+  // and rebuilds every card, including the one the dialog restores focus to on
+  // close — so focus lands on <body> and a keyboard user loses their place in
+  // the shelf. Only touch the grid when the grid's own inputs actually changed.
+  if (stateSignature() !== before) {
+    syncControlsToState();
+    applyFilters({ announceResults: false });
+  }
 
   const disc = discBySlug(discSlugFromHash());
   if (disc) {

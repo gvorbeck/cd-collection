@@ -153,8 +153,8 @@ places it at its first slot.
 | `stats.html` / `stats.js` | The breakdowns page and the counting behind it.                 |
 | `labels.html`           | Printable spine labels for the books.                             |
 | `styles.css`            | All styling for every page (construction-paper / retro-infographic). |
-| `collection.js`         | Shared data layer: `CONFIG`, sheet fetch, CSV parsing, disc model. |
-| `musicbrainz.js`        | Throttled MusicBrainz / Cover Art Archive lookups, cached.        |
+| `collection.js`         | Shared data layer: `CONFIG`, sheet fetch, CSV parsing, disc model, `escapeHtml`. |
+| `musicbrainz.js`        | Shared MusicBrainz primitives: the site-wide 1/sec throttle (`MB.throttledFetch`), Lucene escaping, duration formatting. |
 | `app.js`                | The grid page: rendering, filtering, sorting, URL state, detail view. |
 | `sw.js`                 | Service worker — offline caching (see above).                     |
 | `manifest.webmanifest`  | PWA manifest: name, colors, icons, shortcuts.                     |

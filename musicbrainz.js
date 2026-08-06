@@ -26,5 +26,59 @@ window.MB = (function () {
     return str.replace(/[+\-&|!(){}\[\]^"~*?:\\/]/g, '\\$&');
   }
 
-  return { APP_IDENTITY, WS_BASE, delay, escapeLucene };
+  /* ---------- Rate limiting ----------
+     MusicBrainz asks for no more than one request per second per client, and
+     "client" means the whole page, not one feature of it. This lives here
+     rather than in either caller because both pages hit the same service and
+     a throttle each is not a throttle: two independent queues at 1/sec is
+     2/sec at the server. Anything that talks to MB goes through this. */
+
+  // Minimum gap between calls (ms). The rule is 1/sec; the extra 100ms is
+  // headroom for clock jitter between here and their rate limiter.
+  const THROTTLE_MS = 1100;
+
+  let chain = Promise.resolve();
+  let lastCall = 0;
+
+  function nowMs() {
+    return typeof performance !== 'undefined' ? performance.now() : Date.now();
+  }
+
+  /**
+   * fetch() a MusicBrainz URL, serialized behind every other MB call with at
+   * least THROTTLE_MS between them. Returns the raw Response — callers decide
+   * what a non-ok status means to them.
+   */
+  function throttledFetch(url) {
+    const run = async () => {
+      const gap = THROTTLE_MS - (nowMs() - lastCall);
+      if (gap > 0) await delay(gap);
+      lastCall = nowMs();
+      return fetch(url, { headers: { Accept: 'application/json' } });
+    };
+    // Chain so calls run one-at-a-time. A failure in one must not break the
+    // chain for the next, so errors are swallowed on the chaining link only —
+    // the returned promise still rejects for the caller that made the call.
+    const result = chain.then(run, run);
+    chain = result.then(() => {}, () => {});
+    return result;
+  }
+
+  /**
+   * Milliseconds → "m:ss", or "h:mm:ss" once it runs past an hour. Blank for a
+   * track MusicBrainz has no timing for, so callers can drop it wholesale.
+   */
+  function formatDuration(ms) {
+    if (!ms) return '';
+    const total = Math.round(ms / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const ss = String(total % 60).padStart(2, '0');
+    return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+  }
+
+  return {
+    APP_IDENTITY, WS_BASE, THROTTLE_MS,
+    delay, escapeLucene, throttledFetch, formatDuration,
+  };
 })();

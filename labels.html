@@ -25,6 +25,21 @@
     margin: 0 0 16px;
   }
 
+  /* The same four names, in the same order, as the header on the other pages.
+     This page has its own visual language (it's a print tool, not part of the
+     paper-and-ink browser), so the nav is restyled to match rather than
+     imported — but the row has to be here, or the two pages that link *to*
+     this one lead somewhere you can only leave with the Back button. */
+  .eyebrow {
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #666;
+    margin: 0 0 10px;
+  }
+  .eyebrow a { color: #a03828; }
+
   .app {
     max-width: 1100px;
     margin: 0 auto;
@@ -254,6 +269,7 @@
 <body>
 
 <div class="app">
+  <nav class="eyebrow no-print" aria-label="Site"><a href="index.html">The Collection</a> · <span aria-current="page">Labels</span> · <a href="stats.html">Statistics</a> · <a href="https://docs.google.com/spreadsheets/d/18D6C4P16KTyaPtHCgJxq7Rzc0rt_09juUbIwM06Lnmc/edit" target="_blank" rel="noopener">Shelved by Number</a></nav>
   <h1>CD Label Generator — Repo Man Style</h1>
   <div class="panel">
 
@@ -298,8 +314,15 @@
   </div>
 </div>
 
+<!-- collection.js is loaded for escapeHtml alone: this page builds its label
+     markup as HTML strings, and the escaping rule is one that has to be the
+     same everywhere or it isn't a rule. Nothing here calls Collection.load(),
+     so PapaParse isn't needed and isn't loaded. -->
+<script src="collection.js"></script>
 <script src="musicbrainz.js"></script>
 <script>
+  const { escapeHtml } = Collection;
+
   let labels = JSON.parse(localStorage.getItem('cdLabels') || '[]');
   let editingIndex = null;
 
@@ -427,12 +450,6 @@
     `;
   }
 
-  function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-  }
-
   /* ----------------------------------------------------------------
      Auto-fill track list + lengths from MusicBrainz.
      Key-free + CORS-friendly, same host the main collection app uses
@@ -442,13 +459,12 @@
   // Release endpoint; shared identity/escape/delay come from musicbrainz.js (MB).
   const MB_RELEASE = `${MB.WS_BASE}/release`;
 
-  // One place for the shared query params (fmt/app), the Accept header, and the
-  // ok-check. `path` is appended to the release endpoint ('' to search).
+  // One place for the shared query params (fmt/app) and the ok-check. `path` is
+  // appended to the release endpoint ('' to search). Goes through MB's shared
+  // throttle, so consecutive calls space themselves out with no waiting by hand.
   async function mbFetch(path, extraParams) {
     const params = new URLSearchParams({ fmt: 'json', app: MB.APP_IDENTITY, ...extraParams });
-    const res = await fetch(`${MB_RELEASE}${path}?${params}`, {
-      headers: { Accept: 'application/json' },
-    });
+    const res = await MB.throttledFetch(`${MB_RELEASE}${path}?${params}`);
     if (!res.ok) throw new Error(`MusicBrainz ${res.status}`);
     return res.json();
   }
@@ -456,16 +472,6 @@
   // A release's 4-digit year as a number, or null when MB has no date.
   function releaseYear(rel) {
     return parseInt((rel.date || '').slice(0, 4), 10) || null;
-  }
-
-  function msToTime(ms) {
-    const total = Math.round(ms / 1000);
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const s = total % 60;
-    const ss = String(s).padStart(2, '0');
-    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${ss}`;
-    return `${m}:${ss}`;
   }
 
   function setFillStatus(msg) {
@@ -527,10 +533,8 @@
         .slice()
         .sort((a, b) => scoreRelease(b, wantYear) - scoreRelease(a, wantYear))[0];
 
-      // Respect MB's ~1 req/sec rule between the two calls.
-      await MB.delay(1100);
-
-      // 3. Look it up with recordings to get track titles + lengths.
+      // 3. Look it up with recordings to get track titles + lengths. The gap
+      //    MB's rate limit wants is applied by MB.throttledFetch, not here.
       const release = await mbFetch(`/${best.id}`, { inc: 'recordings' });
 
       // 4. Flatten every disc's tracks, in order.
@@ -540,7 +544,7 @@
           const name = track.title || (track.recording && track.recording.title) || '';
           if (!name) return;
           const len = track.length || (track.recording && track.recording.length);
-          lines.push(len ? `${name} ${msToTime(len)}` : name);
+          lines.push(len ? `${name} ${MB.formatDuration(len)}` : name);
         });
       });
 

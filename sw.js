@@ -26,7 +26,7 @@
    contract between the two.
    ============================================================ */
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 const SHELL_CACHE = `cdc-shell-${CACHE_VERSION}`;
 const DATA_CACHE  = `cdc-data-${CACHE_VERSION}`;
 const ART_CACHE   = `cdc-art-${CACHE_VERSION}`;
@@ -120,7 +120,7 @@ self.addEventListener('fetch', (event) => {
   // Cover art. Immutable once fetched — the archive serves a given image ID
   // forever — so cache-first, and skip the network entirely on a hit.
   if (url.hostname.endsWith('coverartarchive.org') || url.hostname.endsWith('archive.org')) {
-    event.respondWith(cacheFirst(request, ART_CACHE, { trimTo: ART_CACHE_MAX }));
+    event.respondWith(cacheFirst(event, ART_CACHE, { trimTo: ART_CACHE_MAX }));
     return;
   }
 
@@ -174,7 +174,12 @@ async function navigationFirst(request) {
   }
 }
 
-async function cacheFirst(request, cacheName, { trimTo } = {}) {
+// Takes the FetchEvent for the same reason staleWhileRevalidate does: the trim
+// runs after the response is handed back, and without waitUntil() the worker is
+// free to be killed mid-delete — which is how a capped cache quietly stops
+// being capped.
+async function cacheFirst(event, cacheName, { trimTo } = {}) {
+  const { request } = event;
   const cache = await caches.open(cacheName);
   const cached = await cache.match(request);
   if (cached) return cached;
@@ -184,7 +189,7 @@ async function cacheFirst(request, cacheName, { trimTo } = {}) {
   // fine in an <img>, we just can't inspect them.
   if (response && (response.ok || response.type === 'opaque')) {
     await cache.put(request, response.clone());
-    if (trimTo) trimCache(cacheName, trimTo);
+    if (trimTo) event.waitUntil(trimCache(cacheName, trimTo));
   }
   return response;
 }
@@ -196,8 +201,13 @@ async function staleWhileRevalidate(event, cacheName) {
   const cache = await caches.open(cacheName);
   const cached = await cache.match(request);
 
+  // Opaque here too: the Google Fonts stylesheet is CORS-friendly, but the
+  // font files it pulls are not, and an `ok`-only guard silently refuses to
+  // store them — which is exactly the request you want served offline.
   const network = fetch(request).then((response) => {
-    if (response && response.ok) cache.put(request, response.clone());
+    if (response && (response.ok || response.type === 'opaque')) {
+      cache.put(request, response.clone());
+    }
     return response;
   }).catch(() => null);
 

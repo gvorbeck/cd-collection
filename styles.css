@@ -21,6 +21,18 @@
   --orange:  #d9711f;
   --forest:  #3e6b3a;
 
+  /* Text-safe versions of the two accents that get used as type.
+     The palette above is tuned for fills, bars, and shadows, where the only
+     requirement is that it look right on paper. As TYPE on paper it doesn't
+     clear WCAG AA: brick manages 4.13:1 against 4.5, and orange 2.84:1 against
+     the 3.0 that even large display numerals need. These are the same two hues
+     darkened until they pass against the darkest paper tone here (--paper-deep,
+     the worst case), so a link or a headline figure can use them without having
+     to know which of the three paper shades it happens to be sitting on.
+     Anything decorative keeps using the originals. */
+  --brick-ink:  #aa3b28;                  /* 4.76:1 on --paper-deep, 5.34:1 on --paper */
+  --orange-ink: #b8601a;                  /* 3.39:1 on --paper-deep, 3.80:1 on --paper */
+
   /* Default card shadow tint (used until/if cover color is sampled) */
   --shadow-neutral: #3a3128;
 
@@ -146,7 +158,7 @@ body {
   position: relative;
   z-index: 1;
 }
-.eyebrow a { color: var(--brick); }
+.eyebrow a { color: var(--brick-ink); }
 .site-title {
   font-family: var(--font-display);
   font-size: clamp(2.6rem, 12vw, 5rem);
@@ -214,7 +226,7 @@ body {
   font-family: var(--font-display);
   font-size: 2.2rem;
   line-height: 1;
-  color: var(--orange);
+  color: var(--orange-ink);
 }
 .stats-label {
   font-family: var(--font-mono);
@@ -330,11 +342,14 @@ body {
    and the control shifts into where its shadow sat, ringed in orange, instead
    of stacking a focus outline on top of a still-present drop shadow (which read
    as two competing edges). Each control keeps its own translate distance so it
-   travels exactly its own shadow offset — see the per-element rules below. */
+   travels exactly its own shadow offset — see the per-element rules below.
+   The ring uses the text-safe orange: a focus indicator is held to 3:1 against
+   what's next to it (WCAG 1.4.11), and the decorative orange only manages
+   2.84:1 on paper — a ring you can't see is not an indicator. */
 .search-input:focus,
 .detail-close:active,
 .detail-close:focus-visible {
-  outline: 3px solid var(--orange);
+  outline: 3px solid var(--orange-ink);
   outline-offset: 0;
   box-shadow: none;
 }
@@ -461,7 +476,6 @@ body {
   color: var(--surface);
 }
 .pill[aria-pressed="true"]::before { content: "✓ "; }
-.pill.pill-count { opacity: 0.55; font-weight: 400; }
 
 /* ============================================================
    Results bar
@@ -497,8 +511,8 @@ body {
   letter-spacing: 0.06em;
   background: none;
   border: none;
-  border-bottom: 2px solid var(--brick);
-  color: var(--brick);
+  border-bottom: 2px solid var(--brick-ink);
+  color: var(--brick-ink);
   cursor: pointer;
   padding: 0.1rem 0;
 }
@@ -583,7 +597,7 @@ body {
 .sort-select:hover { background-color: var(--mustard); }
 /* Press flush into the paper on focus, matching the search field / close btn. */
 .sort-select:focus-visible {
-  outline: 3px solid var(--orange);
+  outline: 3px solid var(--orange-ink);
   outline-offset: 0;
   transform: translate(2px, 2px);
   box-shadow: none;
@@ -1006,7 +1020,7 @@ body.modal-open { overflow: hidden; }
   font-family: var(--font-display);
   font-size: clamp(1.9rem, 6vw, 2.6rem);
   line-height: 1;
-  color: var(--orange);
+  color: var(--orange-ink);
 }
 /* The year span is text, not a count — let it size to fit rather than
    matching the big numerals and wrapping mid-range. */
@@ -1118,7 +1132,7 @@ body.modal-open { overflow: hidden; }
   text-align: center;
   padding: 2.5rem 1rem;
 }
-.state-msg.is-error { color: var(--brick); font-weight: 700; }
+.state-msg.is-error { color: var(--brick-ink); font-weight: 700; }
 .state-msg[hidden] { display: none; }
 
 .site-footer {
