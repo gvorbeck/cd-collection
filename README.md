@@ -8,13 +8,13 @@ published Google Sheet and renders it as a grid of album covers with search,
 genre/tag filters, sorting, and a shuffle. It installs as an app and works
 with no network.
 
-Three pages, all fed by the same sheet:
+Three pages. Two read the sheet; the third is a print tool that doesn't:
 
 | Page          | What it's for                                                     |
 |---------------|-------------------------------------------------------------------|
 | `index.html`  | The collection itself — grid or compact list, search and filters.  |
 | `stats.html`  | Breakdowns by decade, genre, artist, and shelf.                    |
-| `labels.html` | Printable spine labels for the books.                              |
+| `labels.html` | Printable jewel-case inserts, typed by hand and kept in this browser. |
 
 ## How it works
 
@@ -151,10 +151,11 @@ places it at its first slot.
 |-------------------------|-------------------------------------------------------------------|
 | `index.html`            | The grid page — markup and the loading/empty/error states.        |
 | `stats.html` / `stats.js` | The breakdowns page and the counting behind it.                 |
-| `labels.html`           | Printable spine labels for the books.                             |
+| `labels.html` / `labels.js` | The label generator and the editing behind it.                |
 | `styles.css`            | All styling for every page (construction-paper / retro-infographic). |
+| `labels.css`            | The labels page only: its form UI, and the frozen printed label. See below. |
 | `collection.js`         | Shared data layer: `CONFIG`, sheet fetch, CSV parsing, disc model, `escapeHtml`. |
-| `musicbrainz.js`        | Shared MusicBrainz primitives: the site-wide 1/sec throttle (`MB.throttledFetch`), Lucene escaping, duration formatting. |
+| `musicbrainz.js`        | Shared MusicBrainz primitives: the site-wide 1/sec throttle (`MB.throttledFetch`), Lucene escaping, release search + scoring, tracklist flattening, duration formatting. |
 | `app.js`                | The grid page: rendering, filtering, sorting, URL state, detail view. |
 | `sw.js`                 | Service worker — offline caching (see above).                     |
 | `manifest.webmanifest`  | PWA manifest: name, colors, icons, shortcuts.                     |
@@ -163,6 +164,25 @@ places it at its first slot.
 | `sample.csv`            | Dummy data for local development (see below).                     |
 | `CNAME`                 | Custom-domain config for GitHub Pages (`cd.iamgarrett.com`).      |
 | `qr.svg` / `qr.png`     | QR code linking to the live site.                                 |
+
+### The labels page's two layers
+
+`labels.html` wears the same chrome as the other two pages — paper, grain,
+masthead, the shared nav — and its form is built from the vocabulary in
+`styles.css`. Its own stylesheet, `labels.css`, exists for two reasons:
+
+- **The label itself is frozen.** It's measured in inches against a real
+  jewel-case insert and printed as black on white, so it deliberately does
+  *not* follow the site's paper palette or rem scale. Section 5 of
+  `labels.css` is that artifact; treat it as fixed. The two declarations
+  marked `INHERITANCE GUARD` re-state values the label used to get for free
+  from a bare `<body>` — remove them and `styles.css` reflows the tracklist
+  and tints the print.
+- **`@page` can't be scoped.** The print sheet needs
+  `size: letter portrait; margin: 0.3in`, and an `@page` rule applies to the
+  whole document with no way to limit it to one page or selector. In
+  `styles.css` it would silently re-margin the printed output of the list
+  view and the stats page too.
 
 ## Running locally
 

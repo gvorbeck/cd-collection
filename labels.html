@@ -1,570 +1,121 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>CD Label Generator</title>
-<style>
-  :root {
-    --label-size: 4.7244in; /* standard jewel case front insert, 120mm */
-  }
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Labels — CD Collection</title>
+  <meta name="description" content="Printable jewel-case labels for the CD collection." />
 
-  * { box-sizing: border-box; }
+  <link rel="manifest" href="manifest.webmanifest" />
+  <meta name="theme-color" content="#f5edd6" />
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icons/icon-180.png" />
 
-  body {
-    font-family: 'Helvetica Neue', Arial, sans-serif;
-    background: #e8e8e8;
-    margin: 0;
-    padding: 24px;
-    color: #111;
-  }
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Space+Mono:wght@400;700&family=Archivo:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-  h1 {
-    font-size: 20px;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    margin: 0 0 16px;
-  }
-
-  /* The same four names, in the same order, as the header on the other pages.
-     This page has its own visual language (it's a print tool, not part of the
-     paper-and-ink browser), so the nav is restyled to match rather than
-     imported — but the row has to be here, or the two pages that link *to*
-     this one lead somewhere you can only leave with the Back button. */
-  .eyebrow {
-    font-family: 'Courier New', monospace;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: #666;
-    margin: 0 0 10px;
-  }
-  .eyebrow a { color: #a03828; }
-
-  .app {
-    max-width: 1100px;
-    margin: 0 auto;
-  }
-
-  .panel {
-    display: flex;
-    gap: 32px;
-    align-items: flex-start;
-  }
-
-  .form {
-    background: #fff;
-    padding: 20px;
-    border: 3px solid #111;
-    width: 360px;
-    flex-shrink: 0;
-  }
-
-  .form label {
-    display: block;
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    margin: 14px 0 4px;
-  }
-
-  .form label:first-of-type { margin-top: 0; }
-
-  .form input,
-  .form textarea {
-    width: 100%;
-    padding: 8px;
-    font-size: 14px;
-    border: 2px solid #111;
-    font-family: inherit;
-  }
-
-  .form textarea {
-    height: 160px;
-    resize: vertical;
-    font-family: 'Courier New', monospace;
-  }
-
-  .form .hint {
-    font-size: 11px;
-    color: #555;
-    margin-top: 4px;
-  }
-
-  .buttons {
-    margin-top: 18px;
-    display: flex;
-    gap: 8px;
-  }
-
-  button {
-    background: #111;
-    color: #fff;
-    border: none;
-    padding: 10px 16px;
-    font-size: 13px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    cursor: pointer;
-  }
-
-  button.secondary {
-    background: #fff;
-    color: #111;
-    border: 2px solid #111;
-  }
-
-  button:hover { opacity: 0.85; }
-
-  .label-count {
-    margin-top: 12px;
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: #111;
-  }
-
-  .stack-list {
-    margin-top: 20px;
-  }
-
-  .stack-item {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 8px 10px;
-    border: 2px solid #111;
-    margin-bottom: 6px;
-    font-size: 13px;
-    cursor: pointer;
-  }
-
-  .stack-item:hover {
-    background: #f0f0f0;
-  }
-
-  .stack-item.editing {
-    background: #111;
-    color: #fff;
-  }
-
-  .stack-item button {
-    padding: 4px 8px;
-    font-size: 11px;
-  }
-
-  .preview-area {
-    flex-grow: 1;
-  }
-
-  /* --- THE LABEL ITSELF --- */
-  .label {
-    width: var(--label-size);
-    height: var(--label-size);
-    border: 6px solid #000;
-    background: #fff;
-    padding: 0.3in;
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-    font-family: 'Helvetica Neue', Arial, sans-serif;
-    margin-bottom: 24px;
-  }
-
-  .label-category {
-    font-size: 15px;
-    font-weight: 900;
-    letter-spacing: 3px;
-    text-transform: uppercase;
-    border-bottom: 4px solid #000;
-    padding-bottom: 6px;
-    margin-bottom: 10px;
-  }
-
-  .label-main {
-    flex-grow: 1;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    text-align: center;
-    border-bottom: 4px solid #000;
-    padding: 10px 0;
-  }
-
-  .label-artist {
-    font-size: 17px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    word-break: break-word;
-  }
-
-  .label-title {
-    font-size: 30px;
-    font-weight: 900;
-    text-transform: uppercase;
-    line-height: 1.05;
-    letter-spacing: 1px;
-    margin-top: 8px;
-    word-break: break-word;
-    text-wrap: balance;
-  }
-
-  .label-year {
-    font-size: 13px;
-    font-weight: 700;
-    margin-top: 10px;
-    letter-spacing: 2px;
-  }
-
-  .label-tracks {
-    font-size: 10.5px;
-    font-weight: 700;
-    text-transform: uppercase;
-    line-height: 1.5;
-    padding-top: 8px;
-    columns: 2;
-    column-gap: 14px;
-  }
-
-  .label-tracks div {
-    break-inside: avoid;
-    display: flex;
-  }
-
-  .track-num {
-    width: 16px;
-    flex-shrink: 0;
-  }
-
-  .empty-state {
-    color: #666;
-    font-size: 14px;
-    padding: 40px;
-    border: 2px dashed #999;
-    text-align: center;
-  }
-
-  @media print {
-    @page {
-      size: letter portrait;
-      margin: 0.3in;
-    }
-    body { background: #fff; padding: 0; margin: 0; }
-    .form, h1, .no-print { display: none !important; }
-    .app, .panel, .preview-area { display: block; margin: 0; padding: 0; max-width: none; }
-    .label {
-      border: 6px solid #000;
-      page-break-inside: avoid;
-      margin: 0.1in auto;
-    }
-    .label:nth-child(2n) {
-      page-break-after: always;
-    }
-  }
-</style>
+  <!-- Shared chrome first, then this page's own layer. Order matters: labels.css
+       re-states the two properties the label used to inherit from a bare body,
+       and owns the @page rule, which is why it isn't folded into styles.css. -->
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="labels.css" />
 </head>
 <body>
+  <svg class="grain" aria-hidden="true" focusable="false">
+    <filter id="grain-filter">
+      <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="3" stitchTiles="stitch" />
+      <feColorMatrix type="saturate" values="0" />
+    </filter>
+    <rect width="100%" height="100%" filter="url(#grain-filter)" />
+  </svg>
 
-<div class="app">
-  <nav class="eyebrow no-print" aria-label="Site"><a href="index.html">The Collection</a> · <span aria-current="page">Labels</span> · <a href="stats.html">Statistics</a> · <a href="https://docs.google.com/spreadsheets/d/18D6C4P16KTyaPtHCgJxq7Rzc0rt_09juUbIwM06Lnmc/edit" target="_blank" rel="noopener">Shelved by Number</a></nav>
-  <h1>CD Label Generator — Repo Man Style</h1>
-  <div class="panel">
-
-    <div class="form no-print">
-      <label>Artist</label>
-      <input type="text" id="artist" placeholder="e.g. TALKING HEADS">
-
-      <label>Title</label>
-      <input type="text" id="title" placeholder="e.g. REMAIN IN LIGHT">
-
-      <label>Release Year</label>
-      <input type="text" id="year" placeholder="e.g. 1980">
-
-      <label>Track List</label>
-      <textarea id="tracks" placeholder="One track per line"></textarea>
-      <div class="hint">One song per line, in order.</div>
-      <div class="buttons">
-        <button class="secondary" id="fillBtn" onclick="autoFillTracks()">Auto-fill from artist + title</button>
-      </div>
-      <div class="hint" id="fillStatus"></div>
-
-      <div class="buttons">
-        <button id="addBtn" onclick="addLabel()">Add to print sheet</button>
-        <button class="secondary" onclick="clearForm()">Clear form</button>
-      </div>
-
-      <div class="label-count no-print" id="labelCount"></div>
-
-      <div class="stack-list" id="stackList"></div>
-      <div class="hint no-print">Click a saved CD above to load it back into the form for editing.</div>
-
-      <div class="buttons">
-        <button onclick="window.print()">Print all labels</button>
-        <button class="secondary" onclick="clearAll()">Clear all</button>
-      </div>
-    </div>
-
-    <div class="preview-area" id="previewArea">
-      <div class="empty-state no-print">No labels yet. Fill out the form and click "Add to print sheet."</div>
-    </div>
-
-  </div>
-</div>
-
-<!-- collection.js is loaded for escapeHtml alone: this page builds its label
-     markup as HTML strings, and the escaping rule is one that has to be the
-     same everywhere or it isn't a rule. Nothing here calls Collection.load(),
-     so PapaParse isn't needed and isn't loaded. -->
-<script src="collection.js"></script>
-<script src="musicbrainz.js"></script>
-<script>
-  const { escapeHtml } = Collection;
-
-  let labels = JSON.parse(localStorage.getItem('cdLabels') || '[]');
-  let editingIndex = null;
-
-  function saveLabels() {
-    localStorage.setItem('cdLabels', JSON.stringify(labels));
-  }
-
-  function addLabel() {
-    const artist = document.getElementById('artist').value.trim();
-    const title = document.getElementById('title').value.trim();
-    const year = document.getElementById('year').value.trim();
-    const tracksRaw = document.getElementById('tracks').value.trim();
-
-    if (!artist && !title) return;
-
-    const tracks = tracksRaw.split('\n').map(t => t.trim()).filter(t => t.length > 0);
-    const entry = { artist, title, year, tracks };
-
-    if (editingIndex !== null) {
-      labels[editingIndex] = entry;
-      editingIndex = null;
-    } else {
-      labels.push(entry);
-    }
-
-    saveLabels();
-    render();
-    clearForm();
-  }
-
-  function loadForEdit(index) {
-    const l = labels[index];
-    document.getElementById('artist').value = l.artist;
-    document.getElementById('title').value = l.title;
-    document.getElementById('year').value = l.year;
-    document.getElementById('tracks').value = l.tracks.join('\n');
-    editingIndex = index;
-    document.getElementById('addBtn').textContent = 'Save changes';
-    render();
-  }
-
-  function clearForm() {
-    document.getElementById('artist').value = '';
-    document.getElementById('title').value = '';
-    document.getElementById('year').value = '';
-    document.getElementById('tracks').value = '';
-    editingIndex = null;
-    document.getElementById('addBtn').textContent = 'Add to print sheet';
-    render();
-  }
-
-  function removeLabel(index) {
-    labels.splice(index, 1);
-    if (editingIndex === index) {
-      clearForm();
-    }
-    saveLabels();
-    render();
-  }
-
-  function clearAll() {
-    labels = [];
-    saveLabels();
-    render();
-  }
-
-  function render() {
-    const stackList = document.getElementById('stackList');
-    const previewArea = document.getElementById('previewArea');
-
-    // Count of saved labels + print pages (2 labels per printed page).
-    const count = labels.length;
-    const pages = Math.ceil(count / 2);
-    document.getElementById('labelCount').textContent = count === 0
-      ? ''
-      : `${count} label${count === 1 ? '' : 's'} · ${pages} print page${pages === 1 ? '' : 's'}`;
-
-    stackList.innerHTML = '';
-    labels.forEach((l, i) => {
-      const item = document.createElement('div');
-      item.className = 'stack-item' + (editingIndex === i ? ' editing' : '');
-      item.onclick = () => loadForEdit(i);
-
-      const label = document.createElement('span');
-      label.textContent = `${l.artist} — ${l.title}`;
-      item.appendChild(label);
-
-      const btn = document.createElement('button');
-      btn.textContent = 'Remove';
-      btn.className = 'secondary';
-      btn.onclick = (e) => {
-        e.stopPropagation();
-        removeLabel(i);
-      };
-      item.appendChild(btn);
-      stackList.appendChild(item);
-    });
-
-    if (labels.length === 0) {
-      previewArea.innerHTML = '<div class="empty-state no-print">No labels yet. Fill out the form and click "Add to print sheet."</div>';
-      return;
-    }
-
-    previewArea.innerHTML = labels.map(l => buildLabelHtml(l)).join('');
-  }
-
-  function buildLabelHtml(l) {
-    let tracksHtml = '';
-    if (l.tracks.length > 0) {
-      tracksHtml = '<div class="label-tracks">' +
-        l.tracks.map((t, i) => `<div><span class="track-num">${i + 1}.</span><span>${escapeHtml(t)}</span></div>`).join('') +
-        '</div>';
-    }
-
-    return `
-      <div class="label">
-        <div class="label-category">Compact Disc</div>
-        <div class="label-main">
-          <div class="label-artist">${escapeHtml(l.artist) || 'ARTIST'}</div>
-          <div class="label-title">${escapeHtml(l.title) || 'TITLE'}</div>
-          <div class="label-year">${escapeHtml(l.year)}</div>
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="masthead">
+        <!-- Same four names in the same order on every page, so the row reads as
+             one nav rather than a different set of links per page. The current
+             page stays in place unlinked, marked aria-current — it's what tells
+             you where you are. A real <nav> so it's in the landmark list and a
+             screen reader user can jump straight to it. -->
+        <nav class="eyebrow" aria-label="Site"><a href="index.html">The Collection</a> · <span aria-current="page">Labels</span> · <a href="stats.html">Statistics</a> · <a href="https://docs.google.com/spreadsheets/d/18D6C4P16KTyaPtHCgJxq7Rzc0rt_09juUbIwM06Lnmc/edit" target="_blank" rel="noopener">Shelved by Number</a></nav>
+        <div class="title-row">
+          <h1 class="site-title">Labels</h1>
+          <span class="cd-logo" aria-hidden="true"></span>
         </div>
-        ${tracksHtml}
       </div>
-    `;
-  }
+    </div>
+  </header>
 
-  /* ----------------------------------------------------------------
-     Auto-fill track list + lengths from MusicBrainz.
-     Key-free + CORS-friendly, same host the main collection app uses
-     for cover art. Two calls: search for the best release, then look
-     it up with recordings to get track titles and lengths.
-  ---------------------------------------------------------------- */
-  // Release endpoint; shared identity/escape/delay come from musicbrainz.js (MB).
-  const MB_RELEASE = `${MB.WS_BASE}/release`;
+  <main class="site-main">
+    <div class="labels-layout">
 
-  // One place for the shared query params (fmt/app) and the ok-check. `path` is
-  // appended to the release endpoint ('' to search). Goes through MB's shared
-  // throttle, so consecutive calls space themselves out with no waiting by hand.
-  async function mbFetch(path, extraParams) {
-    const params = new URLSearchParams({ fmt: 'json', app: MB.APP_IDENTITY, ...extraParams });
-    const res = await MB.throttledFetch(`${MB_RELEASE}${path}?${params}`);
-    if (!res.ok) throw new Error(`MusicBrainz ${res.status}`);
-    return res.json();
-  }
+      <section class="panel form-panel no-print" aria-labelledby="h-new-label">
+        <h2 class="panel-title" id="h-new-label">New Label</h2>
+        <p class="panel-note">Repo Man style — black border, block caps, tracks in two columns.</p>
 
-  // A release's 4-digit year as a number, or null when MB has no date.
-  function releaseYear(rel) {
-    return parseInt((rel.date || '').slice(0, 4), 10) || null;
-  }
+        <div class="field">
+          <label class="field-label" for="artist">Artist</label>
+          <input type="text" class="field-input" id="artist" placeholder="e.g. Talking Heads" autocomplete="off" />
+        </div>
 
-  function setFillStatus(msg) {
-    document.getElementById('fillStatus').textContent = msg || '';
-  }
+        <div class="field">
+          <label class="field-label" for="title">Title</label>
+          <input type="text" class="field-input" id="title" placeholder="e.g. Remain in Light" autocomplete="off" />
+        </div>
 
-  // Score a search result: prefer official CD releases, then a year match.
-  function scoreRelease(rel, wantYear) {
-    let score = 0;
-    if (rel.status === 'Official') score += 100;
+        <div class="field">
+          <label class="field-label" for="year">Release Year</label>
+          <input type="text" class="field-input" id="year" placeholder="e.g. 1980" inputmode="numeric" autocomplete="off" />
+        </div>
 
-    const formats = (rel.media || [])
-      .map((m) => (m.format || '').toLowerCase())
-      .join(' ');
-    if (formats.includes('cd')) score += 50;
+        <div class="field">
+          <label class="field-label" for="tracks">Track List</label>
+          <textarea class="field-textarea" id="tracks" placeholder="One track per line" spellcheck="false"></textarea>
+          <p class="field-hint">One song per line, in order.</p>
+        </div>
 
-    const relYear = releaseYear(rel);
-    if (wantYear && relYear) {
-      const diff = Math.abs(relYear - wantYear);
-      // Exact year wins big; otherwise closer is better.
-      score += diff === 0 ? 40 : Math.max(0, 30 - diff);
-    } else if (relYear) {
-      // No target year: gently prefer earlier (original) pressings.
-      score += Math.max(0, 30 - (relYear - 1900) / 10);
-    }
+        <div class="btn-row">
+          <button type="button" class="btn" id="fillBtn">Auto-fill from artist + title</button>
+        </div>
+        <!-- role=status so the lookup's outcome is announced, not just shown. -->
+        <p class="field-hint field-status" id="fillStatus" role="status" aria-live="polite"></p>
 
-    score += (rel.score || 0) / 100; // MB's own relevance as a tiebreaker.
-    return score;
-  }
+        <div class="btn-row">
+          <button type="button" class="btn btn-primary" id="addBtn">Add to print sheet</button>
+          <button type="button" class="btn" id="clearFormBtn">Clear form</button>
+        </div>
 
-  async function autoFillTracks() {
-    const artist = document.getElementById('artist').value.trim();
-    const title = document.getElementById('title').value.trim();
-    const yearRaw = document.getElementById('year').value.trim();
-    const wantYear = parseInt(yearRaw, 10) || null;
-    const btn = document.getElementById('fillBtn');
+        <p class="sheet-count" id="sheetCount"></p>
 
-    if (!artist || !title) {
-      setFillStatus('Enter both an artist and a title first.');
-      return;
-    }
+        <!-- A real list of saved labels; each row is a button, so the whole
+             stack is keyboard-operable rather than click-only. -->
+        <ul class="stack-list" id="stackList"></ul>
+        <p class="field-hint" id="stackHint" hidden>Pick a saved disc to load it back into the form.</p>
 
-    btn.disabled = true;
-    setFillStatus('Looking up…');
+        <div class="btn-row">
+          <button type="button" class="btn btn-primary" id="printBtn">Print all labels</button>
+          <button type="button" class="btn" id="clearAllBtn">Clear all</button>
+        </div>
+      </section>
 
-    try {
-      // 1. Search for matching releases.
-      const q = `artist:"${MB.escapeLucene(artist)}" AND release:"${MB.escapeLucene(title)}"`;
-      const searchData = await mbFetch('', { query: q, limit: '25' });
+      <div class="preview-area" id="previewArea">
+        <div class="empty-state no-print">No labels yet. Fill out the form and add one to the print sheet.</div>
+      </div>
 
-      const releases = searchData.releases || [];
-      if (releases.length === 0) {
-        setFillStatus('No match found. Try tweaking the artist or title.');
-        return;
-      }
+    </div>
+  </main>
 
-      // 2. Pick the best-scoring release.
-      const best = releases
-        .slice()
-        .sort((a, b) => scoreRelease(b, wantYear) - scoreRelease(a, wantYear))[0];
+  <footer class="site-footer">
+    <p>An archive of physical discs. Labels are stored in this browser, not the sheet.</p>
+  </footer>
 
-      // 3. Look it up with recordings to get track titles + lengths. The gap
-      //    MB's rate limit wants is applied by MB.throttledFetch, not here.
-      const release = await mbFetch(`/${best.id}`, { inc: 'recordings' });
-
-      // 4. Flatten every disc's tracks, in order.
-      const lines = [];
-      (release.media || []).forEach((medium) => {
-        (medium.tracks || []).forEach((track) => {
-          const name = track.title || (track.recording && track.recording.title) || '';
-          if (!name) return;
-          const len = track.length || (track.recording && track.recording.length);
-          lines.push(len ? `${name} ${MB.formatDuration(len)}` : name);
-        });
-      });
-
-      if (lines.length === 0) {
-        setFillStatus('Found a release but no track list was available.');
-        return;
-      }
-
-      document.getElementById('tracks').value = lines.join('\n');
-      const yr = releaseYear(release);
-      setFillStatus(`Filled ${lines.length} tracks${yr ? ` from the ${yr} release` : ''}. Edit as needed.`);
-    } catch (err) {
-      setFillStatus(`Lookup failed: ${err.message}. Check your connection and try again.`);
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
-  render();
-</script>
-
+  <!-- collection.js is loaded for escapeHtml alone: this page builds its label
+       markup as HTML strings, and the escaping rule is one that has to be the
+       same everywhere or it isn't a rule. Nothing here calls Collection.load(),
+       so PapaParse isn't needed and isn't loaded. -->
+  <script src="collection.js"></script>
+  <script src="musicbrainz.js"></script>
+  <script src="labels.js"></script>
 </body>
 </html>

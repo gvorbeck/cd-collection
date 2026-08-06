@@ -1,0 +1,410 @@
+/* ============================================================
+   labels.css — the label generator's own layer
+   ------------------------------------------------------------
+   Loaded AFTER styles.css, and only by labels.html. Two very
+   different things live here, and the split is the point:
+
+   1. The page UI (form, stack list, buttons) — written in the
+      shared vocabulary from styles.css: hard 2px ink borders,
+      offset shadows, no radius anywhere, Anton/Space Mono/
+      Archivo. It should be indistinguishable in feel from the
+      collection and statistics pages.
+
+   2. THE LABEL ITSELF — the printed artifact. Frozen. It is
+      sized in inches against a real jewel case insert, and it
+      predates the site's paper palette on purpose: it's ink on
+      white card stock, not construction paper. Nothing in
+      section 1 may reach into it.
+
+   Why its own file rather than a section of styles.css: the
+   @page rule at the bottom sets letter/portrait/0.3in, and
+   @page cannot be scoped to a page or a selector. Living in
+   styles.css it would silently re-margin the printed output of
+   index.html's list view and stats.html too.
+   ============================================================ */
+
+
+/* ============================================================
+   1. Page layout
+   ============================================================ */
+
+/* Form beside the sheet on a desk-sized screen; stacked below it on a phone,
+   where a 360px form column and a 4.7in label can't share a row. */
+.labels-layout {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.form-panel {
+  /* Doesn't grow: the label preview should take the slack, since it's the
+     thing whose size actually means something. */
+  flex: 0 1 22rem;
+  min-width: 0;
+}
+
+.preview-area {
+  flex: 1 1 30rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1.5rem;
+  /* The label is a fixed physical size — 4.7244in, about 454px — because it's
+     cut out and slid into a jewel case. On a phone that's wider than the
+     screen, and styles.css hides overflow-x on <body>, so without a scroll
+     container of its own the label would simply be clipped with no way to
+     reach the rest of it. Shrinking it is not an option: it would no longer
+     be the thing that prints. */
+  overflow-x: auto;
+  /* Room for the scrollbar so it doesn't sit on the label's bottom border. */
+  padding-bottom: 0.5rem;
+}
+
+
+/* ============================================================
+   2. Form fields
+   ============================================================ */
+
+.field { display: flex; flex-direction: column; margin-bottom: 0.9rem; }
+
+.field-label {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-soft);
+  margin-bottom: 0.25rem;
+}
+
+.field-input,
+.field-textarea {
+  font-family: var(--font-body);
+  font-size: 0.95rem;
+  padding: 0.5rem 0.65rem;
+  border: 2px solid var(--ink);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 3px 3px 0 var(--ink);
+  width: 100%;
+  transition: transform 0.1s var(--ease), box-shadow 0.1s var(--ease);
+}
+/* Press into the paper on focus — the same gesture as the search field. */
+.field-input:focus { transform: translate(3px, 3px); box-shadow: none; }
+
+.field-textarea {
+  /* Mono, because this is a list you scan line-by-line for alignment and
+     count, not prose. */
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  height: 11rem;
+  resize: vertical;
+}
+.field-textarea:focus { transform: none; box-shadow: 3px 3px 0 var(--ink); }
+
+.field-input::placeholder,
+.field-textarea::placeholder { color: var(--ink-soft); opacity: 0.7; }
+
+.field-hint {
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  line-height: 1.45;
+  color: var(--ink-soft);
+  margin: 0.35rem 0 0;
+}
+/* The auto-fill readout: same slot, but it reports the result of an action,
+   so it gets ink weight rather than the muted hint grey. */
+.field-status {
+  color: var(--ink);
+  min-height: 1.45em;   /* reserve the line so the form doesn't jump */
+}
+
+
+/* ============================================================
+   3. Buttons
+   ============================================================ */
+
+.btn-row {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.9rem;
+}
+
+.btn {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  background: var(--surface);
+  border: 2px solid var(--ink);
+  box-shadow: 2px 2px 0 var(--ink);
+  padding: 0.45rem 0.8rem;
+  cursor: pointer;
+  transition: transform 0.1s var(--ease), box-shadow 0.1s var(--ease),
+              background-color 0.1s var(--ease);
+}
+.btn:hover { background: var(--mustard); }
+.btn:active { transform: translate(2px, 2px); box-shadow: none; }
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+  box-shadow: 2px 2px 0 var(--ink);
+  background: var(--surface);
+}
+
+/* The two actions that commit something: add to the sheet, and print it. */
+.btn-primary {
+  color: var(--surface);
+  background: var(--orange);
+}
+.btn-primary:hover { background: var(--brick); color: var(--surface); }
+
+
+/* ============================================================
+   4. The print stack
+   ============================================================ */
+
+.sheet-count {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+  margin: 1.1rem 0 0.4rem;
+}
+
+.stack-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* The row is a container, not a control: it holds two separate buttons (load
+   for edit, remove), and a button can't legally nest inside another one. The
+   border and shadow live here so the pair still reads as a single row. */
+.stack-item {
+  display: flex;
+  align-items: stretch;
+  border: 2px solid var(--ink);
+  background: var(--surface);
+  box-shadow: 2px 2px 0 var(--ink);
+}
+
+/* The row currently loaded into the form, inverted so it's obvious which
+   entry the fields belong to. */
+.stack-item.is-editing {
+  background: var(--ink);
+  color: var(--paper);
+  box-shadow: 2px 2px 0 var(--ink-soft);
+}
+
+.stack-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0.4rem 0.5rem;
+  cursor: pointer;
+}
+.stack-name:hover { background: var(--mustard); color: var(--ink); }
+
+/* Destructive, so it separates from the row with a rule and goes brick on
+   hover rather than joining the mustard family the safe controls use. */
+.stack-remove {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: none;
+  border: none;
+  border-left: 2px solid var(--ink);
+  color: var(--brick-ink);
+  cursor: pointer;
+  padding: 0.4rem 0.55rem;
+}
+.stack-remove:hover { background: var(--brick-ink); color: var(--surface); }
+.stack-item.is-editing .stack-remove {
+  border-left-color: var(--paper);
+  color: var(--mustard);
+}
+.stack-item.is-editing .stack-remove:hover { background: var(--brick); color: var(--surface); }
+
+.empty-state {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  padding: 2.5rem 1.5rem;
+  border: 2px dashed var(--ink-soft);
+  text-align: center;
+  width: 100%;
+}
+
+
+/* ============================================================
+   5. THE LABEL — frozen artifact, do not restyle
+   ============================================================
+   Everything below reproduces the jewel-case insert exactly as it printed
+   before this page adopted the site's chrome. Sizes stay in px and inches
+   (they're measured against physical card stock, not the page's rem scale),
+   and the palette stays pure black on white.
+
+   The two declarations marked INHERITANCE GUARD are the only additions. They
+   are not new styling — they re-state values the label used to get for free
+   from a page whose <body> set neither. styles.css sets both, so without
+   these the label would silently pick up 1.45 line-height and warm --ink
+   type, which reflows the tracklist and tints the print.
+   ============================================================ */
+
+:root {
+  --label-size: 4.7244in; /* standard jewel case front insert, 120mm */
+}
+
+.label {
+  width: var(--label-size);
+  height: var(--label-size);
+  border: 6px solid #000;
+  background: #fff;
+  padding: 0.3in;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-family: 'Helvetica Neue', Arial, sans-serif;
+  color: #111;            /* INHERITANCE GUARD — was body's color */
+  line-height: normal;    /* INHERITANCE GUARD — was body's default */
+  /* No margin-bottom: the preview column owns the gap between labels now.
+     Print restores its own spacing below. */
+  flex: 0 0 auto;
+}
+
+.label-category {
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  border-bottom: 4px solid #000;
+  padding-bottom: 6px;
+  margin-bottom: 10px;
+}
+
+.label-main {
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  text-align: center;
+  border-bottom: 4px solid #000;
+  padding: 10px 0;
+}
+
+.label-artist {
+  font-size: 17px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  word-break: break-word;
+}
+
+.label-title {
+  font-size: 30px;
+  font-weight: 900;
+  text-transform: uppercase;
+  line-height: 1.05;
+  letter-spacing: 1px;
+  margin-top: 8px;
+  word-break: break-word;
+  text-wrap: balance;
+}
+
+.label-year {
+  font-size: 13px;
+  font-weight: 700;
+  margin-top: 10px;
+  letter-spacing: 2px;
+}
+
+.label-tracks {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  line-height: 1.5;
+  padding-top: 8px;
+  columns: 2;
+  column-gap: 14px;
+}
+
+.label-tracks div {
+  break-inside: avoid;
+  display: flex;
+}
+
+.track-num {
+  width: 16px;
+  flex-shrink: 0;
+}
+
+
+/* ============================================================
+   6. Print
+   ============================================================
+   The sheet is the only thing on paper: the site chrome, the form, and the
+   stack list all go. What's left is a bare column of labels, two to a page.
+   ============================================================ */
+
+@media print {
+  @page {
+    size: letter portrait;
+    margin: 0.3in;
+  }
+
+  body {
+    background: #fff;
+    padding: 0;
+    margin: 0;
+  }
+
+  /* styles.css already drops .grain and .site-footer in print, but it also
+     gives .site-header a rule line — right for a printed disc list, wrong
+     here, where the header isn't part of the artifact at all. */
+  .site-header,
+  .form-panel,
+  .no-print { display: none !important; }
+
+  .site-main,
+  .labels-layout,
+  .preview-area {
+    display: block;
+    margin: 0;
+    padding: 0;
+    max-width: none;
+    /* The screen's horizontal scroll container would otherwise become a
+       clipping box on paper, cropping every label at the page edge. */
+    overflow: visible;
+  }
+
+  .label {
+    border: 6px solid #000;
+    page-break-inside: avoid;
+    margin: 0.1in auto;
+  }
+  .label:nth-child(2n) {
+    page-break-after: always;
+  }
+}

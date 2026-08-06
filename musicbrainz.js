@@ -77,8 +77,86 @@ window.MB = (function () {
     return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
   }
 
+  /* ---------- Web-service calls ---------- */
+
+  /**
+   * GET a MusicBrainz web-service path as JSON, through the shared throttle.
+   * `path` is appended to WS_BASE ('/release', '/release-group/<mbid>', …) and
+   * `params` is merged over the two every call needs: fmt=json and the app
+   * identity. Non-2xx throws, so every caller fails the same way.
+   */
+  async function wsFetch(path, params = {}) {
+    const query = new URLSearchParams({ fmt: 'json', app: APP_IDENTITY, ...params });
+    const res = await throttledFetch(`${WS_BASE}${path}?${query}`);
+    if (!res.ok) throw new Error(`MusicBrainz ${res.status}`);
+    return res.json();
+  }
+
+  // A release's 4-digit year as a number, or null when MB has no date for it.
+  function releaseYear(rel) {
+    return parseInt((rel.date || '').slice(0, 4), 10) || null;
+  }
+
+  /**
+   * Score a release from a search result: prefer official CD pressings, then
+   * the closest year. MusicBrainz returns every pressing of a title — vinyl,
+   * cassette, promos, twelve reissues — and its own relevance score barely
+   * separates them, so this does the choosing.
+   */
+  function scoreRelease(rel, wantYear) {
+    let score = 0;
+    if (rel.status === 'Official') score += 100;
+
+    const formats = (rel.media || [])
+      .map((m) => (m.format || '').toLowerCase())
+      .join(' ');
+    if (formats.includes('cd')) score += 50;
+
+    const relYear = releaseYear(rel);
+    if (wantYear && relYear) {
+      const diff = Math.abs(relYear - wantYear);
+      // Exact year wins big; otherwise closer is better.
+      score += diff === 0 ? 40 : Math.max(0, 30 - diff);
+    } else if (relYear) {
+      // No target year: gently prefer earlier (original) pressings.
+      score += Math.max(0, 30 - (relYear - 1900) / 10);
+    }
+
+    score += (rel.score || 0) / 100; // MB's own relevance as a tiebreaker.
+    return score;
+  }
+
+  // Highest-scoring release from a search result set, or null if it's empty.
+  function pickBestRelease(releases, wantYear) {
+    if (!releases || releases.length === 0) return null;
+    return releases
+      .slice()
+      .sort((a, b) => scoreRelease(b, wantYear) - scoreRelease(a, wantYear))[0];
+  }
+
+  /**
+   * Flatten a release fetched with `inc=recordings` into [{ title, length }],
+   * in playing order across every medium. A two-disc set comes back as one
+   * continuous list, which is what both callers want: the detail view prints
+   * it as one tracklist, and the labels page as one numbered column.
+   * Untitled tracks are dropped rather than rendered blank.
+   */
+  function flattenTracks(release) {
+    const out = [];
+    ((release && release.media) || []).forEach((medium) => {
+      (medium.tracks || []).forEach((track) => {
+        const title = track.title || (track.recording && track.recording.title) || '';
+        if (!title) return;
+        const length = track.length || (track.recording && track.recording.length) || 0;
+        out.push({ title, length });
+      });
+    });
+    return out;
+  }
+
   return {
     APP_IDENTITY, WS_BASE, THROTTLE_MS,
     delay, escapeLucene, throttledFetch, formatDuration,
+    wsFetch, releaseYear, scoreRelease, pickBestRelease, flattenTracks,
   };
 })();

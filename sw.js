@@ -26,7 +26,7 @@
    contract between the two.
    ============================================================ */
 
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
 const SHELL_CACHE = `cdc-shell-${CACHE_VERSION}`;
 const DATA_CACHE  = `cdc-data-${CACHE_VERSION}`;
 const ART_CACHE   = `cdc-art-${CACHE_VERSION}`;
@@ -43,10 +43,12 @@ const SHELL_ASSETS = [
   'labels.html',
   'stats.html',
   'styles.css',
+  'labels.css',
   'collection.js',
   'musicbrainz.js',
   'app.js',
   'stats.js',
+  'labels.js',
   'sample.csv',
   'manifest.webmanifest',
   'icons/icon.svg',
