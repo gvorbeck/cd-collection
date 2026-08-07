@@ -889,6 +889,8 @@ body.modal-open { overflow: hidden; }
 }
 .detail-meta dd { margin: 0; font-weight: 600; }
 .detail-tags { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.9rem; }
+/* No tags is the common case, and an empty flex row still spends its margin. */
+.detail-tags:empty { display: none; }
 .detail-tag {
   font-family: var(--font-mono);
   font-size: 0.72rem;
@@ -913,6 +915,13 @@ body.modal-open { overflow: hidden; }
   margin-top: 1rem;
   padding-top: 0.9rem;
   border-top: 1.5px dashed var(--ink-soft);
+}
+/* With neither tags nor notes there is nothing between the meta block's bottom
+   rule and this one — two dashed lines fencing an empty band. Drop this one and
+   let the meta's rule close the section; the margin alone is the separation. */
+.detail-tags:empty + .detail-notes:empty + .detail-links {
+  padding-top: 0;
+  border-top: 0;
 }
 .detail-link {
   display: inline-flex;
@@ -1000,6 +1009,32 @@ body.modal-open { overflow: hidden; }
   font-family: var(--font-mono);
   font-size: 0.75rem;
   color: var(--ink-soft);
+}
+/* Running time, as a footer under the list. Same leader and same right-hand
+   column as the track times so the figure lines up with them, but set off by a
+   rule above it so it reads as a sum rather than one more track. */
+.tracklist-total {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0.45rem 0 0;
+  padding-top: 0.4rem;
+  border-top: 2px solid var(--paper-deep);
+}
+.tracklist-total-label {
+  order: 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-soft);
+}
+.tracklist-total::after {
+  content: "";
+  order: 1;                 /* between the label and the duration */
+  flex: 1 1 0.75rem;
+  border-bottom: 2px dotted var(--paper-deep);
+  transform: translateY(-0.3em);
 }
 .tracklist-loading {
   font-family: var(--font-mono);

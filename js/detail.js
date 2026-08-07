@@ -285,6 +285,8 @@ function renderTracklist(disc) {
       ol.appendChild(li);
     });
     box.appendChild(ol);
+    const total = totalRuntime(tracks);
+    if (total) box.appendChild(total);
   };
 
   // A cached tracklist resolves in a microtask, so only show the loading line
@@ -309,6 +311,37 @@ function renderTracklist(disc) {
     if (settled || dom.detail.dataset.discId !== disc.id) return;
     setMakeLabelPending(false);
   }, TRACKLIST_WAIT_CAP);
+}
+
+/**
+ * The disc's running time, as a footer row under the tracklist — or null when
+ * MusicBrainz timed none of the tracks and there's nothing to add up.
+ *
+ * Built to sit under the list as one more leader row, so the figure lands in
+ * the same column as the track times above it. When only some tracks are timed
+ * the sum is a floor rather than the answer, and it says so out loud instead of
+ * quietly presenting a short total as the real one.
+ */
+function totalRuntime(tracks) {
+  const timed = tracks.filter((t) => t.length);
+  if (!timed.length) return null;
+
+  const ms = timed.reduce((sum, t) => sum + t.length, 0);
+  const partial = timed.length < tracks.length;
+
+  const row = el('p', 'tracklist-total');
+  row.appendChild(el('span', 'tracklist-total-label', partial ? 'At least' : 'Total time'));
+  row.appendChild(el('span', 'track-len', formatDuration(ms)));
+  if (partial) {
+    // The count is the whole explanation for a total that looks short; on
+    // screen it's the small print, and to a screen reader it's part of the row.
+    row.appendChild(el(
+      'span',
+      'sr-only',
+      ` — ${timed.length} of ${tracks.length} tracks are timed`
+    ));
+  }
+  return row;
 }
 
 /* ---------- "Make label" ---------- */

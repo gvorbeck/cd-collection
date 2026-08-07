@@ -19,7 +19,12 @@ import { readStore, writeStore } from './util.js';
 // The throttle lives in musicbrainz.js, shared with the labels page: MB's
 // 1/sec rule is per client, and this page and that one are the same client.
 // Cache hits never enter the queue, so browsing cached discs stays instant.
-import { throttledFetch, escapeLucene } from './musicbrainz.js';
+import {
+  throttledFetch,
+  escapeLucene,
+  pickBestRelease,
+  flattenTracks,
+} from './musicbrainz.js';
 
 
 // --- localStorage cache -------------------------------------------------
@@ -130,10 +135,76 @@ export function mbidFromCaaUrl(url) {
   return match ? match[1] : null;
 }
 
+// The disc's year as a number, or null when the sheet leaves it blank. Both
+// halves of the lookup want it: it tells same-titled records apart, and then
+// which pressing of the one we settled on.
+function discYear(disc) {
+  return parseInt(String((disc && disc.year) || '').slice(0, 4), 10) || null;
+}
+
+// A release group's 4-digit first-release year, or null when MB has no date.
+function groupYear(rg) {
+  return parseInt((rg['first-release-date'] || '').slice(0, 4), 10) || null;
+}
+
+// Titles compared the way a person would: case, spacing and punctuation are
+// noise, the words are the title.
+function normalizeTitle(str) {
+  return String(str || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+/**
+ * Score a release group from a search result against the disc we're holding.
+ *
+ * MusicBrainz's own relevance can't separate a record from the EP, single and
+ * remix set that reuse its name — searching Amy Winehouse for "Back to Black"
+ * returns the 2006 album, a 2006 remixes EP, a 2007 single and a B-sides EP,
+ * several of them exact title matches — so relevance alone picked whichever
+ * sorted first and the detail view showed three tracks for an eleven-track
+ * record.
+ *
+ * Type carries the most weight, because a shelf of CDs is overwhelmingly
+ * albums, and the year in the sheet is usually the *pressing* year rather than
+ * the group's first release: "Back to Black" reissued in 2007 must not start
+ * matching the 2007 single. So the year breaks ties between plausible records
+ * instead of choosing on its own, and a disc that really is an EP or a single
+ * wins on its title matching exactly where the album's doesn't.
+ */
+function scoreReleaseGroup(rg, wantTitle, wantYear) {
+  let score = 0;
+
+  const primary = (rg['primary-type'] || '').toLowerCase();
+  if (primary === 'album') score += 100;
+  else if (primary === 'ep') score += 30;
+
+  // The disc's own name, not a longer title that merely contains it —
+  // "Back to Black" is not "Back to Black: B-Sides" or "Frank & Back to Black".
+  if (wantTitle && normalizeTitle(rg.title) === wantTitle) score += 90;
+
+  const rgYear = groupYear(rg);
+  if (wantYear && rgYear) {
+    const diff = Math.abs(rgYear - wantYear);
+    // Exact wins; a pressing a few years off the original still counts for
+    // something; a decade away contributes nothing either way.
+    score += diff === 0 ? 60 : Math.max(0, 45 - diff * 6);
+  }
+
+  // Compilations, live records and remix sets are their own titles; when one
+  // shares a name with the studio album, the studio album is the likelier disc.
+  if ((rg['secondary-types'] || []).length) score -= 25;
+
+  score += (rg.score || 0) / 100; // MB's own relevance as a tiebreaker.
+  return score;
+}
+
 /**
  * Query MusicBrainz for the release group that best matches this disc and
- * return its MBID, or null. We search by artist + release title and take the
- * top-scored result; MusicBrainz sorts by relevance.
+ * return its MBID, or null. We search by artist + release title, then choose
+ * among the matches with scoreReleaseGroup — MusicBrainz sorts by text
+ * relevance, which doesn't know which "Back to Black" is on the shelf.
  */
 async function findReleaseGroupMbid(disc) {
   // Lucene-style query: quote the values and escape embedded quotes.
@@ -141,7 +212,9 @@ async function findReleaseGroupMbid(disc) {
   const params = new URLSearchParams({
     query: q,
     fmt: 'json',
-    limit: '3',
+    // Enough candidates that the album and its same-named EP, single and
+    // compilation are all in hand to choose between. Still one request.
+    limit: '10',
     // Identify the app per MusicBrainz etiquette (can't set User-Agent header
     // from a browser; the app= param is the sanctioned alternative).
     app: CONFIG.MUSICBRAINZ.APP_IDENTITY,
@@ -154,7 +227,14 @@ async function findReleaseGroupMbid(disc) {
 
   const groups = data['release-groups'] || [];
   if (groups.length === 0) return null;
-  return groups[0].id || null;
+
+  const wantTitle = normalizeTitle(disc.title);
+  const wantYear = discYear(disc);
+  const best = groups
+    .slice()
+    .sort((a, b) =>
+      scoreReleaseGroup(b, wantTitle, wantYear) - scoreReleaseGroup(a, wantTitle, wantYear))[0];
+  return best.id || null;
 }
 
 
@@ -198,7 +278,12 @@ export async function resolveTracklist(disc) {
   const mbid = await resolveReleaseGroupMbid(disc);
   if (!mbid) return null;
 
-  const hit = tracksCache[mbid];
+  // Keyed by group *and* year: which pressing within the group we pick depends
+  // on the year, so two discs sharing a release group but not a year — an
+  // original and a reissue with bonus tracks — mustn't share a cache entry.
+  const wantYear = discYear(disc);
+  const key = `${mbid}|${wantYear || ''}`;
+  const hit = tracksCache[key];
   if (hit) {
     // Touch it so the LRU eviction keeps the discs actually being browsed.
     hit.at = Date.now();
@@ -210,9 +295,9 @@ export async function resolveTracklist(disc) {
 
   disc._tracksPromise = (async () => {
     try {
-      const tracks = await fetchTracklist(mbid);
+      const tracks = await fetchTracklist(mbid, wantYear);
       if (tracks && tracks.length) {
-        tracksCache[mbid] = { t: tracks.map((t) => [t.title, t.length]), at: Date.now() };
+        tracksCache[key] = { t: tracks.map((t) => [t.title, t.length]), at: Date.now() };
         persistTracksCache();
       }
       return tracks;
@@ -227,34 +312,30 @@ export async function resolveTracklist(disc) {
 }
 
 /**
- * Browse one release from a release group, with its recordings, and flatten
- * the tracks. A release group can hold many releases (reissues, regional
- * pressings); any of them gives essentially the same running order, so we take
- * the first rather than spending extra throttled requests choosing.
+ * Browse the releases in a release group, with their recordings, pick the one
+ * that best matches the disc on the shelf, and flatten its tracks.
+ *
+ * A release group holds every pressing of a title — vinyl, cassette, promos,
+ * deluxe reissues with a second disc of B-sides — and their running orders are
+ * not interchangeable, so the choice goes through the same scoring the labels
+ * page uses: official CD pressings first, then the year closest to the sheet's.
+ * One request either way; the recordings just come back for all of them.
  */
-async function fetchTracklist(mbid) {
+async function fetchTracklist(mbid, wantYear) {
   const params = new URLSearchParams({
     'release-group': mbid,
     inc: 'recordings',
     fmt: 'json',
-    limit: '1',
+    limit: '25',
     app: CONFIG.MUSICBRAINZ.APP_IDENTITY,
   });
   const res = await throttledFetch(`${CONFIG.MUSICBRAINZ.RELEASE_URL}?${params.toString()}`);
   if (!res.ok) throw new Error(`MusicBrainz ${res.status}`);
   const data = await res.json();
 
-  const release = (data.releases || [])[0];
+  const release = pickBestRelease(data.releases, wantYear);
   if (!release) return null;
 
-  const out = [];
-  (release.media || []).forEach((medium) => {
-    (medium.tracks || []).forEach((track) => {
-      const title = track.title || (track.recording && track.recording.title) || '';
-      if (!title) return;
-      const length = track.length || (track.recording && track.recording.length) || 0;
-      out.push({ title, length });
-    });
-  });
+  const out = flattenTracks(release);
   return out.length ? out : null;
 }

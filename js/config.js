@@ -57,11 +57,16 @@ export const CONFIG = {
     CAA_SIZE: 500,
     // localStorage key + schema version. Bump the version to invalidate the
     // whole cache if the lookup logic changes.
-    CACHE_KEY: 'cdc:art-cache:v1',
-    // Cached tracklists, keyed by release-group MBID. Capped because these are
-    // much bigger than a cover URL and localStorage is a shared ~5MB budget —
-    // past the cap the least-recently-fetched entries are dropped.
-    TRACKS_CACHE_KEY: 'cdc:tracks:v1',
+    // v2: the release-group search now weighs the disc's year, so entries from
+    // v1 can point at the wrong record entirely — the same-named EP rather than
+    // the album. The tracklist reads its release group back out of these URLs,
+    // so a stale one here is a stale tracklist too; both caches start over.
+    CACHE_KEY: 'cdc:art-cache:v2',
+    // Cached tracklists, keyed by release-group MBID + the disc's year (which
+    // pressing within the group we pick depends on it). Capped because these
+    // are much bigger than a cover URL and localStorage is a shared ~5MB
+    // budget — past the cap the least-recently-fetched entries are dropped.
+    TRACKS_CACHE_KEY: 'cdc:tracks:v2',
     TRACKS_CACHE_MAX: 250,
   },
 };

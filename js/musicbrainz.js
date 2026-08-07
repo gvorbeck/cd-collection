@@ -124,16 +124,45 @@ export function scoreRelease(rel, wantYear) {
     score += Math.max(0, 30 - (relYear - 1900) / 10);
   }
 
+  // This is an American collection of standard editions, so among pressings
+  // that are otherwise equal, prefer a US (or worldwide) one and a single disc
+  // — a deluxe reissue's bonus disc of demos isn't the record on the shelf.
+  // Deliberately small: these separate tied pressings of the same release, and
+  // must never outweigh the year or the format above.
+  const country = (rel.country || '').toUpperCase();
+  if (country === 'US') score += 6;
+  else if (country === 'XW') score += 4; // MB's code for [Worldwide]
+  if ((rel.media || []).length === 1) score += 8;
+
   score += (rel.score || 0) / 100; // MB's own relevance as a tiebreaker.
   return score;
 }
 
-// Highest-scoring release from a search result set, or null if it's empty.
+// How precisely a release is dated: 3 for YYYY-MM-DD, 2 for YYYY-MM, 1 for a
+// bare year, 0 for undated.
+function datePrecision(rel) {
+  return (rel.date || '').split('-').filter(Boolean).length;
+}
+
+/**
+ * Highest-scoring release from a set, or null if it's empty.
+ *
+ * Ties are the normal case, not the exception: a title's official CD pressings
+ * differ mainly by country, they share a year, and browse results carry no
+ * relevance score at all — so scoreRelease alone left the winner to whatever
+ * order MusicBrainz happened to return, which for "Back to Black" meant a
+ * ten-track regional pressing over the eleven-track original. Break the tie on
+ * how well MB knows the release: a full date is the documented original, a bare
+ * year is usually a reissue someone catalogued later. Earliest first after that.
+ */
 export function pickBestRelease(releases, wantYear) {
   if (!releases || releases.length === 0) return null;
   return releases
     .slice()
-    .sort((a, b) => scoreRelease(b, wantYear) - scoreRelease(a, wantYear))[0];
+    .sort((a, b) =>
+      scoreRelease(b, wantYear) - scoreRelease(a, wantYear) ||
+      datePrecision(b) - datePrecision(a) ||
+      String(a.date || '9999').localeCompare(String(b.date || '9999')))[0];
 }
 
 /**
