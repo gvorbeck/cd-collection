@@ -16,6 +16,7 @@
    which runs before any module does. No build step.
    ============================================================ */
 
+import { foldText } from './util.js';
 
 /* ----------------------------------------------------------
    Config — edit here
@@ -319,14 +320,15 @@ function normalizeRows(rows) {
     // start pointing at a different disc.
     disc.slug = uniqueSlug(slugsSeen, `${artist}-${title}`);
 
-    // Precompute one lowercased blob of every searchable field so the search
+    // Precompute one folded blob of every searchable field so the search
     // box can match across all columns (artist, title, year, genre, tags,
     // notes, number) instead of just artist + title. Include the expanded slot
     // numbers so a search for any single number in a range (e.g. "43" within
-    // "42-45") still matches.
-    disc.searchText = [book, number, numbers.join(' '), artist, title, year, genre, tags.join(' '), notes]
-      .join(' ')
-      .toLowerCase();
+    // "42-45") still matches. foldText strips accents as well as case, so
+    // "andre" finds "André Messager" — the query is folded the same way.
+    disc.searchText = foldText(
+      [book, number, numbers.join(' '), artist, title, year, genre, tags.join(' '), notes].join(' ')
+    );
 
     // Precompute the shelf-location label ("Book 2 · #42–43") once.
     disc.locationLabel = formatLocation(disc);

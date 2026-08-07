@@ -26,6 +26,15 @@ export function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+// Lowercase and strip diacritics, so typing plain ASCII finds accented text:
+// "andre" matches "André Messager", "bjork" matches "Björk". NFD splits an
+// accented letter into base + combining mark, and the range below drops the
+// marks. Applied to both sides of a search comparison — the precomputed
+// searchText blob and the query — so the two always agree.
+export function foldText(str) {
+  return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
 /* ============================================================
    Persistent caches: localStorage, read and written as JSON
    ============================================================

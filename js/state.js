@@ -8,7 +8,7 @@
    `state` is mirrored to the querystring by url.js, so every
    combination reachable here is a link that can be sent to someone.
    ============================================================ */
-import { reducedMotion } from './util.js';
+import { reducedMotion, foldText } from './util.js';
 import { CONFIG as SHEET } from './collection.js';
 import { dom } from './dom.js';
 import { announce, announceCount, layoutTagCloud, renderCards } from './render.js';
@@ -101,7 +101,9 @@ function yearOr(disc, blankTo) {
 
 // Compute the currently-visible discs from state.
 function currentMatches() {
-  const q = state.search.toLowerCase();
+  // Folded the same way as disc.searchText, so an unaccented query still
+  // matches accented text (and an accented query matches too).
+  const q = foldText(state.search);
   return DISCS.filter((d) => {
     // Search matches across every column via the precomputed blob.
     if (q && !d.searchText.includes(q)) return false;
