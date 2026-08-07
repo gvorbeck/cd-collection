@@ -33,6 +33,14 @@
   --brick-ink:  #aa3b28;                  /* 4.76:1 on --paper-deep, 5.34:1 on --paper */
   --orange-ink: #b8601a;                  /* 3.39:1 on --paper-deep, 3.80:1 on --paper */
 
+  /* The same problem the other way round: a FILL dark enough to carry --surface
+     type. The buttons that commit something are light-on-orange, and plain
+     --orange only manages 3.19:1 behind them — under AA, and their labels are
+     small bold caps, so the large-text allowance doesn't apply. Darkened until
+     it passes, which also puts it a shade clear of --brick so the hover state
+     still reads as a change. */
+  --orange-deep: #a8551a;                 /* 5.07:1 under --surface type */
+
   /* Default card shadow tint (used until/if cover color is sampled) */
   --shadow-neutral: #3a3128;
 
@@ -951,10 +959,10 @@ body.modal-open { overflow: hidden; }
 .tracklist {
   margin: 0;
   /* No marker gutter: the items are flex containers, which Blink refuses to
-     paint a ::marker on, so the indent was reserving space for numbers that
-     never appear. Still an <ol> — the running order is meaningful even with the
-     numbers off — so list-style is turned off explicitly rather than left to
-     depend on that quirk. */
+     paint a ::marker on, so the browser's own numbering can't be seen. The
+     numbers are drawn as real elements instead (see .track-num), and the
+     built-in markers are turned off explicitly rather than left to depend on
+     that quirk. Still an <ol>: the running order is meaningful. */
   padding: 0;
   list-style: none;
   font-size: 0.85rem;
@@ -964,6 +972,17 @@ body.modal-open { overflow: hidden; }
   align-items: baseline;
   gap: 0.5rem;
   padding: 0.16rem 0;
+}
+/* The running-order number. A fixed, right-aligned gutter in tabular figures,
+   so the titles stay in one column once the count passes 9. */
+.tracklist .track-num {
+  order: 0;
+  flex: 0 0 1.5em;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);
 }
 .track-title { flex: 0 1 auto; min-width: 0; }
 /* Dotted leader out to the duration, same device as the genre counts. Drawn on
@@ -987,6 +1006,43 @@ body.modal-open { overflow: hidden; }
   font-size: 0.78rem;
   color: var(--ink-soft);
   margin: 0;
+}
+
+/* ---------- Make label ----------
+   The last thing in the dialog, below everything it will carry over. Built
+   like the buttons on the labels page it leads to, in the accent reserved
+   there for the actions that commit something. */
+.detail-actions {
+  margin-top: 1.2rem;
+  padding-top: 0.9rem;
+  border-top: 1.5px dashed var(--ink-soft);
+}
+.detail-action {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--surface);
+  background: var(--orange-deep);
+  border: 2px solid var(--ink);
+  box-shadow: 2px 2px 0 var(--ink);
+  padding: 0.45rem 0.8rem;
+  cursor: pointer;
+  transition: transform 0.1s var(--ease), box-shadow 0.1s var(--ease),
+              background-color 0.1s var(--ease);
+}
+.detail-action:hover { background: var(--brick); }
+.detail-action:active { transform: translate(2px, 2px); box-shadow: none; }
+/* Held shut until the tracklist settles, so a press can't quietly hand over a
+   release with none of the tracks that are still on their way. Keeps the
+   shadow: the button is temporarily unavailable, not a different control. */
+.detail-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+  box-shadow: 2px 2px 0 var(--ink);
+  background: var(--orange-deep);
 }
 
 /* ============================================================

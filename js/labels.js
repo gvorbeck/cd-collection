@@ -8,6 +8,7 @@
    ============================================================ */
 
 import { escapeHtml, registerServiceWorker } from './collection.js';
+import { takeLabelDraft } from './labelDraft.js';
 import {
   escapeLucene,
   wsFetch,
@@ -354,3 +355,49 @@ dom.clearAllBtn.addEventListener('click', clearAll);
 registerServiceWorker();
 
 render();
+
+/* ----------------------------------------------------------
+   Arriving from the collection page
+   ---------------------------------------------------------- */
+
+/**
+ * A disc sent over by "Make label" in the collection's detail dialog.
+ * It fills the form and stops there: adding it to the print sheet is still a
+ * deliberate press of the button, since the point of the handoff is to get a
+ * head start on the typing, not to skip the read-through.
+ *
+ * Runs after the first render(), which resets the status line.
+ */
+function applyIncomingDraft() {
+  const draft = takeLabelDraft();
+  if (!draft) return;
+
+  dom.artist.value = draft.artist;
+  dom.title.value = draft.title;
+  dom.year.value = draft.year;
+  dom.tracks.value = draft.tracks.join('\n');
+
+  // Land on the first field rather than wherever the browser puts focus after
+  // a navigation, so the form is immediately editable from the keyboard.
+  dom.artist.focus();
+
+  // editingIndex stays null, so the button still reads "Add to print sheet" —
+  // this is a new label, not one of the saved ones loaded back for editing.
+  const message = draft.tracks.length
+    ? `Filled in from the collection (${draft.tracks.length} tracks). Check it over, then add it to the print sheet.`
+    : 'Filled in from the collection. No tracks came across — auto-fill or type them in, then add it to the print sheet.';
+
+  // #fillStatus is a live region, and a live region only announces changes it
+  // sees AFTER assistive tech has registered it — text written this early in
+  // page load is read as the region's initial content and goes unspoken. That
+  // matters more than usual here: focus has just jumped into a form the user
+  // didn't navigate to, and this sentence is the only thing that explains why.
+  // A short delay makes it a change rather than a starting value.
+  //
+  // A timer rather than requestAnimationFrame: rAF is tied to painting and
+  // doesn't run while the document is hidden, which would hang the one piece of
+  // feedback this screen owes the user on whether the tab happens to be drawing.
+  setTimeout(() => setFillStatus(message), 120);
+}
+
+applyIncomingDraft();

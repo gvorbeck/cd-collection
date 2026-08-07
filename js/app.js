@@ -26,7 +26,7 @@ import { $, isHex6, cssVar } from './util.js';
 import { hexToRgb, setPaperRgb } from './color.js';
 import { dom, cacheDom } from './dom.js';
 import { announce, renderStats, renderPills, layoutTagCloud, enableDragScroll } from './render.js';
-import { openDetail, dismissDetail, onDetailClosed } from './detail.js';
+import { openDetail, dismissDetail, onDetailClosed, makeLabelForCurrentDisc } from './detail.js';
 import {
   DISCS, state, applyFilters, togglePill, clearAllFilters,
   setView, syncViewControls, exportCurrentCsv, shuffle,
@@ -94,6 +94,8 @@ function wireEvents() {
 
   // Detail dialog close.
   dom.detailClose.addEventListener('click', dismissDetail);
+  // Take this disc to the labels page with its form already filled.
+  dom.detailMakeLabel.addEventListener('click', makeLabelForCurrentDisc);
   // Click on the backdrop (outside the inner panel) closes it too. A click that
   // lands on the dialog element itself is the backdrop — but the dialog's own
   // scrollbar reports the same target, so only treat clicks that fall outside

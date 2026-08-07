@@ -158,10 +158,14 @@
   background: var(--surface);
 }
 
-/* The two actions that commit something: add to the sheet, and print it. */
+/* The two actions that commit something: add to the sheet, and print it.
+   --orange-deep rather than plain --orange: these labels are small bold caps,
+   which AA holds to 4.5:1, and light type on the decorative orange only reaches
+   3.19:1. Same fill as "Make label" in the collection's disc dialog, which is
+   the button that sends a disc here. */
 .btn-primary {
   color: var(--surface);
-  background: var(--orange);
+  background: var(--orange-deep);
 }
 .btn-primary:hover { background: var(--brick); color: var(--surface); }
 

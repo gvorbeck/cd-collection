@@ -15,7 +15,16 @@ import { hexToRgb, safeHex, blendWithPaper } from './color.js';
 import { artCache, artCacheKey, resolveCoverArt, mbidFromCaaUrl, resolveTracklist } from './art.js';
 import { generatePlaceholderCover } from './cover.js';
 import { dom } from './dom.js';
+import { saveLabelDraft } from './labelDraft.js';
 import { DISC_HASH_PREFIX, buildUrl, discSlugFromHash } from './url.js';
+
+
+// The disc the dialog is currently showing, and the tracklist painted for it.
+// "Make label" reads both — the disc for artist/title/year, the tracks for the
+// running order — and is held shut until the second one has settled, so the two
+// are always in step. Cleared when the dialog closes.
+let currentDisc = null;
+let currentTracks = [];
 
 
 /**
@@ -47,6 +56,7 @@ export function openDetail(disc, { pushUrl = true } = {}) {
   // disc — ids are unique per row, unlike artist+title which can collide
   // (duplicates, reissues, same-named "Greatest Hits", etc.).
   dom.detail.dataset.discId = disc.id;
+  currentDisc = disc;
 
   dom.detailCover.innerHTML = '';
   const img = document.createElement('img');
@@ -226,6 +236,15 @@ function externalIcon() {
 
 /* ---------- Tracklist ---------- */
 
+// How long "Make label" will wait on a tracklist before opening up anyway.
+// Nothing in the MusicBrainz path has a request timeout, and its calls are
+// throttled to one a second, so a stalled or queued lookup could otherwise hold
+// the button shut for as long as the connection takes to give up. This site is
+// built to be useful in a shop with no signal; a manual action can't be hostage
+// to a best-effort lookup. Long enough to cover the throttle queue and a slow
+// round trip, short enough not to read as broken.
+const TRACKLIST_WAIT_CAP = 8000;
+
 /**
  * Fill in the tracklist panel for a disc.
  * Async and best-effort: the panel shows a loading line, then either the
@@ -236,18 +255,30 @@ function renderTracklist(disc) {
   const box = dom.detailTracks;
   box.innerHTML = '';
   box.hidden = true;
+  currentTracks = [];
+  // Nothing to hand over yet. "Make label" stays shut until this settles, so a
+  // press during the lookup can't send a release stripped of the tracks that
+  // are still in flight — the one way this feature could lose data quietly.
+  setMakeLabelPending(true);
 
   const paint = (tracks) => {
     // The dialog may have moved on to another disc while we were waiting.
     if (dom.detail.dataset.discId !== disc.id) return;
     box.innerHTML = '';
+    currentTracks = tracks || [];
+    setMakeLabelPending(false);
     if (!tracks || !tracks.length) { box.hidden = true; return; }
 
     box.hidden = false;
     box.appendChild(el('h3', 'detail-tracks-heading', 'Tracklist'));
     const ol = el('ol', 'tracklist');
-    tracks.forEach((t) => {
+    tracks.forEach((t, i) => {
       const li = el('li', 'tracklist-item');
+      // The running order, written out as a real element. The <ol> would number
+      // these itself, but Blink won't paint a ::marker on a flex list item and
+      // the items have to be flex for the dotted leader — so the numbers were
+      // there in the markup and invisible on screen.
+      li.appendChild(el('span', 'track-num', `${i + 1}.`));
       li.appendChild(el('span', 'track-title', t.title));
       const len = formatDuration(t.length);
       if (len) li.appendChild(el('span', 'track-len', len));
@@ -271,6 +302,68 @@ function renderTracklist(disc) {
     box.appendChild(el('h3', 'detail-tracks-heading', 'Tracklist'));
     box.appendChild(el('p', 'tracklist-loading', 'Looking it up…'));
   }, 150);
+
+  // Give up holding the button shut. The tracklist may still land later and
+  // paint normally; this only says the wait is over, not the lookup.
+  setTimeout(() => {
+    if (settled || dom.detail.dataset.discId !== disc.id) return;
+    setMakeLabelPending(false);
+  }, TRACKLIST_WAIT_CAP);
+}
+
+/* ---------- "Make label" ---------- */
+
+/**
+ * Shut the button while a tracklist is on its way, and say why.
+ *
+ * A disabled control with no explanation is its own bug, so the reason goes on
+ * the button itself — aria-disabled rather than the `disabled` attribute would
+ * keep it focusable but wouldn't stop the click, and stopping the click is the
+ * point. The title/aria-label pair covers pointer and screen reader alike.
+ */
+function setMakeLabelPending(pending) {
+  const btn = dom.detailMakeLabel;
+  btn.disabled = pending;
+  if (pending) {
+    btn.title = 'Waiting for the tracklist…';
+    btn.setAttribute('aria-label', 'Make label — waiting for the tracklist');
+  } else {
+    btn.removeAttribute('title');
+    btn.removeAttribute('aria-label');
+  }
+}
+
+/**
+ * Hand the disc on screen to the label generator: stash a draft and go there.
+ *
+ * The labels page fills its form from the draft and stops — nothing is added
+ * to the print sheet, because the whole point of the trip is to look the thing
+ * over (and top up the tracks) before committing it.
+ *
+ * Only reachable once the tracklist has settled (see setMakeLabelPending), so
+ * what travels is the finished list, not however much of it had arrived. A disc
+ * MusicBrainz doesn't know still comes over — with no tracks, which the labels
+ * page says out loud and its own auto-fill can have another go at.
+ */
+export function makeLabelForCurrentDisc() {
+  if (!currentDisc) return;
+
+  saveLabelDraft({
+    artist: currentDisc.artist,
+    title: currentDisc.title,
+    year: currentDisc.year,
+    tracks: currentTracks.map(trackToLabelLine),
+  });
+
+  location.href = 'labels.html';
+}
+
+// One track as one line of a label's track list: the title, plus its running
+// time when MusicBrainz gave us one. Same shape the labels page's own auto-fill
+// writes, so a handed-over disc is indistinguishable from one typed in there.
+function trackToLabelLine(track) {
+  const len = formatDuration(track.length);
+  return len ? `${track.title} ${len}` : track.title;
 }
 
 // True when the dialog currently open was opened by us pushing a history
@@ -329,6 +422,13 @@ export function onDetailClosed() {
   detailCleanedUp = true;
 
   dom.body.classList.remove('modal-open');
+
+  // Let go of the disc and its tracks. Nothing can reach them once the dialog
+  // is closed — a closed <dialog> is display:none, so its button takes neither
+  // clicks nor focus — but leaving them set means every later reader has to
+  // work that out, and it pins a tracklist for as long as the tab is open.
+  currentDisc = null;
+  currentTracks = [];
 
   // We closed it ourselves to match a Back/Forward — history is already right.
   if (closingForHistory) {
