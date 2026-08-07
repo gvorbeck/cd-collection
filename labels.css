@@ -183,6 +183,15 @@
   margin: 1.1rem 0 0.4rem;
 }
 
+/* Fires when a disc has more tracks than the tightest density step can fit, so
+   the card is printing a trimmed list. Brick rather than the hint grey: this is
+   the sheet about to lose something, not a note about how to use the form. */
+.sheet-warning {
+  color: var(--brick-ink);
+  font-weight: 700;
+  margin: 0 0 0.6rem;
+}
+
 .stack-list {
   list-style: none;
   margin: 0;
@@ -296,6 +305,11 @@
   /* No margin-bottom: the preview column owns the gap between labels now.
      Print restores its own spacing below. */
   flex: 0 0 auto;
+  /* Last resort. The density ladder below is what actually makes long
+     tracklists fit; this only catches the disc so long that even the tightest
+     step overflows, and turns a tail of type spilling across the page into a
+     clean crop at the border. The form warns when it fires. */
+  overflow: hidden;
 }
 
 .label-category {
@@ -309,17 +323,30 @@
 }
 
 .label-main {
+  /* Step 0 of the header ladder: the original measured values. */
+  --head-artist: 17px;
+  --head-title: 30px;
+  --head-year: 13px;
+  --head-pad: 10px;
+  --head-title-gap: 8px;
+  --head-year-gap: 10px;
+
   flex-grow: 1;
+  /* But never gives room back on its own. When the card is over budget, flex
+     would take the deficit out of every item in proportion, silently and by an
+     amount nobody chose. The header does give room back — it's the first thing
+     that does — but through the ladder below, in measured steps. */
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   justify-content: center;
   text-align: center;
   border-bottom: 4px solid #000;
-  padding: 10px 0;
+  padding: var(--head-pad) 0;
 }
 
 .label-artist {
-  font-size: 17px;
+  font-size: var(--head-artist);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 1px;
@@ -327,31 +354,74 @@
 }
 
 .label-title {
-  font-size: 30px;
+  font-size: var(--head-title);
   font-weight: 900;
   text-transform: uppercase;
   line-height: 1.05;
   letter-spacing: 1px;
-  margin-top: 8px;
+  margin-top: var(--head-title-gap);
   word-break: break-word;
   text-wrap: balance;
 }
 
 .label-year {
-  font-size: 13px;
+  font-size: var(--head-year);
   font-weight: 700;
-  margin-top: 10px;
+  margin-top: var(--head-year-gap);
   letter-spacing: 2px;
 }
 
+/* ---- The header ladder -----------------------------------------------
+   Spent BEFORE the tracklist gives up anything. The artist and title are set
+   large because they're what you read from across the room while the case is
+   still on the shelf — but you read them at a glance, and a glance survives
+   30px dropping to 20px. The tracklist doesn't work that way: it's read up
+   close, one line at a time, and type small enough to defeat that isn't
+   holding the information any more, it's just proving the information was
+   there. So the display type is the first thing asked to give, and by the
+   time step 3 is reached the title is still nearly twice the size of a track.
+
+   The gaps and padding come down with the type: at 19px the original 10px of
+   air around the block reads as a gap someone forgot to close.
+   ---------------------------------------------------------------------- */
+
+.label[data-head="1"] .label-main {
+  --head-artist: 15px; --head-title: 26px; --head-year: 12px;
+  --head-pad: 9px; --head-title-gap: 7px; --head-year-gap: 8px;
+}
+.label[data-head="2"] .label-main {
+  --head-artist: 13.5px; --head-title: 22px; --head-year: 11px;
+  --head-pad: 8px; --head-title-gap: 6px; --head-year-gap: 7px;
+}
+.label[data-head="3"] .label-main {
+  --head-artist: 12px; --head-title: 19px; --head-year: 10px;
+  --head-pad: 7px; --head-title-gap: 5px; --head-year-gap: 6px;
+}
+
 .label-tracks {
-  font-size: 10.5px;
+  /* Step 0 of the density ladder: the original measured values, and what every
+     disc that fits in two comfortable columns still gets. */
+  --track-size: 10.5px;
+  --track-leading: 1.5;
+  --track-cols: 2;
+  --track-gap: 14px;
+  --track-num-w: 16px;
+  --track-pad: 8px;
+
+  font-size: var(--track-size);
   font-weight: 700;
   text-transform: uppercase;
-  line-height: 1.5;
-  padding-top: 8px;
-  columns: 2;
-  column-gap: 14px;
+  line-height: var(--track-leading);
+  padding-top: var(--track-pad);
+  column-count: var(--track-cols);
+  column-gap: var(--track-gap);
+  /* Height stays intrinsic — no shrinking. A multicol box with a definite
+     height doesn't grow downward when it runs out of room, it spills sideways
+     into overflow columns, which would make the tracklist unmeasurable in the
+     one direction the fitter cares about. Left alone it balances into
+     --track-cols and grows down, so how far past the label's bottom edge it
+     reaches is exactly how much it doesn't fit by. */
+  flex: 0 0 auto;
 }
 
 .label-tracks div {
@@ -360,8 +430,74 @@
 }
 
 .track-num {
-  width: 16px;
+  width: var(--track-num-w);
   flex-shrink: 0;
+}
+
+/* The title beside the number. At three columns a column is barely 1.2in wide,
+   and a flex item won't wrap below its longest word by default — one
+   "INSTRUMENTAL)" would push the column into its neighbour. */
+.label-tracks div span:not(.track-num) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The "+12 more" row labels.js substitutes for the tracks it had to drop. Set
+   apart with a rule and a wider gap so it reads as a footnote about the list
+   rather than as the last thing on it. */
+.track-more {
+  margin-top: 4px;
+  padding-top: 3px;
+  border-top: 1px solid #000;
+}
+
+/* ---- The density ladder ----------------------------------------------
+   The second ladder, and the one the card is most reluctant to climb: it isn't
+   touched until the header ladder above is spent. labels.js sets data-density
+   and stops at the first step whose tracklist fits inside the card. Nothing
+   here is responsive to the viewport — the label is 120mm of card stock at
+   every screen size, so what it responds to is the tracklist itself: how many
+   tracks there are and how long their titles run.
+
+   The order is by readability, not by size, and those aren't the same thing.
+   A third column is not simply "denser": it makes each column about 1.2in
+   wide, and a title that used to sit on one line now wraps to two, so three
+   columns of 8px type can run TALLER than two columns of 8.25px. That's why
+   the two-column run goes all the way down to 7.5px before step 5 splits: for
+   a disc with real song titles, two columns of slightly smaller type both fits
+   better and reads better than three columns of slightly larger. Steps 5-6
+   exist for the discs the split does help — samplers and hardcore records,
+   where forty titles are each two words long.
+
+   The gap, the number gutter and the top padding come down with the type so
+   the columns keep their proportions instead of turning into thin ribbons of
+   text with a canyon between them.
+   ---------------------------------------------------------------------- */
+
+.label[data-density="1"] .label-tracks {
+  --track-size: 9.75px; --track-leading: 1.4; --track-gap: 13px; --track-num-w: 15px;
+}
+.label[data-density="2"] .label-tracks {
+  --track-size: 9px; --track-leading: 1.35; --track-gap: 12px; --track-num-w: 14px; --track-pad: 7px;
+}
+.label[data-density="3"] .label-tracks {
+  --track-size: 8.25px; --track-leading: 1.3; --track-gap: 11px; --track-num-w: 13px; --track-pad: 6px;
+}
+.label[data-density="4"] .label-tracks {
+  --track-size: 7.5px; --track-leading: 1.22; --track-gap: 10px; --track-num-w: 12px; --track-pad: 5px;
+}
+/* Three columns from here down. */
+.label[data-density="5"] .label-tracks {
+  --track-size: 8px; --track-leading: 1.3; --track-cols: 3; --track-gap: 10px; --track-num-w: 12px; --track-pad: 6px;
+}
+/* The floor. 7.25px bold caps is small, but it's still type you can read off a
+   card held at arm's length, which is the whole job. There was a 6.5px step
+   below this one and it's gone on purpose: it fit more tracks and none of them
+   could be read, which is not a card with a longer tracklist, it's a card with
+   a grey smudge along the bottom. Past this point labels.js stops shrinking and
+   starts dropping tracks, which at least tells the truth about what's there. */
+.label[data-density="6"] .label-tracks {
+  --track-size: 7.25px; --track-leading: 1.25; --track-cols: 3; --track-gap: 9px; --track-num-w: 11px; --track-pad: 5px;
 }
 
 

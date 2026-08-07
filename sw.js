@@ -26,7 +26,7 @@
    contract between the two.
    ============================================================ */
 
-const CACHE_VERSION = 'v6';
+const CACHE_VERSION = 'v7';
 const SHELL_CACHE = `cdc-shell-${CACHE_VERSION}`;
 const DATA_CACHE  = `cdc-data-${CACHE_VERSION}`;
 const ART_CACHE   = `cdc-art-${CACHE_VERSION}`;

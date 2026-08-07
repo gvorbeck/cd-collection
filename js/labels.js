@@ -79,6 +79,7 @@ const dom = {
   printBtn: $('printBtn'),
   clearAllBtn: $('clearAllBtn'),
   sheetCount: $('sheetCount'),
+  sheetWarning: $('sheetWarning'),
   stackList: $('stackList'),
   stackHint: $('stackHint'),
   previewArea: $('previewArea'),
@@ -235,11 +236,181 @@ function renderPreview() {
   if (labels.length === 0) {
     dom.previewArea.innerHTML =
       '<div class="empty-state no-print">No labels yet. Fill out the form and add one to the print sheet.</div>';
+    setOverflowWarning([]);
     return;
   }
   // Nothing but .label elements here: the print rules page-break on
   // `.label:nth-child(2n)`, which counts every child of this container.
   dom.previewArea.innerHTML = labels.map(buildLabelHtml).join('');
+
+  // Every label gets fitted; the ones that can't be are collected so the form
+  // can name them.
+  const trimmed = [];
+  dom.previewArea.querySelectorAll('.label').forEach((el, i) => {
+    const dropped = fitTracks(el);
+    if (dropped > 0) trimmed.push({ label: labels[i], dropped });
+  });
+  setOverflowWarning(trimmed);
+}
+
+/* ----------------------------------------------------------
+   Fitting the tracklist to the card
+   ------------------------------------------------------------
+   The label is a fixed physical object — 120mm square, because that's the
+   jewel case — so a long tracklist can't be answered by giving it more room.
+   The only variable left is the type, and CSS alone can't set it: how tall a
+   list runs depends on how many of its titles wrap, which nothing but layout
+   knows. So the density steps live in labels.css and the choice between them
+   is made here, by measuring.
+   ---------------------------------------------------------- */
+
+/**
+ * The order the card gives up room in, as [header step, tracklist step] against
+ * the two ladders in labels.css.
+ *
+ * The whole sequence is one idea: SPEND THE HEADER FIRST. The artist and title
+ * are display type, read at a glance from across the room, and a glance barely
+ * notices 30px becoming 19px. The tracklist is read up close, one line at a
+ * time, and shrinking it past legibility doesn't preserve the information — it
+ * just leaves a grey smudge where the information used to be. So all three
+ * header steps are spent before the tracks give up a single point, and even
+ * then the title stays roughly twice the size of a track title.
+ *
+ * Header steps aren't revisited once the tracks start shrinking: there are only
+ * three of them and by then they're all spent.
+ */
+const FIT_STEPS = [
+  [0, 0],  // untouched — where nearly every disc lands
+  [1, 0],  // header gives, tracks still at full size
+  [2, 0],
+  [3, 0],  // header at its floor
+  [3, 1],  // only now does the tracklist tighten
+  [3, 2],
+  [3, 3],
+  [3, 4],
+  [3, 5],
+  [3, 6],  // 7.25px, the legibility floor — see labels.css
+];
+
+/**
+ * Walks the steps and stops at the first one where the tracklist ends inside
+ * the card. Returns the number of tracks that had to be dropped to make it fit
+ * — 0 for every disc that fits, which is nearly all of them.
+ *
+ * Reading a rect between writes forces a synchronous layout each time round,
+ * which is the cost of measuring at all. It's a handful of small boxes, and it
+ * only happens when the sheet changes.
+ */
+function fitTracks(label) {
+  const tracks = label.querySelector('.label-tracks');
+  if (!tracks) return 0;
+
+  // Where the card's content box ends. The tracklist is the last thing in the
+  // label and doesn't shrink on its own, so any part of it below this line is
+  // the amount by which the current step fails.
+  const style = getComputedStyle(label);
+  const floor = label.getBoundingClientRect().bottom
+    - parseFloat(style.borderBottomWidth)
+    - parseFloat(style.paddingBottom);
+
+  // Half a pixel of slack throughout: sub-pixel rounding in a box measured in
+  // fractional inches shouldn't cost a whole step of type size.
+  const fits = () => tracks.getBoundingClientRect().bottom <= floor + 0.5;
+
+  for (const [head, density] of FIT_STEPS) {
+    label.dataset.head = String(head);
+    label.dataset.density = String(density);
+    if (fits()) {
+      relaxHeader(label, fits);
+      return 0;
+    }
+  }
+
+  return truncateToFit(label, tracks, fits);
+}
+
+/**
+ * Gives the header back whatever the tracklist didn't need.
+ *
+ * The steps are coarse — one of them is 8.25px to 7.5px — so the step that
+ * finally fits usually clears the bottom edge by more than it had to, and the
+ * header was charged for all of it. Left alone that reads as the worst of both
+ * worlds: a title cut to 19px AND a band of empty card above the tracks, the
+ * shrink having bought nothing you can see.
+ *
+ * So the header walks back up. The tracklist keeps the size it won — this runs
+ * with the density fixed, and never trades a point of track size for a bigger
+ * title — and the leftover room goes back into the display type instead of
+ * staying as a gap.
+ */
+function relaxHeader(label, fits) {
+  const spent = Number(label.dataset.head);
+  for (let head = 0; head < spent; head += 1) {
+    label.dataset.head = String(head);
+    if (fits()) return;
+  }
+  // Every larger header overflows, so the step that got us here was the price.
+  label.dataset.head = String(spent);
+}
+
+/**
+ * The end of the road: a shrunk header plus three columns at the smallest type
+ * still worth printing is a hard ceiling, and some discs are past it. Left
+ * alone the card would still print every track — it would just print them
+ * clipped, and because the columns balance to equal height, the clip takes the
+ * bottom off ALL THREE of them. The card would be missing tracks 18-22 and
+ * 40-44 as well as the tail, with nothing to say so.
+ *
+ * So the list is cut deliberately instead: drop from the end until what's left
+ * fits, and give the last row over to a count of what didn't. The card then
+ * says something true — these are the first N tracks — rather than looking
+ * complete and being wrong.
+ */
+function truncateToFit(label, tracks, fits) {
+  const marker = document.createElement('div');
+  marker.className = 'track-more';
+  tracks.appendChild(marker);
+
+  let dropped = 0;
+  // Everything but the marker itself.
+  const remaining = () => tracks.children.length - 1;
+
+  while (remaining() > 0) {
+    dropped += 1;
+    marker.textContent = `+${dropped} more`;
+    tracks.children[remaining() - 1].remove();
+    if (fits()) return dropped;
+  }
+
+  // Not even one track fits, so the trouble is above the tracklist rather than
+  // in it — an artist and title long enough to fill the card on their own. A
+  // count of what was dropped has nothing useful to say about that.
+  marker.remove();
+  return dropped;
+}
+
+function setOverflowWarning(trimmed) {
+  dom.sheetWarning.hidden = trimmed.length === 0;
+  if (trimmed.length === 0) {
+    dom.sheetWarning.textContent = '';
+    return;
+  }
+
+  if (trimmed.length === 1) {
+    const { label, dropped } = trimmed[0];
+    const kept = (label.tracks || []).length - dropped;
+    dom.sheetWarning.textContent = kept > 0
+      ? `“${describe(label)}” has more tracks than a jewel-case card can hold. `
+        + `It prints the first ${kept} and a count of the ${dropped} it drops.`
+      : `“${describe(label)}” has an artist and title long enough to fill the card `
+        + `on their own, so none of its ${dropped} tracks print. Shorten one of them.`;
+    return;
+  }
+
+  const total = trimmed.reduce((sum, t) => sum + t.dropped, 0);
+  dom.sheetWarning.textContent =
+    `${trimmed.length} labels have more tracks than a jewel-case card can hold. `
+    + `They print as many as fit, dropping ${total} tracks between them.`;
 }
 
 /**

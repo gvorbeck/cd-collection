@@ -88,6 +88,12 @@
 
         <p class="sheet-count" id="sheetCount"></p>
 
+        <!-- Only appears when a tracklist can't be made to fit its card. It's a
+             property of the preview, but it belongs over here: the preview area
+             holds nothing but .label elements, since the print rules break the
+             page on every second child of it. -->
+        <p class="field-hint sheet-warning" id="sheetWarning" role="status" aria-live="polite" hidden></p>
+
         <!-- A real list of saved labels; each row is a button, so the whole
              stack is keyboard-operable rather than click-only. -->
         <ul class="stack-list" id="stackList"></ul>
