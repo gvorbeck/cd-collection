@@ -29,7 +29,9 @@ Three pages. Two read the sheet; the third is a print tool that doesn't:
   stays well under MusicBrainz's rate limit and no disc is looked up twice.
   Anything still without art falls back to a generated placeholder cover — a
   solid color hashed from the artist name, the title in bold type, and the
-  catalog number — drawn on a `<canvas>`.
+  catalog number — drawn on a `<canvas>`. A disc whose `Barcode` column is
+  filled in skips the search entirely and goes straight to that pressing; see
+  [Pinning a release with a barcode](#pinning-a-release-with-a-barcode).
 - **Card shadows** are tinted by the dominant color sampled from each cover,
   falling back to a neutral tint when a cover can't be read.
 - **Offline** works because a service worker (`sw.js`) precaches the pages,
@@ -186,10 +188,49 @@ below are what the site looks for.
 | `Tags`         | optional  | Comma-separated inside one cell, e.g. `essential, moody`. Drives Tag pills.   |
 | `Art URL`      | optional  | A direct image URL. If set, it always wins. If blank, art is looked up automatically (MusicBrainz → Cover Art Archive), then a generated placeholder as a last resort. |
 | `Notes`        | optional  | Free text shown in the detail view.                                          |
+| `Barcode`      | optional  | The UPC/EAN off the back of the case. Pins the MusicBrainz lookup to that exact pressing instead of searching by artist + title. See below. |
 
 Every column is optional — a completely blank row is skipped, and any single
 missing cell just uses the fallback above. (To rename a column, update both the
 sheet header **and** the matching entry in `CONFIG.COLUMNS` in `js/collection.js`.)
+
+`Barcode` is optional in a second sense too: a sheet that doesn't have the
+column at all parses exactly as it did before it existed.
+
+### Pinning a release with a barcode
+
+Artist + title is a guess, and for a common title with a dozen reissues it is
+sometimes the wrong one — the tracklist comes back with ten tracks instead of
+eleven, or the cover is the remaster's. The barcode printed on the back of the
+case isn't a guess: it names one pressing. Put it in `Barcode` and that disc
+stops searching.
+
+What changes for a disc with a barcode:
+
+- **Cover art** comes from that release's own front image rather than from
+  whichever cover the archive nominates to stand for the record as a whole.
+- **The tracklist** in the detail view is that pressing's running order, with no
+  scoring step deciding which pressing to take.
+- **The MusicBrainz link** in the detail view goes to the release page.
+- **Search** matches the digits, so scanning or typing a barcode with the case
+  in your hand answers "is this one already on the shelf?"
+
+Write it however it's printed — `0 75678 26442 9` and `075678264429` are the
+same cell as far as the page is concerned. Two things to know:
+
+- **Format the column as plain text in the sheet** (Format → Number → Plain
+  text) before typing any barcodes in. Left to itself, a spreadsheet reads a
+  barcode as a number, eats the leading zero, and past twelve digits starts
+  writing it back as `7.5678E+11` — at which point the digits are genuinely gone
+  and no amount of parsing recovers them. A cell in that state is ignored, with
+  a warning in the browser console, rather than being sent to MusicBrainz as if
+  it meant something. A lost leading zero *is* recovered: the lookup asks for
+  the barcode both with and without one, since UPC-A and EAN-13 differ by
+  exactly that.
+- **A barcode can only help.** If MusicBrainz has no release carrying it — a
+  typo, or simply a pressing nobody has entered — the disc falls back to the
+  ordinary artist + title search and looks exactly as it did before. Nothing
+  disappears because a barcode was wrong.
 
 ### Books & shelf location
 

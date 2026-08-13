@@ -12,11 +12,11 @@ import { coerceLabel, takeLabelDraft } from './labelDraft.js';
 import { hideWithoutLosingFocus } from './util.js';
 import {
   findReleaseGroup,
+  tracksForRelease,
   tracksForReleaseGroup,
   escapeLucene,
   wsFetch,
   pickBestRelease,
-  flattenTracks,
   formatDuration,
 } from './musicbrainz.js';
 
@@ -812,9 +812,9 @@ async function looseReleaseTracks(artist, title, wantYear) {
   const best = pickBestRelease(search.releases, wantYear);
   if (!best) return null;
 
-  const release = await wsFetch(`/release/${best.id}`, { inc: 'recordings' });
-  const tracks = flattenTracks(release);
-  return tracks.length ? tracks : null;
+  // Fetching one known release's tracks is shared with the grid page now — it's
+  // what a disc pinned by Barcode does for its whole tracklist.
+  return tracksForRelease(best.id);
 }
 
 /* ----------------------------------------------------------

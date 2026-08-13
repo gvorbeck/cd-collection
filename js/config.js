@@ -56,6 +56,12 @@ export const CONFIG = {
     // Cover Art Archive front-image endpoint (CORS-enabled + canvas-readable).
     // {mbid} is a release-group id; size is one of 250 / 500 / 1200.
     CAA_URL: 'https://coverartarchive.org/release-group',
+    // The same archive addressed by release instead of by release group, for a
+    // disc the sheet pinned with a Barcode. A group's front image is whichever
+    // pressing's cover the archive nominates to stand for the record as a
+    // whole; this one is the cover of the pressing actually on the shelf, which
+    // is the point of having pinned it.
+    CAA_RELEASE_URL: 'https://coverartarchive.org/release',
     CAA_SIZE: 500,
     // localStorage key + schema version. Bump the version to invalidate the
     // whole cache if the lookup logic changes.
@@ -68,6 +74,11 @@ export const CONFIG = {
     // up again — those entries have to go. And the release tiebreakers no
     // longer overturn an exact year match, which changes which pressing inside
     // a group a tracklist is taken from; both caches start over again.
+    // Deliberately *not* bumped to v4 for the Barcode column: artCacheKey grows
+    // a third field only for the discs that have a barcode, so every entry
+    // already in a visitor's browser still matches the disc it was written for.
+    // A bump would have thrown all of them away to re-resolve the handful of
+    // discs the new column actually changes the answer for.
     CACHE_KEY: 'cdc:art-cache:v3',
     // Cached tracklists, keyed by release-group MBID + the disc's year (which
     // pressing within the group we pick depends on it). Capped because these

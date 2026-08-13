@@ -37,6 +37,7 @@ import {
   flattenTracks,
   normalizeTitle,
   scoreReleaseGroup,
+  barcodeQuery,
 } from '../js/musicbrainz.js';
 
 
@@ -395,5 +396,36 @@ describe('scoreReleaseGroup', () => {
 
   it('scores an empty release group at zero', () => {
     assert.equal(scoreReleaseGroup({}, '', null), 0);
+  });
+});
+
+
+describe('barcodeQuery', () => {
+  it('asks for the barcode with and without a leading zero', () => {
+    // A UPC-A and the EAN-13 for the same product differ by that zero, and
+    // which one MusicBrainz holds is down to whoever entered it. Both, always,
+    // in one request.
+    assert.equal(
+      barcodeQuery('075678264429'),
+      'barcode:075678264429 OR barcode:0075678264429 OR barcode:75678264429'
+    );
+  });
+
+  it('pads a barcode a spreadsheet has already eaten the zero off', () => {
+    // 11 digits is not a barcode length that exists. It's a 12-digit UPC that
+    // was read as a number somewhere upstream, which is the single most likely
+    // thing to go wrong with this column.
+    assert.equal(
+      barcodeQuery('75678264429'),
+      'barcode:75678264429 OR barcode:075678264429'
+    );
+  });
+
+  it('never emits a term with nothing after the colon', () => {
+    // Stripping the leading zero off "0" leaves an empty string, and a bare
+    // `barcode:` doesn't search badly — it fails to parse and takes the request
+    // with it. Unreachable through parseBarcode, which is exactly why it's
+    // pinned here rather than left to the caller to keep true.
+    assert.equal(barcodeQuery('0'), 'barcode:0 OR barcode:00');
   });
 });

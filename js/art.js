@@ -8,6 +8,14 @@
    The same release-group id then buys a tracklist for the detail
    view, so both caches live here together.
 
+   A disc whose sheet row carries a Barcode skips step 1: the
+   barcode names one pressing, so the archive is asked for that
+   release rather than for the group it belongs to, and the
+   tracklist comes off the same release. Both are id lookups from
+   there on, and everything below this line — the caches, the
+   offline bail, the retry ceiling — treats the two the same way,
+   which is why they resolve through one function rather than two.
+
    Results — hits AND misses — are cached in localStorage, and both
    caches are read before anything touches the network: the point is
    that a disc is looked up once per browser, ever. Lookups are
@@ -21,7 +29,9 @@ import { readStore, writeStore } from './util.js';
 // and that one are the same client. What's left here is the caching layer over
 // it — cache hits never enter the queue, so browsing cached discs stays instant.
 import {
+  findReleaseByBarcode,
   findReleaseGroup,
+  tracksForRelease,
   tracksForReleaseGroup,
 } from './musicbrainz.js';
 
@@ -43,7 +53,17 @@ function persistArtCache() {
 // formatting differences don't cause misses.
 export function artCacheKey(disc) {
   const norm = (s) => s.toLowerCase().replace(/\s+/g, ' ').trim();
-  return `${norm(disc.artist)}|${norm(disc.title)}`;
+  const key = `${norm(disc.artist)}|${norm(disc.title)}`;
+  // A barcode is part of the question, not a hint about it: the same artist and
+  // title with one is asking for a different cover than the same pair without,
+  // and must not be handed the answer to the other. Adding, correcting or
+  // removing a barcode in the sheet therefore re-resolves that disc by itself,
+  // with no cache version to bump.
+  //
+  // Appended only when there is one, which is what keeps that true of the disc
+  // rather than of everybody's whole cache: a third field on every key would
+  // have invalidated every entry in every browser the day this shipped.
+  return disc.barcode ? `${key}|bc:${disc.barcode}` : key;
 }
 
 /**
@@ -144,8 +164,8 @@ export async function resolveCoverArt(disc) {
   disc._artPromise = (async () => {
     let url = null;
     try {
-      const mbid = await resolveReleaseGroupMbid(disc);
-      if (mbid === LOOKUP_FAILED) {
+      const found = await resolveMbEntity(disc);
+      if (found === LOOKUP_FAILED) {
         // The search never completed, so we learned nothing about this disc.
         // Falling through to the write below would record a dropped connection
         // as "MusicBrainz has no cover for this", forever. Clear the promise so
@@ -156,14 +176,12 @@ export async function resolveCoverArt(disc) {
         disc._artPromise = null;
         return null;
       }
-      if (mbid) {
-        url = `${CONFIG.MUSICBRAINZ.CAA_URL}/${mbid}/front-${CONFIG.MUSICBRAINZ.CAA_SIZE}`;
-      }
+      if (found) url = caaUrl(found);
     } catch (err) {
       // Network/parse failure: treat as a miss for now, but DON'T cache it as a
       // permanent miss — a transient failure shouldn't poison the disc forever.
-      // Belt and braces: resolveReleaseGroupMbid catches its own failures and
-      // reports them as LOOKUP_FAILED above, so nothing is expected to land here.
+      // Belt and braces: resolveMbEntity catches its own failures and reports
+      // them as LOOKUP_FAILED above, so nothing is expected to land here.
       // Counts as a try for the same reason that path does.
       disc._artTries = (disc._artTries || 0) + 1;
       disc._artPromise = null;
@@ -177,6 +195,88 @@ export async function resolveCoverArt(disc) {
   })();
 
   return disc._artPromise;
+}
+
+/**
+ * The MusicBrainz thing a disc's cover and tracklist come from:
+ *
+ *   { kind: 'release',       id }  the pressing its Barcode names
+ *   { kind: 'release-group', id }  the record its artist + title matches
+ *   null                           MusicBrainz doesn't know this disc
+ *   LOOKUP_FAILED                  the question never got an answer
+ *
+ * A barcode is tried first and is *not* binding. If MusicBrainz has no release
+ * carrying it, this falls through to the artist + title search rather than
+ * giving up, so the column can only ever improve a disc or leave it exactly as
+ * it was — a barcode MB has never heard of costs one request and changes
+ * nothing on screen. The alternative, treating a pin as all-or-nothing, turns a
+ * typo into a disc that has lost its cover, and there is no worse way to
+ * discover you mistyped a barcode than by a cover going missing.
+ */
+async function resolveMbEntity(disc) {
+  if (disc.barcode) {
+    const pinned = await resolvePinnedRelease(disc);
+    if (pinned) return pinned; // an entity, or LOOKUP_FAILED — both are answers
+  }
+  const mbid = await resolveReleaseGroupMbid(disc);
+  return mbid && mbid !== LOOKUP_FAILED ? { kind: 'release-group', id: mbid } : mbid;
+}
+
+// Where the Cover Art Archive keeps the front image of either kind of thing.
+function caaUrl(found) {
+  const base = found.kind === 'release'
+    ? CONFIG.MUSICBRAINZ.CAA_RELEASE_URL
+    : CONFIG.MUSICBRAINZ.CAA_URL;
+  return `${base}/${found.id}/front-${CONFIG.MUSICBRAINZ.CAA_SIZE}`;
+}
+
+/**
+ * The release a disc's Barcode names, as an entity for resolveMbEntity above —
+ * or null meaning "no pin to be had, carry on with the search", or LOOKUP_FAILED.
+ *
+ * Shaped like resolveReleaseGroupMbid below, for the same reasons: an id costs
+ * a throttled search, so it's resolved once per disc, remembered on the disc,
+ * and read back out of a cached Cover Art Archive URL for free on later visits.
+ *
+ * The third check is the one that isn't in the other function. A *group* URL
+ * cached under this disc's key is last visit's answer to the barcode: the pin
+ * found nothing, and the search stood in for it. Without that check, a barcode
+ * MusicBrainz doesn't have would spend a request rediscovering that on every
+ * single visit, forever — the fallback above is what makes it a real risk,
+ * because nothing on screen would ever look wrong.
+ */
+async function resolvePinnedRelease(disc) {
+  if (disc._releaseMbid) return { kind: 'release', id: disc._releaseMbid };
+
+  const cached = disc._resolvedArt || artCache[artCacheKey(disc)];
+  if (cached === ART_MISS) return null;
+  const fromArt = mbidFromCaaUrl(cached, 'release');
+  if (fromArt) {
+    disc._releaseMbid = fromArt;
+    return { kind: 'release', id: fromArt };
+  }
+  if (mbidFromCaaUrl(cached)) return null; // settled already — see above
+
+  if (disc._releasePromise) return disc._releasePromise;
+
+  disc._releasePromise = (async () => {
+    try {
+      const id = await findReleaseByBarcode(disc.barcode, discYear(disc));
+      disc._releaseMbid = id;
+      // Null here is "MB has no release with this barcode", which is a real
+      // answer and is kept: the promise stays resolved, so the search doesn't
+      // run twice in a session, and the caller falls through to artist + title.
+      return id ? { kind: 'release', id } : null;
+    } catch (err) {
+      // Same distinction resolveReleaseGroupMbid draws: a question that failed
+      // is not a question answered "no". Clear the promise so a later attempt
+      // can retry, and say so loudly enough that nothing writes it to the cache.
+      disc._releasePromise = null;
+      return LOOKUP_FAILED;
+    }
+  })();
+
+  return disc._releasePromise;
 }
 
 /**
@@ -227,9 +327,19 @@ async function resolveReleaseGroupMbid(disc) {
   return disc._mbidPromise;
 }
 
-// Pull the release-group MBID back out of a Cover Art Archive URL.
-export function mbidFromCaaUrl(url) {
-  const match = /release-group\/([0-9a-f-]{36})\//i.exec(url || '');
+/**
+ * Pull an MBID back out of a Cover Art Archive URL — by default the
+ * release-group one, which is the shape most of these URLs have.
+ *
+ * `kind` is what the caller is asking about, and a URL of the other kind
+ * answers null rather than handing over the id it does have. The two are both
+ * 36 hex characters and neither works in the other's place: a release id in a
+ * /release-group/ link is a 404 on musicbrainz.org and a blank cover from the
+ * archive. The two patterns can't be confused for each other either, since
+ * "/release-group/" doesn't contain "/release/".
+ */
+export function mbidFromCaaUrl(url, kind = 'release-group') {
+  const match = new RegExp(`/${kind}/([0-9a-f-]{36})/`, 'i').exec(url || '');
   return match ? match[1] : null;
 }
 
@@ -248,6 +358,8 @@ function discYear(disc) {
    latter, so the detail view fills it in on demand: resolve the release group
    (usually already known from the cover-art lookup), browse one release from
    it with recordings included, and flatten every medium's tracks in order.
+   For a disc pinned by Barcode there is no browsing and no picking — the
+   release is already the answer, and its recordings are fetched straight.
 
    Fetched only when a disc is actually opened, throttled with every other
    MusicBrainz call, and cached in localStorage — so a disc you revisit shows
@@ -278,16 +390,23 @@ function persistTracksCache() {
  * when MusicBrainz doesn't have it). Returns null when nothing was found.
  */
 export async function resolveTracklist(disc) {
-  const mbid = await resolveReleaseGroupMbid(disc);
-  // A failed lookup is a truthy Symbol, not an id — there's nothing to browse
-  // and nothing worth writing down, so the next open of this disc tries again.
-  if (!mbid || mbid === LOOKUP_FAILED) return null;
+  const found = await resolveMbEntity(disc);
+  // A failed lookup is a truthy Symbol, not an entity — there's nothing to
+  // browse and nothing worth writing down, so the next open of this disc tries
+  // again.
+  if (!found || found === LOOKUP_FAILED) return null;
 
-  // Keyed by group *and* year: which pressing within the group we pick depends
-  // on the year, so two discs sharing a release group but not a year — an
-  // original and a reissue with bonus tracks — mustn't share a cache entry.
+  // A release group is keyed by group *and* year: which pressing within the
+  // group we pick depends on the year, so two discs sharing a release group but
+  // not a year — an original and a reissue with bonus tracks — mustn't share a
+  // cache entry. A pinned release needs no year in its key, because choosing
+  // the pressing is the one thing the barcode has already done. Prefixed so the
+  // two kinds of key can't be mistaken for each other by a future reader; the
+  // ids themselves are UUIDs and would never actually collide.
   const wantYear = discYear(disc);
-  const key = `${mbid}|${wantYear || ''}`;
+  const key = found.kind === 'release'
+    ? `rel:${found.id}`
+    : `${found.id}|${wantYear || ''}`;
   const hit = tracksCache[key];
   if (hit) {
     // Touch it so the LRU eviction keeps the discs actually being browsed.
@@ -300,7 +419,9 @@ export async function resolveTracklist(disc) {
 
   disc._tracksPromise = (async () => {
     try {
-      const tracks = await tracksForReleaseGroup(mbid, wantYear);
+      const tracks = found.kind === 'release'
+        ? await tracksForRelease(found.id)
+        : await tracksForReleaseGroup(found.id, wantYear);
       if (tracks && tracks.length) {
         tracksCache[key] = { t: tracks.map((t) => [t.title, t.length]), at: Date.now() };
         persistTracksCache();

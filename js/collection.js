@@ -50,6 +50,10 @@ export const CONFIG = {
     tags:   'Tags',
     art:    'Art URL',
     notes:  'Notes',
+    // Column J, and the only optional-to-*exist* one: a sheet that predates it
+    // parses exactly as it did before, because col() answers '' for a header
+    // that isn't there. Adding the feature didn't require touching a sheet.
+    barcode: 'Barcode',    // pins the MusicBrainz lookup to one pressing
   },
 
   // Fallbacks for blank cells. Empty string means "show nothing".
@@ -122,6 +126,35 @@ function formatNumbers(numbers) {
   const contiguous = numbers.every((n, i) => i === 0 || n === numbers[i - 1] + 1);
   if (contiguous) return `${numbers[0]}–${numbers[numbers.length - 1]}`;
   return numbers.join(', ');
+}
+
+/**
+ * Reduce a Barcode cell to the digits MusicBrainz indexes, or '' when the cell
+ * holds something that isn't a barcode.
+ *
+ * A barcode gets written down however it's printed — "0 75678 26442 9",
+ * "075678-264429" — so spacing and dashes are dropped and the digits kept, which
+ * is the form MB stores. Two things are rejected outright rather than cleaned:
+ *
+ * - A cell with anything else in it (a letter, a dot, a plus). That covers a
+ *   catalog number typed into the wrong column, and it covers the cell a
+ *   spreadsheet turned into a number behind everyone's back and printed as
+ *   7.5678E+11. The second matters more than it looks: the digits are *gone*
+ *   there, not merely reformatted, and stripping the punctuation out of it
+ *   yields a plausible-length run that would pin the disc to a query meaning
+ *   nothing at all. Format the column as plain text in the sheet.
+ * - A run that isn't 8 to 14 digits long. EAN-8 is the shortest real barcode
+ *   and GTIN-14 the longest, so anything outside that is half of one.
+ *
+ * Both routes lead to the same place: '' reads as "no barcode here", and the
+ * disc falls back to the artist + title search it has always used. Exported for
+ * the tests — nothing else should be interpreting this cell.
+ */
+export function parseBarcode(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (!text || !/^[\d\s\-–—]+$/.test(text)) return '';
+  const digits = text.replace(/\D/g, '');
+  return digits.length >= 8 && digits.length <= 14 ? digits : '';
 }
 
 /**
@@ -385,6 +418,20 @@ function normalizeRows(rows) {
     const art    = col(row, 'art');
     const notes  = col(row, 'notes');
 
+    // Kept in both forms for the same reason the three above are: the digits
+    // are what MusicBrainz is asked for, and the cell is what the CSV export
+    // has to write back. Normalizing on the way out would rewrite the sheet's
+    // own formatting, and a cell this rejects would export as blank — which is
+    // not a rewrite, it's a deletion.
+    const rawBarcode = col(row, 'barcode');
+    const barcode = parseBarcode(rawBarcode);
+    // Said out loud, once, at load. A mistyped barcode otherwise does nothing
+    // whatsoever — the disc keeps the cover and tracklist it would have had —
+    // and "nothing happened" is the hardest kind of wrong to go looking for.
+    if (rawBarcode && !barcode) {
+      console.warn(`Ignoring a Barcode cell that isn't a barcode: "${rawBarcode}".`);
+    }
+
     // A single release can span several catalog slots in the book (e.g. a
     // 2-disc greatest-hits set). The Number cell accepts a range ("42-43") or
     // a comma list ("42, 43"); parseNumbers expands either into the actual
@@ -416,15 +463,20 @@ function normalizeRows(rows) {
       sortTitle:  sortKey(title),
       year,
       genre,
-      // The three cells exactly as the sheet has them, blanks included. Read by
-      // the CSV export and nothing else; display code wants the resolved values
-      // above.
+      // These four cells exactly as the sheet has them, blanks included. Read
+      // by the CSV export and nothing else; display code wants the resolved
+      // values above, and the MusicBrainz lookup wants `barcode` below.
       rawArtist,
       rawTitle,
       rawGenre,
+      rawBarcode,
       tags,
       art,
       notes,
+      // Digits only, '' when the cell was blank or wasn't a barcode. Set means
+      // "this disc is pinned to one MusicBrainz release"; art.js does the
+      // pinning, since it owns every lookup and every cache over them.
+      barcode,
       // Stable random key for the "Random" sort: assigned once per page load,
       // so the shelf looks different every visit but doesn't reshuffle on each
       // keystroke while filtering. A fresh load re-randomizes it.
@@ -443,8 +495,12 @@ function normalizeRows(rows) {
     // numbers so a search for any single number in a range (e.g. "43" within
     // "42-45") still matches. foldText strips accents as well as case, so
     // "andre" finds "André Messager" — the query is folded the same way.
+    // The barcode goes in as its digits rather than as the cell, so the number
+    // read off the back of a case matches whatever spacing the sheet wrote it
+    // in. Searching for one is a real move: it's the fastest way to answer
+    // "is this disc already on the shelf" with the case in your hand.
     disc.searchText = foldText(
-      [book, number, numbers.join(' '), artist, title, year, genre, tags.join(' '), notes].join(' ')
+      [book, number, numbers.join(' '), artist, title, year, genre, tags.join(' '), notes, barcode].join(' ')
     );
 
     // Precompute the shelf-location label ("Book 2 · #42–43") once.
