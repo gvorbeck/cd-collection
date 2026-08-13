@@ -114,19 +114,33 @@ body {
   mix-blend-mode: multiply;
 }
 
-/* ---------- The same grain, tiled onto the covers ----------
+/* ---------- The same grain, tiled onto the PLACEHOLDER covers ----------
    Generated placeholder covers used to carry their own grain, drawn per pixel
    onto the canvas. It came out: per-pixel random noise is the worst thing you
    can hand DEFLATE, and the identical 400px cover encoded to 147,418 bytes with
    it against 1,435 without. This tile is where that texture went.
 
+   It goes only where that pass went: onto the drawn covers. A tile can't tell
+   what it's sitting on, so it briefly went onto every cover, real art included
+   — the reasoning being that generated and photographed covers side by side in
+   one grid at visibly different textures looks like a bug. It isn't the call
+   that was wanted: a photograph of a jewel case is a photograph, and putting
+   construction-paper tooth over it makes it look like a bad scan rather than
+   like the rest of the page. So the grain is a property of the drawn cover now,
+   as it was when it lived in the canvas, and the two textures in a grid are the
+   point rather than the flaw.
+
+   That is what .cover-placeholder is: a class render.js and detail.js put on
+   the <img> whenever what it's showing is a cover we drew, and take off the
+   moment real art loads into it. It is on the image because the image is the
+   thing that knows, and both files hold one long before it is in the document —
+   :has() lifts the state up to the box that can carry a tile.
+
    BOTH selectors are load-bearing, for different reasons:
    - .card-cover-wrap IS under the .grain overlay above, so this is a second
-     coat there — deliberately. A cover on this site has always been grainier
-     than the paper around it; that was the baked-in pass plus the overlay, and
-     this is the tile plus the overlay. The one change is that real cover photos
-     now get it too, which is the fix for generated and photographed covers
-     sitting side by side in the same grid at visibly different textures.
+     coat there — deliberately. A drawn cover on this site has always been
+     grainier than the paper around it; that was the baked-in pass plus the
+     overlay, and this is the tile plus the overlay.
    - .detail-cover is not under the overlay at all. .grain is position: fixed at
      z-index 9999 and the detail view is a modal <dialog>, which the browser
      paints in the top layer — above every z-index in the document, the overlay
@@ -203,10 +217,10 @@ body {
    That parity is with the dialog. Cards measure 5.5 at the same setting, where
    the baked-in pass gave them about 3.75 — because that pass was drawn at 400px
    and then downscaled into a 180px card, which averaged half its amplitude away,
-   and a fixed tile has no equivalent loss. So cards are somewhat grainier than
-   they used to be and every cover on the site now carries the same texture at
-   every size, which is the point of a tile. Checked at 40px too: the row thumbs
-   read as texture rather than sand.
+   and a fixed tile has no equivalent loss. So drawn cards are somewhat grainier
+   than they used to be and carry the same texture at every size, which is the
+   point of a tile. Checked at 40px too: the row thumbs read as texture rather
+   than sand.
 
    Two things that sound like they would help and measurably do not, so they are
    not worth rediscovering: background-size in percentages, so the grain scales
@@ -218,8 +232,13 @@ body {
    only one. The page overlay is deliberately left on 0.19/multiply/linearRGB: it
    sits on paper, where multiply is at its strongest and the texture is already
    right, and changing it would restyle every page. */
-.card-cover-wrap::after,
-.detail-cover::after {
+/* The child combinator is not decoration: the <img> is always a direct child of
+   the box (render.js's coverWrap, detail.js's dom.detailCover), and pinning it
+   there keeps the match a single-element check instead of a subtree walk on
+   every card. Where :has() isn't understood the whole rule is dropped and no
+   cover gets grain, which is the harmless direction to fail in. */
+.card-cover-wrap:has(> .cover-placeholder)::after,
+.detail-cover:has(> .cover-placeholder)::after {
   content: "";
   position: absolute;
   inset: 0;

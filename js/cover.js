@@ -9,6 +9,12 @@
 
    The paper grain these used to carry is a CSS ::after tile on
    .card-cover-wrap and .detail-cover now, not pixels on the canvas.
+   It still belongs to these covers and only these: the tile is
+   scoped to a box holding an <img class="cover-placeholder">, which
+   render.js and detail.js put on whenever what's showing is drawn
+   here and take off the moment real art lands. So a cover made by
+   this file has grain wherever it appears, and a photograph from the
+   Cover Art Archive never does.
    Per-pixel random noise is the worst input DEFLATE can be handed:
    the identical 400px cover encoded to 147,418 bytes with the grain
    baked in against 1,435 bytes without it, at roughly 17ms of

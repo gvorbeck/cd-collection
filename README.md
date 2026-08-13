@@ -29,7 +29,9 @@ Three pages. Two read the sheet; the third is a print tool that doesn't:
   stays well under MusicBrainz's rate limit and no disc is looked up twice.
   Anything still without art falls back to a generated placeholder cover — a
   solid color hashed from the artist name, the title in bold type, and the
-  catalog number — drawn on a `<canvas>`. A disc whose `Barcode` column is
+  catalog number — drawn on a `<canvas>` and finished with the same paper grain
+  as the page, which is what tells a drawn cover from a photographed one at a
+  glance. Real art is left alone. A disc whose `Barcode` column is
   filled in skips the search entirely and goes straight to that pressing; see
   [Pinning a release with a barcode](#pinning-a-release-with-a-barcode).
 - **Card shadows** are tinted by the dominant color sampled from each cover,

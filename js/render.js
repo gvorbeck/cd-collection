@@ -573,6 +573,16 @@ function loadRealCover(img, disc, card, url) {
   img.src = url;
 
   img.addEventListener('load', () => {
+    // Real art is on screen now, so the grain tile comes off (styles.css scopes
+    // it with :has(> .cover-placeholder) — see the block above that rule). This
+    // sits ahead of every bail below, including the un-CORS one: a cover we can
+    // display but not sample is still a photograph and still shouldn't wear
+    // construction-paper tooth. The src check is what keeps the placeholder's
+    // OWN load event from clearing the class it was just given — this handler
+    // fires for whatever the <img> loads next, placeholder included, and
+    // resolveAndSwap can leave more than one of these attached to one node.
+    if (img.getAttribute('src') === url) img.classList.remove('cover-placeholder');
+
     // Two things reach this handler with no crossOrigin, and neither has pixels
     // worth reading: the placeholder the error handler draws (a data URL of our
     // own making) and the un-CORS retry it tries first (real art, but tainted —
@@ -626,6 +636,12 @@ function loadRealCover(img, disc, card, url) {
 function applyPlaceholder(img, disc, card) {
   img.removeAttribute('crossorigin'); // it's a data URL now; no CORS needed
   img.src = generatePlaceholderCover(disc); // memoized per disc
+  // What the cover grain keys off (styles.css, .card-cover-wrap:has(...)).
+  // Every path into this function is one where there is no photograph to show —
+  // no art in the sheet, none cached, or a URL that just failed — so the class
+  // is unconditional here. loadRealCover's load handler is the only thing that
+  // takes it off, and only for the url it was itself asked to load.
+  img.classList.add('cover-placeholder');
   tintFromArtist(disc, card);
 }
 

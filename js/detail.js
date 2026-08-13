@@ -78,7 +78,7 @@ export function openDetail(disc, { pushUrl = true } = {}) {
 
   if (disc.art) {
     img.src = disc.art;
-    img.addEventListener('error', () => { img.src = generatePlaceholderCover(disc); });
+    img.addEventListener('error', () => { usePlaceholder(img, disc); });
   } else if (knownArt) {
     // Already looked up and found — reuse that URL directly instead of running
     // another lookup. resolveCoverArt below would answer out of the same cache,
@@ -89,7 +89,7 @@ export function openDetail(disc, { pushUrl = true } = {}) {
     disc._resolvedArt = knownArt;
     // Show the placeholder first so there's no blank box while the remote image
     // loads, then swap to the real art once it has actually decoded.
-    img.src = generatePlaceholderCover(disc);
+    usePlaceholder(img, disc);
     swapWhenLoaded(img, knownArt, disc.id);
   } else {
     // No sheet Art URL and none resolved yet. Show the placeholder, then resolve.
@@ -98,7 +98,7 @@ export function openDetail(disc, { pushUrl = true } = {}) {
     // call, and a disc previously settled as a known-miss returns null without
     // any network. So opening the detail before the card's art came back never
     // fires a duplicate request — it joins the existing one.
-    img.src = generatePlaceholderCover(disc);
+    usePlaceholder(img, disc);
     resolveCoverArt(disc).then((url) => {
       if (!url) return;
       // Remember a found URL on the disc so future opens skip the lookup path.
@@ -162,9 +162,29 @@ export function openDetail(disc, { pushUrl = true } = {}) {
 function swapWhenLoaded(img, url, discId) {
   const pre = new Image();
   pre.onload = () => {
-    if (dom.detail.open && dom.detail.dataset.discId === discId) img.src = url;
+    if (!dom.detail.open || dom.detail.dataset.discId !== discId) return;
+    img.src = url;
+    // Real art, so the grain comes off with the placeholder it replaced. Paired
+    // with the src inside the guard rather than run unconditionally, for the
+    // same reason the src is: after a close and reopen this closure is holding
+    // an <img> the dialog has already thrown away, and neither line should be
+    // the one that touches it.
+    img.classList.remove('cover-placeholder');
   };
   pre.src = url;
+}
+
+/**
+ * Draw the generated cover into the dialog's <img> and mark it as drawn.
+ *
+ * The mark is what styles.css scopes the grain tile to — a real cover is a
+ * photograph and gets none — and this exists so the three places that reach for
+ * a placeholder can't set one without it. There is no matching un-mark here:
+ * swapWhenLoaded owns that, because it owns the moment art actually arrives.
+ */
+function usePlaceholder(img, disc) {
+  img.src = generatePlaceholderCover(disc); // memoized per disc
+  img.classList.add('cover-placeholder');
 }
 
 /**
