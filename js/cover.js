@@ -36,6 +36,10 @@ const ARTIST_FONT = '400 18px "Space Mono", monospace';
 const titleFont = (px) => `400 ${px}px "Anton", "Arial Narrow", sans-serif`;
 const TITLE_PX = 40;
 const TITLE_PX_LONG = 30; // long titles step down so four lines still fit
+// The floor for the measured step-down in drawWrappedTitle. Below this the title
+// is set smaller than the artist credit under it and the cover stops reading as
+// a cover, so a word that still doesn't fit here gets broken instead of shrunk.
+const TITLE_PX_MIN = 18;
 // The two webfont families named above, spelled as the @font-face rules that
 // the Google stylesheet installs spell them.
 const WEB_FAMILIES = ['Anton', 'Space Mono'];
@@ -183,9 +187,31 @@ function drawWrappedTitle(ctx, text, cx, cy, maxWidth, lineHeight) {
   ctx.font = titleFont(fontSize);
 
   const words = text.split(/\s+/);
+
+  // Character count is only a proxy for width, and it is wrong for exactly the
+  // case that broke this: "BOOGADABOOGADABOOGADA" is 21 characters, one under
+  // the threshold above, so it was set at the full 40px — where 21 characters of
+  // Anton run about half again as wide as the frame. Wrapping cannot save it
+  // either, since the loop below can only break at a space and there isn't one,
+  // so the title was drawn straight out through both edges of the canvas.
+  // Measure instead of counting, and step down until the longest single word
+  // fits the line box. Only titles that would have overflowed move; a step of 1
+  // so a word that needs 39px doesn't get set at 30.
+  while (fontSize > TITLE_PX_MIN && widestWord(ctx, words) > maxWidth) {
+    fontSize -= 1;
+    ctx.font = titleFont(fontSize);
+  }
+
   const lines = [];
   let line = '';
   for (const word of words) {
+    // Still wider than the box at the floor — a 40-plus-character run with no
+    // spaces in it. Break it mid-word rather than reinstate the overflow.
+    if (ctx.measureText(word).width > maxWidth) {
+      if (line) { lines.push(line); line = ''; }
+      lines.push(...breakWord(ctx, word, maxWidth));
+      continue;
+    }
     const test = line ? `${line} ${word}` : word;
     if (ctx.measureText(test).width > maxWidth && line) {
       lines.push(line);
@@ -197,12 +223,44 @@ function drawWrappedTitle(ctx, text, cx, cy, maxWidth, lineHeight) {
   if (line) lines.push(line);
 
   const shown = lines.slice(0, 4);
+  // Four lines is what fits between the catalog number and the artist credit at
+  // the sizes above. A title longer than that is cut without a mark, which is
+  // the behaviour this has always had.
   const totalHeight = shown.length * lineHeight;
   let y = cy - totalHeight / 2 + lineHeight / 2;
   for (const l of shown) {
     ctx.fillText(l, cx, y);
     y += lineHeight;
   }
+}
+
+/* The width of the longest word, which is the width the title cannot go under.
+   Measured at whatever size ctx.font is currently set to, so the caller has to
+   set it before asking and again after changing it. */
+function widestWord(ctx, words) {
+  let widest = 0;
+  for (const word of words) widest = Math.max(widest, ctx.measureText(word).width);
+  return widest;
+}
+
+/* Split a word too wide for the line box into pieces that fit, greedily.
+   Character-level, because that is all a canvas offers — fillText has no
+   hyphenation and no soft-hyphen handling, so there is nowhere better to break.
+   Iterated by code point rather than by index so that an accented title like
+   VÉRONIQUE cannot be cut through the middle of a character. */
+function breakWord(ctx, word, maxWidth) {
+  const pieces = [];
+  let piece = '';
+  for (const ch of word) {
+    if (piece && ctx.measureText(piece + ch).width > maxWidth) {
+      pieces.push(piece);
+      piece = ch;
+    } else {
+      piece += ch;
+    }
+  }
+  if (piece) pieces.push(piece);
+  return pieces;
 }
 
 function truncate(str, max) {
