@@ -4,17 +4,51 @@
    A lot of discs are home-burned with no art. Rather than an empty
    box, draw a designed cover on a <canvas>: a solid hashed color
    block, the title in bold centered type (auto black/white for
-   contrast), the catalog number as a small archival mark, and the
-   same paper grain as everything else. Returns a data URL usable
-   as an <img> src.
+   contrast), and the catalog number as a small archival mark.
+   Returns a data URL usable as an <img> src.
+
+   The paper grain these used to carry is a CSS ::after tile on
+   .card-cover-wrap and .detail-cover now, not pixels on the canvas.
+   Per-pixel random noise is the worst input DEFLATE can be handed:
+   the identical 400px cover encoded to 147,418 bytes with the grain
+   baked in against 1,435 bytes without it, at roughly 17ms of
+   synchronous encode per disc, all of it during the first render
+   pass. A repeating tile over the top reads the same. Don't put it
+   back — and if you touch the CSS, the dialog needs its own tile:
+   the page-wide .grain overlay is position: fixed and never reaches
+   inside a modal <dialog>'s top layer, so .detail-cover is not
+   covered by it.
    ============================================================ */
 import { colorForArtist, hexToRgb, readableTextOn } from './color.js';
 
 
+/* The exact font shorthands the canvas draws with, hoisted so that fontsReady()
+   asks about the same strings the drawing uses. A readiness check naming a face
+   the canvas doesn't name is one that always agrees with itself and never with
+   the picture. */
+const NUMBER_FONT = '700 20px "Space Mono", monospace';
+const ARTIST_FONT = '400 18px "Space Mono", monospace';
+// Anton at 400, not 700. Every page loads it as
+// fonts.googleapis.com/css2?family=Anton&… — no weight axis — and Anton ships a
+// single 400 face, so asking for 700 here gets a canvas-synthesized faux-bold
+// that no real heading on the page has, and the placeholder came out heavier
+// than the type around it. The 400 is deliberate; it is not a missing bold.
+const titleFont = (px) => `400 ${px}px "Anton", "Arial Narrow", sans-serif`;
+const TITLE_PX = 40;
+const TITLE_PX_LONG = 30; // long titles step down so four lines still fit
+// The two webfont families named above, spelled as the @font-face rules that
+// the Google stylesheet installs spell them.
+const WEB_FAMILIES = ['Anton', 'Space Mono'];
+
+
 export function generatePlaceholderCover(disc) {
-  // Cache per disc — the canvas + per-pixel grain is not free, and the grid
-  // re-renders on every filter change.
-  if (disc._placeholderSrc) return disc._placeholderSrc;
+  // Cache per disc — a canvas draw plus a PNG encode is not free, and the grid
+  // re-renders on every filter change. Keyed on font readiness as well as on
+  // having drawn once: a cover laid out in the fallback faces is not the cover
+  // being asked for once the real ones have landed, so it gets redrawn rather
+  // than handed back. repaintPlaceholders is what makes that happen on screen.
+  const ready = fontsReady();
+  if (disc._placeholderSrc && disc._placeholderFontsReady === ready) return disc._placeholderSrc;
 
   const S = 400; // render at 400px square, scaled by CSS
   const canvas = document.createElement('canvas');
@@ -40,7 +74,7 @@ export function generatePlaceholderCover(disc) {
   // 3. Catalog number as a small mark, top-left inside the frame.
   if (disc.numberLabel) {
     ctx.fillStyle = textColor;
-    ctx.font = '700 20px "Space Mono", monospace';
+    ctx.font = NUMBER_FONT;
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
     ctx.fillText(`#${disc.numberLabel}`, 34, 34);
@@ -53,23 +87,100 @@ export function generatePlaceholderCover(disc) {
   drawWrappedTitle(ctx, disc.title.toUpperCase(), S / 2, S / 2, S - 80, 44);
 
   // 5. Artist, small, under the title area toward the bottom.
-  ctx.font = '400 18px "Space Mono", monospace';
+  ctx.font = ARTIST_FONT;
   ctx.globalAlpha = 0.85;
   ctx.fillText(truncate(disc.artist, 28), S / 2, S - 44);
   ctx.globalAlpha = 1;
 
-  // 6. Grain overlay so it matches the paper texture of the page.
-  applyGrain(ctx, S, S);
-
   disc._placeholderSrc = canvas.toDataURL('image/png');
+  disc._placeholderFontsReady = ready;
   return disc._placeholderSrc;
+}
+
+/**
+ * Redraw the placeholders that were drawn before the webfonts arrived, and
+ * repoint the images already showing them.
+ *
+ * Called once from app.js when document.fonts.ready settles — that is the last
+ * word on the subject, since by then the stylesheet has either applied or
+ * failed for good. Discs already drawn in the right faces are skipped, so the
+ * warm-cache case (fonts served from the service worker before the first cover
+ * is drawn) does nothing at all rather than re-encoding a few hundred PNGs to
+ * produce the identical bytes.
+ *
+ * The swap matches on the stale data URL instead of walking cards, so every
+ * placeholder on the page — grid, list, and the dialog's cover — is repointed
+ * without any of them having to know that fonts exist.
+ *
+ * "On the page" is the limit of it, though: document.images is the document,
+ * and render.js keeps a card per disc per view in a reuse map whose off-screen
+ * ones aren't in it. A disc filtered out at the instant the fonts landed would
+ * otherwise keep its Arial Narrow cover and come back wearing it. So the map is
+ * returned rather than applied and forgotten, and app.js hands it to render.js
+ * to finish the job on the nodes only that module can reach.
+ */
+export function repaintPlaceholders(discs) {
+  const ready = fontsReady();
+
+  // Stale src → fresh src. The old value has to be read before the redraw,
+  // because generatePlaceholderCover overwrites _placeholderSrc in place.
+  const swaps = new Map();
+  for (const disc of discs) {
+    if (!disc._placeholderSrc || disc._placeholderFontsReady === ready) continue;
+    const stale = disc._placeholderSrc;
+    swaps.set(stale, generatePlaceholderCover(disc));
+  }
+  if (swaps.size === 0) return swaps;
+
+  for (const img of document.images) {
+    const fresh = swaps.get(img.getAttribute('src'));
+    if (fresh) img.src = fresh;
+  }
+  return swaps;
+}
+
+/**
+ * Whether the covers can be drawn in the type they are designed in.
+ *
+ * Every text pass above names a webfont, and the CSV can win the race against
+ * fonts.gstatic.com: draw too early and a whole session's covers are laid out
+ * — measureText-wrapped and all — in Arial Narrow and Courier, then memoized in
+ * that state permanently. So the memo is gated on this rather than on having
+ * drawn once.
+ *
+ * Two answers that need care:
+ *
+ * - No FontFaceSet at all (an old browser) counts as ready. There is nothing to
+ *   wait on and nothing that will ever say otherwise, and a cover that never
+ *   draws is worse than one in the wrong face.
+ * - check() answers "available" for a family it has simply never heard of,
+ *   which is exactly what it says in the window before the Google Fonts <link>
+ *   has been parsed — long enough for a service-worker-cached CSV to render a
+ *   full grid inside it. So the families have to be registered before their
+ *   check() means anything. Offline with no cached stylesheet they never are,
+ *   which reads as not-ready and stays there: the covers draw immediately in
+ *   the fallbacks and keep their memo, since nothing is coming to repaint them.
+ */
+function fontsReady() {
+  if (!document.fonts) return true;
+
+  const registered = new Set();
+  // Family names come back quoted in some engines and bare in others.
+  document.fonts.forEach((face) => registered.add(face.family.replace(/["']/g, '')));
+  if (!WEB_FAMILIES.every((family) => registered.has(family))) return false;
+
+  // Size doesn't enter into whether a face is available, so the title only
+  // needs asking about at one of the two sizes it draws at.
+  return document.fonts.check(titleFont(TITLE_PX)) &&
+    document.fonts.check(NUMBER_FONT) &&
+    document.fonts.check(ARTIST_FONT);
 }
 
 // Word-wrap a title into up to 4 centered lines around a vertical midpoint.
 function drawWrappedTitle(ctx, text, cx, cy, maxWidth, lineHeight) {
   // Choose a font size that scales down for long titles.
-  let fontSize = text.length > 22 ? 30 : 40;
-  ctx.font = `700 ${fontSize}px "Anton", "Arial Narrow", sans-serif`;
+  let fontSize = text.length > 22 ? TITLE_PX_LONG : TITLE_PX;
+  ctx.font = titleFont(fontSize);
 
   const words = text.split(/\s+/);
   const lines = [];
@@ -96,22 +207,4 @@ function drawWrappedTitle(ctx, text, cx, cy, maxWidth, lineHeight) {
 
 function truncate(str, max) {
   return str.length > max ? `${str.slice(0, max - 1)}…` : str;
-}
-
-// Sprinkle faint monochrome noise over a canvas region for a printed feel.
-function applyGrain(ctx, w, h) {
-  const grain = ctx.getImageData(0, 0, w, h);
-  const d = grain.data;
-  for (let i = 0; i < d.length; i += 4) {
-    // small random +/- nudge to each channel
-    const n = (Math.random() - 0.5) * 26;
-    d[i]     = clamp8(d[i] + n);
-    d[i + 1] = clamp8(d[i + 1] + n);
-    d[i + 2] = clamp8(d[i + 2] + n);
-  }
-  ctx.putImageData(grain, 0, 0);
-}
-
-function clamp8(n) {
-  return n < 0 ? 0 : n > 255 ? 255 : n;
 }

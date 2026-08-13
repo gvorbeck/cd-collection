@@ -14,6 +14,12 @@
    since. Both halves are failure-tolerant: with storage blocked
    the handoff degrades to an empty form, which is exactly the
    page as it was before this existed.
+
+   The coercion that guards the read lives here too, and is
+   exported: the labels page's JSON import faces the same problem
+   from a different direction — arbitrary parsed JSON that has to
+   become a label or be refused — and two copies of "what counts
+   as a label" is one copy too many.
    ============================================================ */
 
 const DRAFT_KEY = 'cdLabelDraft';
@@ -33,11 +39,26 @@ export function saveLabelDraft(draft) {
 }
 
 /**
- * Take the pending draft, if there is one, and clear it.
- * Everything is coerced to the shape the form expects: this is read back out
- * of storage, so a hand-edited or half-written value shouldn't be able to put
- * `undefined` in a field or throw before the page finishes rendering.
+ * Anything already parsed out of JSON, as the shape the form and the print
+ * sheet expect — or null when it isn't a label object at all.
+ *
+ * Every field is coerced rather than trusted: this runs on values that came
+ * from storage or from a file someone picked, so a hand-edited or half-written
+ * entry shouldn't be able to put `undefined` in a field or throw partway
+ * through rendering. Null is kept distinct from "a label with blank fields" so
+ * a caller reading a file can tell the two apart and refuse the file.
  */
+export function coerceLabel(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return {
+    artist: str(value.artist),
+    title: str(value.title),
+    year: str(value.year),
+    tracks: Array.isArray(value.tracks) ? value.tracks.map(str).filter(Boolean) : [],
+  };
+}
+
+/** Take the pending draft, if there is one, and clear it. */
 export function takeLabelDraft() {
   let raw;
   try {
@@ -49,14 +70,7 @@ export function takeLabelDraft() {
   if (!raw) return null;
 
   try {
-    const draft = JSON.parse(raw);
-    if (!draft || typeof draft !== 'object' || Array.isArray(draft)) return null;
-    return {
-      artist: str(draft.artist),
-      title: str(draft.title),
-      year: str(draft.year),
-      tracks: Array.isArray(draft.tracks) ? draft.tracks.map(str).filter(Boolean) : [],
-    };
+    return coerceLabel(JSON.parse(raw));
   } catch {
     return null;
   }

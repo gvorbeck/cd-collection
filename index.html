@@ -51,9 +51,19 @@
       <aside class="stats-card" aria-label="Collection statistics">
         <div class="stats-total">
           <span class="stats-figure" id="stat-total">—</span>
-          <span class="stats-label">discs on the shelf</span>
+          <!-- "Releases", not "discs". renderStats fills the figure above with
+               discs.length — one row of the sheet, however many CDs are in the
+               box — which is exactly the number stats.html prints under
+               "releases", and not the larger one it prints under "physical
+               discs". The two pages sit one nav hop apart, so the word is what
+               had to move: putting the disc count under the old label would
+               only have relocated the disagreement. -->
+          <span class="stats-label">releases on the shelf</span>
         </div>
-        <ul class="stats-genres" id="stat-genres"><!-- per-genre counts injected here --></ul>
+        <!-- role=list is not redundant: .stats-genres is list-style: none and
+             display: flex, and WebKit takes the list role off a <ul> styled
+             that way — the genre count and "this is a list" go with it. -->
+        <ul class="stats-genres" id="stat-genres" role="list"><!-- per-genre counts injected here --></ul>
       </aside>
     </div>
   </header>
@@ -63,11 +73,18 @@
     <section class="controls" aria-label="Browse controls">
       <div class="search-wrap">
         <label class="search-label" for="search">Search the collection</label>
+        <!-- The placeholder says "in any order" because the search no longer
+             wants one. It used to test the query as a single run against a blob
+             laid out in the shelf's column order (book, number, artist, title,
+             year, genre, tags, notes) — an order nobody types in, which is why
+             "miles kind of blue" found nothing. searchTerms in js/state.js
+             matches each word independently now, so the old wording described a
+             rule that had stopped existing. -->
         <input
           type="search"
           id="search"
           class="search-input"
-          placeholder="Search artist, title, genre, tag, year…"
+          placeholder="Search artist, title, genre, tag, year — in any order"
           autocomplete="off"
           spellcheck="false"
         />
@@ -112,7 +129,25 @@
 
     <!-- Visible result summary + active-filter readout (never relies on color alone). -->
     <div class="results-bar">
-      <p class="results-count" id="results-count"></p>
+      <!-- tabindex="-1" so "Clear filters" has somewhere to put the keyboard as
+           it hides itself: hideWithoutLosingFocus in js/util.js parks focus
+           here, and a <p> without it swallows the focus() call silently and
+           drops the user back to <body>. -1 is not Tab-reachable — it only
+           makes this a valid focus() target. -->
+      <p class="results-count" id="results-count" tabindex="-1"></p>
+
+      <!-- Shown only when the discs did not come from the live sheet: the
+           committed data/collection.csv (as old as the last commit) or the
+           service worker's cached copy of the sheet. Filled from loadedFrom()
+           in js/collection.js once load() resolves, and hidden every other
+           time — which is why it is its own element rather than #state-msg,
+           whose text is already the loading, empty and error states. It borrows
+           .results-count for the bar's small mono type; .sheet-stale is the
+           hook for saying it louder than a count. No role=status on purpose:
+           this page has exactly one live region, #live-region above, and a
+           second one would double-speak. -->
+      <p class="results-count sheet-stale" id="stale-notice" hidden></p>
+
       <div class="results-tools">
         <button type="button" class="clear-filters" id="clear-filters" hidden>Clear filters</button>
 
@@ -156,8 +191,16 @@
       </div>
     </div>
 
-    <!-- The main grid. A real list of discs. -->
-    <ul class="grid" id="grid" aria-label="Album covers"><!-- cards injected here --></ul>
+    <!-- The main grid. A real list of discs.
+         role=list is not redundant: .grid is list-style: none and display: grid,
+         and a <ul> styled that way loses its list role in WebKit — and with it
+         the "3 of 42" a screen reader counts off as you arrow through the cards.
+         The <ul> supplies that for free once the role is back, so the cards need
+         no roving tabindex.
+         aria-label here is the pre-render default (state.view starts 'grid') and
+         the no-JS fallback; labelGrid in js/render.js rewrites it on the first
+         render and whenever the view toggles. -->
+    <ul class="grid" id="grid" role="list" aria-label="Album covers"><!-- cards injected here --></ul>
 
     <!-- Empty / loading / error states (visual only — announcements go through
          the single #live-region above to avoid double-speaking to AT). -->

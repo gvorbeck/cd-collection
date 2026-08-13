@@ -14,7 +14,7 @@ Three pages. Two read the sheet; the third is a print tool that doesn't:
 |---------------|-------------------------------------------------------------------|
 | `index.html`  | The collection itself — grid or compact list, search and filters.  |
 | `stats.html`  | Breakdowns by decade, genre, artist, and shelf.                    |
-| `labels.html` | Printable jewel-case inserts, typed by hand and kept in this browser. |
+| `labels.html` | Printable jewel-case inserts, typed by hand or sent over from a disc, kept in this browser. |
 
 ## How it works
 
@@ -34,7 +34,10 @@ Three pages. Two read the sheet; the third is a print tool that doesn't:
   falling back to a neutral tint when a cover can't be read.
 - **Offline** works because a service worker (`sw.js`) precaches the pages,
   styles, and scripts, keeps the last good copy of the sheet, and holds on to
-  cover art once it's been fetched. See [Offline & installing](#offline--installing).
+  cover art once it's been fetched. It also precaches `data/collection.csv`, a
+  snapshot of the sheet committed to the repo, so a fresh install opened for
+  the first time with no signal still has real discs to show. See
+  [Offline & installing](#offline--installing).
 
 The sheet URL, column names, and blank-cell fallbacks are in the `CONFIG` block
 at the top of `js/collection.js` — the shared data layer every page imports.
@@ -42,6 +45,25 @@ The placeholder-cover palette is display-only and stays in `CONFIG` in
 `js/config.js`.
 
 ## What the site does
+
+### Search
+
+The search box matches across everything a disc has — book, catalog number,
+artist, title, year, genre, tags, and notes — and reads what you type as a set
+of words rather than as a phrase. Every word has to turn up somewhere on the
+record, but not in any particular order and not next to each other, so
+`miles kind of blue`, `kind of blue miles` and `1959 miles` all find the same
+disc. Accents fold, so `bjork` finds Björk and `andre` finds André Messager.
+
+Double quotes hold words together when the order is the point: `"kind of blue"`
+is one term, not three. A quote you haven't closed yet runs to the end of the
+query — which is every quoted search halfway through being typed.
+
+The honest cost of matching each word separately is that they can land in
+different fields: a disc with one of them in its notes and another in its genre
+now matches. That's the trade. A word that turns up anywhere on the record is
+usually what someone scanning a shelf meant, and quotes are there for when it
+isn't.
 
 ### Sharing a view
 
@@ -63,13 +85,54 @@ Opening a card gives you the shelf location, notes, and:
   MusicBrainz gets a direct release-group link once one has been identified.
 - **Tracklist** — fetched from MusicBrainz on first open, then cached in
   `localStorage`. A failed lookup isn't cached, so re-opening retries.
+- **Make label** — opens the labels page with this release already filled in,
+  tracklist and all if one has been fetched. See [Labels](#labels).
 
 ### List view and export
 
 The **Grid / List** toggle swaps the covers for dense one-line rows — better
-for scanning a few hundred titles, and what prints. **Export CSV** downloads
-whatever is currently filtered (not the whole collection) as a spreadsheet-safe
-CSV, dated in the filename.
+for scanning a few hundred titles, and what prints.
+
+**Export CSV** downloads whatever is currently filtered — not the whole
+collection — dated in the filename, and marked `-filtered` when a search or a
+pill was on. The file carries every column the sheet has, in the sheet's own
+header order (`Art URL` included), so a paste lands column for column instead
+of quietly putting Notes under Art URL. Cells are written as the *sheet* has
+them rather than as the page shows them: a blank Artist exports blank, not
+"Various Artists."
+
+"Spreadsheet-safe" means one specific thing here. A cell someone typed
+beginning with `=`, `+`, `-` or `@` is read as a live formula by Excel, Sheets
+and LibreOffice alike — no macro warning, no opt-in — so those cells are quoted
+with a tab in front of the value, which no spreadsheet will start a formula
+with. The tab is a real character and it stays: a note that legitimately opens
+with a hyphen ("- see sleeve") comes back from a paste with a tab in front of
+it, and re-exporting keeps it. That's the price of an export that can't run
+anything, and it's the right way round. There's a UTF-8 BOM on the front too,
+so Excel opens accented names as written.
+
+### Labels
+
+`labels.html` prints jewel-case inserts. Labels get there two ways: typed into
+the form by hand, or handed over from the collection by **Make label** in a
+disc's detail view, which arrives with the artist, title and any
+already-fetched tracklist filled in.
+
+They live only in this browser, in `localStorage` under `cdLabels` — not in the
+sheet, not on a server, and "clear site data" takes them with everything else.
+**Export** is the way out: a dated `cd-labels-YYYY-MM-DD.json` holding the whole
+stack, pretty-printed because it's a file a person may well open. **Import**
+takes that back, or a bare array of labels written by hand or by a script.
+Every entry is checked before anything is replaced, and a file with one bad
+entry is refused whole, with a reason — an import that swapped a stack of
+hand-typed tracklists for half a file would be unrecoverable.
+
+Import and **Clear all** are the only two things on the page that can destroy
+more than one label at once, and both offer **Undo** for 30 seconds afterwards
+rather than a confirmation first: a dialog that fires every single time is one
+people learn to dismiss without reading. The offer is only good for that page
+view. The change is written to storage immediately — holding it back would
+leave storage and screen disagreeing — so a reload inside the window is final.
 
 ### Offline & installing
 
@@ -79,7 +142,20 @@ in a record shop.
 
 Bump `CACHE_VERSION` in `sw.js` whenever the shell changes. Old caches are
 deleted on activate, so a bump is also how you force a refresh of anything
-stuck. Icons are committed PNGs (there's no build step) generated by
+stuck. Add new modules and assets to `SHELL_ASSETS` in the same file — it's
+hand-kept, and a module missing from it is a network request the offline shell
+can't answer, which the site hides perfectly until there's no signal.
+`node scripts/check-shell-assets.js` is what notices; CI runs it.
+
+When the discs on screen didn't come from the live sheet, the page says so —
+in the results bar on the grid, above the figures on the stats page — naming
+which copy it read (the one saved on this device, or the one published with the
+site) and dating it when the worker stamped one. What it never says is that the
+*sheet* is out of date: Google's published CSV can trail the spreadsheet all on
+its own, and nothing on this side can see that. All either page honestly knows
+is which copy it read.
+
+Icons are committed PNGs (there's no build step) generated by
 `node scripts/make-icons.js`; re-run that after changing the palette.
 
 ## Editing the collection
@@ -146,6 +222,35 @@ detail view notes the disc count (e.g. "Catalog #42–43 (2 discs)"), searching
 any single number in the span finds the release, and sorting by catalog number
 places it at its first slot.
 
+### Refreshing the offline snapshot
+
+`data/collection.csv` is the sheet frozen into the repo. The service worker
+only has a copy of the sheet after one successful *online* fetch, so without
+this file a fresh install opened for the first time with no signal has nothing
+real to show — the record-shop case the offline support was built for.
+`sample.csv` is no substitute; it's invented data.
+
+Editing the sheet doesn't update it. Refresh it by hand, from a machine with a
+connection:
+
+```sh
+node scripts/snapshot.js
+```
+
+The script reads the sheet's URL out of `js/collection.js`, so there's nothing
+to configure, and it refuses to write anything whose header row doesn't name
+both the Artist and Title columns — a login wall or a Google error page answers
+`200` with HTML, and that must never be able to overwrite a good snapshot.
+
+Then commit the result. This is a hand-run script and not a build stage:
+nothing runs it for you, and Pages serves the repo as-is, so the file has to be
+in the tree to be servable (same as the icons). Re-run it whenever the sheet
+has changed enough that an offline visitor would notice the difference.
+
+One side effect worth having on purpose: because every refresh is a commit,
+`git log -p data/collection.csv` becomes an acquisition log — every disc added
+to the shelf, in order, dated.
+
 ## Files
 
 | File                    | What it is                                                        |
@@ -159,7 +264,12 @@ places it at its first slot.
 | `sw.js`                 | Service worker — offline caching (see above).                     |
 | `manifest.webmanifest`  | PWA manifest: name, colors, icons, shortcuts.                     |
 | `icons/`                | App icons, generated and committed.                               |
+| `data/collection.csv`   | The sheet frozen into the repo, so a first-ever offline load has real discs. See above. |
 | `scripts/make-icons.js` | Regenerates `icons/` — Node stdlib only, run by hand.             |
+| `scripts/snapshot.js`   | Regenerates `data/collection.csv` — likewise Node stdlib, run by hand. |
+| `scripts/check-shell-assets.js` | Checks `SHELL_ASSETS` in `sw.js` against the files actually in the tree. |
+| `test/`                 | Unit tests for the pure helpers. See below.                       |
+| `.github/workflows/`    | Checks every push to `main` and every pull request; publishes `main` to Pages. See below. |
 | `sample.csv`            | Dummy data for local development (see below).                     |
 | `CNAME`                 | Custom-domain config for GitHub Pages (`cd.iamgarrett.com`).      |
 | `qr.svg` / `qr.png`     | QR code linking to the live site.                                 |
@@ -174,12 +284,13 @@ by being imported by name.
 | Module            | What it is                                                      |
 |-------------------|-----------------------------------------------------------------|
 | `collection.js`   | Shared data layer: `CONFIG`, sheet fetch, CSV parsing, disc model, `escapeHtml`. Imported by all three pages. |
-| `musicbrainz.js`  | Shared MusicBrainz primitives: the site-wide 1/sec throttle, Lucene escaping, release search + scoring, tracklist flattening, duration formatting. |
+| `musicbrainz.js`  | Shared MusicBrainz primitives: the site-wide 1/sec throttle, Lucene escaping, the two-step release-group lookup (identify the release, then read a tracklist off it), scoring for both steps, and duration formatting. |
 | `app.js`          | **Entry point for `index.html`.** Wiring only — reads the URL, loads the sheet, binds the event listeners, and hands off. |
 | `stats.js`        | **Entry point for `stats.html`.** Counts the collection three ways and draws the bar charts. |
-| `labels.js`       | **Entry point for `labels.html`.** The label list, the form, and the print sheet. |
+| `labels.js`       | **Entry point for `labels.html`.** The label list, the form, the print sheet, and the JSON export/import. |
+| `labelDraft.js`   | The collection → labels handoff: the draft "Make label" parks in `sessionStorage`, and the one definition of what counts as a label — which the labels page's import reuses to vet a file. |
 | `config.js`       | Grid-page tunables: timings, thresholds, sheet column names, the placeholder palette. |
-| `util.js`         | Tiny shared helpers — element lookup, reduced-motion check, hex test, CSS-variable read, the `localStorage` wrapper. |
+| `util.js`         | Tiny shared helpers — element lookup, reduced-motion check, hex test, CSS-variable read, the accent folding both sides of the search use, a focus-safe way to hide a control, and the `localStorage` wrapper. |
 | `color.js`        | Per-artist accent colors, hex/RGB math, contrast, dominant-color sampling from cover art. |
 | `art.js`          | Cover-art and tracklist resolution: MusicBrainz lookups, the Cover Art Archive, and the caches over both. |
 | `cover.js`        | The generated placeholder cover — canvas, drawn per disc when no art exists. |
@@ -237,6 +348,52 @@ the live sheet:
 The sample data deliberately includes edge cases (blank artist/title/year
 rows, a missing catalog number, very long names, and multi-disc releases) so
 layout and fallbacks can be exercised without touching the real collection.
+
+### Tests
+
+The pure MusicBrainz helpers — Lucene escaping, release and release-group
+scoring, date precision, tracklist flattening, duration formatting — have unit
+tests. There is nothing to install:
+
+```sh
+node --test 'test/*.test.mjs'
+```
+
+Node 24 or newer, and quote the glob. The pattern has to reach Node intact
+rather than be expanded by the shell, and `node --test test/` is read as a path
+to a *file* and dies with `MODULE_NOT_FOUND` before a single test runs.
+
+Node also prints a `MODULE_TYPELESS_PACKAGE_JSON` warning on stderr, because
+there's no `package.json` to say the modules are ES modules. That's expected
+and is not a failure — and it is not worth fixing, because a `package.json`
+with `{"type":"module"}` would break all three scripts in `scripts/`
+(`make-icons.js`, `snapshot.js`, `check-shell-assets.js`), which are CommonJS
+by design. The last of those is the one CI itself runs, so the cure would fail
+the very job it was meant to quiet.
+
+Only what runs without a browser is tested. Anything that touches the DOM, the
+network or `localStorage` isn't.
+
+### What CI checks
+
+Nothing here is compiled, which is exactly why something has to be checked: a
+module with a syntax error is served as-is, the browser refuses the whole
+import graph, and the page white-screens — no build to fail, no console anyone
+is watching. So `.github/workflows/deploy.yml` runs a `check` job first, on
+pushes and on pull requests both:
+
+- `node --check` over `js/*.js`, `scripts/*.js` and `sw.js`. A service worker
+  that doesn't parse fails to install and takes offline support with it.
+- The unit tests above.
+- `node scripts/check-shell-assets.js`, which walks the imports out of all
+  three pages and the icons out of the manifest and fails if `SHELL_ASSETS` in
+  `sw.js` has drifted from what's in the tree. That list is hand-kept because
+  there's no build step to generate it, and drift is invisible online and total
+  offline.
+
+`deploy` waits on `check`, and a pull request stops there — there's one site
+and it is `main`'s. All three checks are the commands above, so any of them can
+be run by hand before pushing.
 
 [PapaParse]: https://www.papaparse.com/
 [MusicBrainz]: https://musicbrainz.org/

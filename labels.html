@@ -78,7 +78,9 @@
         <div class="btn-row">
           <button type="button" class="btn" id="fillBtn">Auto-fill from artist + title</button>
         </div>
-        <!-- role=status so the lookup's outcome is announced, not just shown. -->
+        <!-- role=status so the lookup's outcome is announced, not just shown.
+             It carries the bulk actions' outcomes too — what Clear all and
+             Import just did, and so what the Undo further down would reverse. -->
         <p class="field-hint field-status" id="fillStatus" role="status" aria-live="polite"></p>
 
         <div class="btn-row">
@@ -95,14 +97,34 @@
         <p class="field-hint sheet-warning" id="sheetWarning" role="status" aria-live="polite" hidden></p>
 
         <!-- A real list of saved labels; each row is a button, so the whole
-             stack is keyboard-operable rather than click-only. -->
-        <ul class="stack-list" id="stackList"></ul>
+             stack is keyboard-operable rather than click-only.
+             role=list is not redundant here: labels.css strips the markers off
+             this list, and Safari/VoiceOver drops the list semantics of any
+             list styled that way — without the role the stack stops being
+             announced as "list, 7 items" and becomes seven loose buttons. -->
+        <ul class="stack-list" id="stackList" role="list"></ul>
         <p class="field-hint" id="stackHint" hidden>Pick a saved disc to load it back into the form.</p>
 
         <div class="btn-row">
           <button type="button" class="btn btn-primary" id="printBtn">Print all labels</button>
           <button type="button" class="btn" id="clearAllBtn">Clear all</button>
+          <!-- The way back from "Clear all" and from an import that replaced
+               the stack; #fillStatus above says which of the two it would
+               reverse. Here rather than up beside that message for two
+               reasons: it lands as the very next tab stop after the button
+               that just fired it, and #fillStatus is a live region — a control
+               parked inside one gets re-announced every time an unrelated
+               message replaces the text around it. -->
+          <button type="button" class="btn btn-undo" id="undoBtn" hidden>Undo</button>
         </div>
+
+        <div class="btn-row">
+          <button type="button" class="btn" id="exportBtn">Export JSON</button>
+          <button type="button" class="btn" id="importBtn">Import JSON</button>
+          <!-- Opened by the button beside it, never shown. See js/labels.js. -->
+          <input type="file" id="importFile" accept="application/json,.json" hidden />
+        </div>
+        <p class="field-hint">Saved labels live in this browser only. Export keeps a copy you can carry elsewhere; import replaces the whole stack.</p>
       </section>
 
       <div class="preview-area" id="previewArea">

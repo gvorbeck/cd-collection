@@ -169,6 +169,17 @@
 }
 .btn-primary:hover { background: var(--brick); color: var(--surface); }
 
+/* The way back from a Clear all or a replacing import — on the page only for
+   the half-minute the offer stands, and hidden the rest of the time, so it
+   appears and disappears in a row that otherwise never changes.
+
+   Mustard held permanently, where every other safe control only goes mustard on
+   hover. Same signal for the same reason — this is the button being pointed at
+   — and one that has just materialised next to the button you pressed should be
+   found by looking, not by hunting for what moved. */
+.btn-undo { background: var(--mustard); }
+.btn-undo:hover { background: var(--orange); }
+
 
 /* ============================================================
    4. The print stack
@@ -235,6 +246,26 @@
   cursor: pointer;
 }
 .stack-name:hover { background: var(--mustard); color: var(--ink); }
+
+/* The inversion above is the only thing that says "this row is in the form",
+   and forced-colors mode discards it: --ink and --paper both collapse to the
+   system pair, so the loaded row comes back looking exactly like its
+   neighbours. Border widths survive forced colors where fills don't, so the
+   state gets a rule under the row's name as well as the fill. currentColor so
+   it flips with the inversion — paper on the dark row, ink once the name is
+   hovered — instead of hard-coding one side of it.
+
+   On .stack-name rather than on .stack-item, which is where the state class
+   actually sits: the row's own bottom edge is where the buttons' focus ring
+   lands (3px, offset 2px, so it covers 2-5px outside the button), and a state
+   rule sitting under it would be painted over at exactly the moment someone is
+   navigating by keyboard. Inside the button the ring is drawn around it and the
+   two never meet. The 3px comes back out of the padding, so loading a row for
+   edit doesn't make it 3px taller and shove the rest of the stack down. */
+.stack-item.is-editing .stack-name {
+  border-bottom: 3px solid currentColor;
+  padding-bottom: calc(0.4rem - 3px);
+}
 
 /* Destructive, so it separates from the row with a rule and goes brick on
    hover rather than joining the mustard family the safe controls use. */

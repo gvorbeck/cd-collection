@@ -1,29 +1,97 @@
 # The site is static — no build step, no bundler — so there is nothing to
-# compile here. This workflow exists only to hand the repository to Pages
-# directly, replacing the legacy branch-based pipeline that ran Jekyll over
-# files that were never Jekyll to begin with.
+# compile here. Handing the repository to Pages directly is most of what this
+# does, replacing the legacy branch-based pipeline that ran Jekyll over files
+# that were never Jekyll to begin with.
+#
+# But nothing being compiled is exactly why something has to be checked. A
+# module with a syntax error is served as-is, the browser refuses the whole
+# import graph, and the page white-screens with no signal anywhere — no build
+# to fail, no console anyone is watching. So `check` runs first and `deploy`
+# waits on it, and the checks also run on pull requests, since a merge to main
+# is a deploy and review is the last place to stop a broken module.
 name: Deploy to GitHub Pages
 
 on:
   push:
     branches: [main]
+  # Checks only — see the `if` on the deploy job. This is the one point in the
+  # life of a change where something can be caught before it is live.
+  pull_request:
   # So a failed publish can be retried without an empty commit.
   workflow_dispatch:
 
+# Least privilege by default. The deploy job asks for the rest on its own
+# behalf, so a pull request — which runs nothing but `check` — never holds a
+# token that could publish.
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-# One deployment at a time. Not cancel-in-progress: a half-published site is
-# worse than a queued one, and deploys here are rare enough to just wait.
-concurrency:
-  group: pages
-  cancel-in-progress: false
 
 jobs:
-  deploy:
+  check:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned rather than left to whatever the runner image ships. The test
+      # step below leans on the built-in runner and on Node's own handling of
+      # the glob, both of which have moved between releases, and the image's
+      # default Node moves without asking anyone. 24 is what these checks were
+      # written and run against. There is no package.json, so there is nothing
+      # to install and nothing to cache — this step only fixes a version.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      # The cheapest check here, and the one that catches the white-screen.
+      # sw.js and scripts/ are in the loop too: a service worker that does not
+      # parse fails to install and takes offline support down with it, and the
+      # scripts are how the icons and the offline snapshot get regenerated.
+      - name: Parse every script
+        run: |
+          for file in js/*.js scripts/*.js sw.js; do
+            echo "  $file"
+            node --check "$file"
+          done
+
+      # A glob, quoted so the pattern reaches Node intact instead of depending
+      # on the shell to expand it — and a glob rather than a directory, because
+      # `node --test test/` is read as a path to a file and dies with
+      # MODULE_NOT_FOUND before a single test runs.
+      #
+      # Node warns MODULE_TYPELESS_PACKAGE_JSON on stderr here, because there is
+      # no package.json to say the modules are ES modules. That is expected and
+      # is not a failure: adding one with {"type":"module"} would break all
+      # three scripts in scripts/ — make-icons.js, snapshot.js and
+      # check-shell-assets.js — which are CommonJS by design and say so in
+      # their own headers. The third of those is the next step in this job, so
+      # silencing the warning would fail the workflow it was silenced for.
+      - name: Run the unit tests
+        run: node --test 'test/*.test.mjs'
+
+      # SHELL_ASSETS in sw.js is maintained by hand, because there is no build
+      # step to generate it. This is what notices when it drifts from the files
+      # that are actually in the tree — the failure it prevents is invisible
+      # online and total offline.
+      - name: Check the offline shell's asset list
+        run: node scripts/check-shell-assets.js
+
+  deploy:
+    needs: check
+    # A pull request stops at the checks. There is one site, and it is main's.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # Only this job publishes, so only this job is handed the tokens for it.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # One deployment at a time. Scoped to this job rather than the whole
+    # workflow so a pull request's checks don't queue behind a deploy they have
+    # nothing to do with. Not cancel-in-progress: a half-published site is worse
+    # than a queued one, and deploys here are rare enough to just wait.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

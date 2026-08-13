@@ -2,7 +2,9 @@
    detail.js — the disc dialog
    ------------------------------------------------------------
    Opening a card: the cover at full size, the shelf location, the
-   notes, the search links, and a tracklist fetched on first open.
+   notes, the genre and tags as filters you can follow back out to
+   the shelf, the search links, and a tracklist fetched on first
+   open.
 
    The dialog is also a history entry — opening a disc pushes
    `#disc-<slug>` so Back closes it — so its lifecycle flags and the
@@ -12,11 +14,12 @@
 import { el, formatLocation } from './collection.js';
 import { formatDuration } from './musicbrainz.js';
 import { hexToRgb, safeHex, blendWithPaper } from './color.js';
-import { artCache, artCacheKey, resolveCoverArt, mbidFromCaaUrl, resolveTracklist } from './art.js';
+import { cachedCoverArt, resolveCoverArt, mbidFromCaaUrl, resolveTracklist } from './art.js';
 import { generatePlaceholderCover } from './cover.js';
 import { dom } from './dom.js';
 import { saveLabelDraft } from './labelDraft.js';
-import { DISC_HASH_PREFIX, buildUrl, discSlugFromHash } from './url.js';
+import { state, togglePill } from './state.js';
+import { DISC_HASH_PREFIX, buildUrl, discSlugFromHash, syncControlsToState } from './url.js';
 
 
 // The disc the dialog is currently showing, and the tracklist painted for it.
@@ -67,16 +70,27 @@ export function openDetail(disc, { pushUrl = true } = {}) {
   // Decorative, same as the cards: the dialog is labelled by the title and the
   // artist is the line under it, so alt text here reads them a second time.
   img.alt = '';
+
+  // Real art this browser already has on file for the disc, if any: found by a
+  // card or an earlier open in this session, or by any visit before it — the
+  // art cache is localStorage and outlives the page.
+  const knownArt = disc._resolvedArt || cachedCoverArt(disc);
+
   if (disc.art) {
     img.src = disc.art;
     img.addEventListener('error', () => { img.src = generatePlaceholderCover(disc); });
-  } else if (disc._resolvedArt) {
-    // A card (or a prior detail open) already looked this disc up and found real
-    // art — reuse that URL directly instead of running another lookup. Show the
-    // placeholder first so there's no blank box while the remote image loads,
-    // then swap to the real art once it has actually decoded.
+  } else if (knownArt) {
+    // Already looked up and found — reuse that URL directly instead of running
+    // another lookup. resolveCoverArt below would answer out of the same cache,
+    // but only after a microtask and after pinning an in-flight promise to the
+    // disc; taking the synchronous answer keeps the settled case out of the
+    // async path altogether. Recorded on the disc exactly as that route would
+    // have, so nothing downstream can tell the two apart.
+    disc._resolvedArt = knownArt;
+    // Show the placeholder first so there's no blank box while the remote image
+    // loads, then swap to the real art once it has actually decoded.
     img.src = generatePlaceholderCover(disc);
-    swapWhenLoaded(img, disc._resolvedArt, disc.id);
+    swapWhenLoaded(img, knownArt, disc.id);
   } else {
     // No sheet Art URL and none resolved yet. Show the placeholder, then resolve.
     // resolveCoverArt is cache- and in-flight-aware: a URL already in the cache
@@ -99,11 +113,13 @@ export function openDetail(disc, { pushUrl = true } = {}) {
   // Meta rows: only show fields that have content.
   dom.detailMeta.innerHTML = '';
   if (disc.year)  addMetaRow('Year', disc.year);
-  addMetaRow('Genre', disc.genre);
+  addMetaRow('Genre', filterButton('genre', disc.genre, 'detail-filter'));
 
-  // Tags
+  // Tags. Same chip as before, now the control it always looked like.
   dom.detailTags.innerHTML = '';
-  disc.tags.forEach((t) => dom.detailTags.appendChild(el('span', 'detail-tag', t)));
+  disc.tags.forEach((t) => {
+    dom.detailTags.appendChild(filterButton('tag', t, 'detail-tag detail-filter'));
+  });
 
   // Notes (hidden when empty via CSS :empty)
   dom.detailNotes.textContent = disc.notes || '';
@@ -151,8 +167,118 @@ function swapWhenLoaded(img, url, discId) {
   pre.src = url;
 }
 
+// The release-group MBID this page can name for a disc without asking anyone:
+// one a lookup already resolved, or the one sitting inside a cached Cover Art
+// Archive URL, which has the id in its path. null when nothing here knows it —
+// which is also the answer to "would MusicBrainz have to be asked?".
+function knownMbid(disc) {
+  return disc._mbid || mbidFromCaaUrl(disc._resolvedArt || cachedCoverArt(disc));
+}
+
+// One label/value row of the meta list. `value` is a string or a node — the
+// genre is a button now (see filterButton), everything else is still text.
 function addMetaRow(label, value) {
-  dom.detailMeta.append(el('dt', null, label), el('dd', null, value));
+  const dd = el('dd');
+  dd.append(value);
+  dom.detailMeta.append(el('dt', null, label), dd);
+}
+
+/* ---------- Genre and tag, as filters ----------
+   The dialog is otherwise a dead end: five links off the site and "Make label".
+   Seeing that a record is post-punk and having no way to ask for the rest of
+   the post-punk is the obvious missing move, so the genre and the tags are the
+   same control here as they are on the rails above the grid. */
+
+/**
+ * A genre or tag rendered as the filter it stands for.
+ *
+ * The dataset is exactly what buildPillRail writes in render.js, because that
+ * dataset is all togglePill reads — so this drives the shelf through the same
+ * function the pills do, with no dialog-shaped special case at either end.
+ * aria-pressed starts from live state for the same reason a pill's does: the
+ * dialog can be opened with that genre already filtered, and a pressed state
+ * that's a guess is worse than none.
+ *
+ * The visible word says what it is; the sr-only tail says what pressing it
+ * does, the same split the "look it up" links use.
+ */
+function filterButton(type, value, className) {
+  const btn = el('button', className, value);
+  btn.type = 'button';
+  btn.dataset.filterType = type;
+  btn.dataset.filterValue = value;
+  const set = type === 'genre' ? state.genres : state.tags;
+  btn.setAttribute('aria-pressed', String(set.has(value)));
+  btn.append(el('span', 'sr-only', ` — filter the shelf by this ${type}`));
+  btn.addEventListener('click', () => filterByAndClose(btn));
+  return btn;
+}
+
+/**
+ * Apply one of those filters and get the dialog out of the way, so the press
+ * lands you on the filtered shelf rather than on the record you just filtered by.
+ *
+ * The order matters, and so does which of the two close routes runs. A dialog
+ * opened by a click pushed a history entry, and dismissDetail() normally unwinds
+ * that entry with history.back() — but the entry it goes back to holds the URL
+ * as it was BEFORE the dialog opened, filters and all, and onPopState reads that
+ * URL back over state. Filter first and the pop undoes it; filter after and the
+ * pop still undoes it, because the navigation is asynchronous either way. So the
+ * entry is spent rather than unwound: clearing detailPushedHistory (declared
+ * below, with the rest of the dialog's history bookkeeping) sends onDetailClosed
+ * down its other existing branch, which drops the disc hash from the current
+ * entry in place — no navigation, no popstate, nothing to fight. Back still
+ * lands where it always did, on the shelf as it was before the dialog opened,
+ * which is also the honest undo for the filter.
+ *
+ * Then the filter goes on, in that order, so the grid re-renders behind a dialog
+ * that has already gone rather than during its dismissal.
+ */
+function filterByAndClose(btn) {
+  // Read before dismissDetail: onDetailClosed clears currentDisc, and this is
+  // the only handle on which card the keyboard is about to be knocked off.
+  const disc = currentDisc;
+
+  detailPushedHistory = false;
+  dismissDetail();
+  togglePill(btn);
+  // togglePill presses the button it was handed, and this one isn't the rail's.
+  // Without this the filter is on while its pill still reads unpressed — and an
+  // unpressed tag pill is one the cloud is free to hide behind "show more".
+  syncControlsToState();
+  landOnShelf(disc);
+}
+
+/**
+ * Put the keyboard back on the shelf after following a filter out of the dialog.
+ *
+ * dismissDetail closes the <dialog>, which hands focus back to the card that
+ * opened it — right, and immediately undone. togglePill above re-renders the
+ * grid, and renderCards moves every match through a DocumentFragment to get
+ * them into sort order; a node parked in a fragment is out of the document, so
+ * the browser drops focus to <body>. A disc always matches its own genre, so
+ * its card is always one of the moved ones, so this always happened: Tab after
+ * following a filter restarted at the top of the page, several screens from the
+ * shelf you were just looking at. Same hazard hideWithoutLosingFocus exists
+ * for, one step further along — there the element goes away, here it only
+ * leaves and comes back, and the keyboard doesn't know the difference.
+ *
+ * _cardEl is re-pointed by renderCards for every disc it lays out, so this is
+ * the live node by the time it runs — including after a view switch, where the
+ * card for a disc is a different element than it was in grid. No preventScroll:
+ * the filter moved the disc to a new place in a shorter grid, and seeing where
+ * it landed is the point.
+ *
+ * The disc can also fail to survive: following a genre that's already on turns
+ * it OFF, and another filter still standing can exclude the disc once it does.
+ * Then its card was retired and removed, and the results readout takes focus —
+ * the same fallback clearing a filter uses, sitting just ahead of the tools
+ * cluster, and its text is the answer to what just happened.
+ */
+function landOnShelf(disc) {
+  const card = disc && disc._cardEl;
+  if (card && card.isConnected) card.focus();
+  else if (dom.resultsCount) dom.resultsCount.focus({ preventScroll: true });
 }
 
 /* ---------- "Look it up" links ----------
@@ -180,7 +306,7 @@ function renderDetailLinks(disc) {
   // MusicBrainz last: a direct release-group link if we already resolved one
   // (from the cover-art lookup), otherwise its search page. Never fires a
   // lookup of its own — a link shouldn't cost a request to draw.
-  const mbid = disc._mbid || mbidFromCaaUrl(disc._resolvedArt || artCache[artCacheKey(disc)]);
+  const mbid = knownMbid(disc);
   dom.detailLinks.appendChild(makeDetailLink(
     'MusicBrainz',
     mbid
@@ -256,10 +382,31 @@ function renderTracklist(disc) {
   box.innerHTML = '';
   box.hidden = true;
   currentTracks = [];
+
+  // Offline, the only tracklist that can still arrive is one already in
+  // localStorage from a previous visit, and that one arrives in a microtask —
+  // long before anyone could reach the button. So there is nothing in flight for
+  // "Make label" to be held shut over, and nothing to still be waiting on eight
+  // seconds from now: this site is built to be useful in a shop with no signal,
+  // and a control disabled for the length of a request that already failed is
+  // the opposite of that. navigator.onLine is only trustworthy in one direction
+  // — true can still mean a captive portal or a dead uplink — and false is the
+  // direction being relied on here.
+  const offline = navigator.onLine === false;
+
   // Nothing to hand over yet. "Make label" stays shut until this settles, so a
   // press during the lookup can't send a release stripped of the tracks that
   // are still in flight — the one way this feature could lose data quietly.
-  setMakeLabelPending(true);
+  setMakeLabelPending(!offline);
+
+  // Offline with no release group known for this disc, the lookup would open
+  // with a MusicBrainz search: certain to fail, a full throttle slot spent
+  // failing, and nothing cached behind it either — the tracklist cache is keyed
+  // by the very id we haven't got. So don't ask. The section stays hidden and
+  // says nothing about it, exactly as it does for a disc MusicBrainz has never
+  // heard of; an "you're offline" line here would be the apology this panel
+  // deliberately doesn't make.
+  if (offline && !knownMbid(disc)) return;
 
   const paint = (tracks) => {
     // The dialog may have moved on to another disc while we were waiting.
@@ -272,6 +419,9 @@ function renderTracklist(disc) {
     box.hidden = false;
     box.appendChild(el('h3', 'detail-tracks-heading', 'Tracklist'));
     const ol = el('ol', 'tracklist');
+    // .tracklist turns off list-style, which is enough for Safari to drop the
+    // list out of the accessibility tree entirely. Say it explicitly instead.
+    ol.setAttribute('role', 'list');
     tracks.forEach((t, i) => {
       const li = el('li', 'tracklist-item');
       // The running order, written out as a real element. The <ol> would number
@@ -289,14 +439,30 @@ function renderTracklist(disc) {
     if (total) box.appendChild(total);
   };
 
-  // A cached tracklist resolves in a microtask, so only show the loading line
-  // if we're actually about to hit the network.
+  // Still asked for on the offline path that got this far — but as a maybe, not
+  // a certainty. Knowing the release group is not the same as having the tracks:
+  // art.js keys its tracklist cache by `mbid|year` and fills it only for discs
+  // someone actually opened, so a disc whose cover resolved from a card has an
+  // id and no running order at all. What the id does buy is that the question
+  // becomes answerable — if this disc's tracklist was fetched on some earlier
+  // visit it comes straight back out of localStorage, and a disc looked up at
+  // home should still show its running order in a shop. If it wasn't, the
+  // request fails and the panel stays hidden, which is exactly what it does for
+  // a disc MusicBrainz has no tracks for anyway. Worth one doomed request
+  // against an id we already hold; the search this function bailed on above
+  // would have been a doomed request AND a wasted throttle slot. Only the two
+  // timers below are about an answer that might yet be coming over the wire,
+  // and offline none is.
   const pending = resolveTracklist(disc);
   let settled = false;
   // resolveTracklist swallows its own failures, but a rejection here would be
   // an unhandled one — and "no tracklist" is the right answer either way.
   pending.then((tracks) => { settled = true; paint(tracks); })
          .catch(() => { settled = true; paint(null); });
+  if (offline) return;
+
+  // A cached tracklist resolves in a microtask, so only show the loading line
+  // if we're actually about to hit the network.
   setTimeout(() => {
     if (settled || dom.detail.dataset.discId !== disc.id) return;
     box.hidden = false;
