@@ -8,10 +8,10 @@
    from churning through the art pipeline.
    ============================================================ */
 import { CONFIG } from './config.js';
-import { reducedMotion } from './util.js';
+import { reducedMotion, hideWithoutLosingFocus } from './util.js';
 import { el } from './collection.js';
 import { colorForArtist, sampleDominantColor } from './color.js';
-import { resolveCoverArt } from './art.js';
+import { cachedCoverArt, resolveCoverArt, artLookupSettled } from './art.js';
 import { generatePlaceholderCover } from './cover.js';
 import { dom } from './dom.js';
 import { openDetail } from './detail.js';
@@ -50,9 +50,39 @@ export function announceCount(message) {
   }, 700);
 }
 
+/**
+ * Drop a queued count announcement without making one.
+ *
+ * Every other caller that takes the live region over — announce() above —
+ * clears this timer on the way past, so the only paths that need this are the
+ * ones that decide to say *nothing*. Not calling announceCount isn't the same as
+ * silence: the 700ms timer armed by the keystroke or the click before is still
+ * running, and it fires into a page that has moved on, reading out a count from
+ * the state before last. That's worst in exactly the case applyFilters skips
+ * for — focus has just landed on the results readout and the screen reader is
+ * reading it — where the stale count interrupts the very announcement the skip
+ * exists to protect.
+ */
+export function cancelCountAnnounce() {
+  clearTimeout(countAnnounceTimer);
+  // Same reset announce() does: something else has spoken (or deliberately
+  // hasn't), so the next real count is news again even if the number matches.
+  lastCountAnnounced = '';
+}
+
 // Build the stats "data card": total + per-genre counts.
 export function renderStats(discs) {
-  dom.statTotal.textContent = discs.length;
+  // Grouped, so a four-figure shelf reads as 1,234 and not as the serial number
+  // 1234. stats.js has always done this to its own copy of the very same
+  // number; the header never did, and the two pages sit one nav hop apart.
+  //
+  // The figure is the RELEASE count — one row of the sheet, however many discs
+  // are in the box — which is why stats.js prints "releases" and "physical
+  // discs" as two separate cards. The label beside this one in index.html reads
+  // "releases on the shelf" for that reason; it used to say "discs", and the
+  // wording is what moved rather than the number, because putting the disc
+  // count under the old label would only have relocated the disagreement.
+  dom.statTotal.textContent = discs.length.toLocaleString();
 
   // A Map, not a plain object: genres come from a spreadsheet anyone can type
   // into, and a genre literally named "constructor" or "__proto__" would
@@ -213,8 +243,22 @@ export function layoutTagCloud() {
     fit++;
   }
 
+  // Where focus goes if the pill about to be hidden is the one holding it. That
+  // is not a corner case: un-pressing an overflow tag pill is what un-pins it,
+  // so the pill you just clicked is exactly the pill this loop hides, and
+  // [hidden] is display:none — focus would land back on <body> and the next Tab
+  // would restart at the top of the document. The toggle is the honest
+  // destination because it is where the pill just went; it is also guaranteed
+  // to be on screen here (anything hidden below means `hidden > 0`, so the
+  // early-out that hides the toggle can't be reached), and the search input
+  // stands by for the case where some future edit makes that untrue.
+  const fallback = btn.hidden ? dom.search : btn;
+
   pills.forEach((pill, i) => {
-    pill.hidden = i >= fit && pill.getAttribute('aria-pressed') !== 'true';
+    // Everything was shown above; only the hiding half needs the focus care.
+    if (i >= fit && pill.getAttribute('aria-pressed') !== 'true') {
+      hideWithoutLosingFocus(pill, fallback);
+    }
   });
 
   const hidden = pills.reduce((n, pill) => n + (pill.hidden ? 1 : 0), 0);
@@ -247,6 +291,32 @@ export function layoutTagCloud() {
 
 // disc → { grid: {li, card}, list: {li, card} }
 const cardNodes = new Map();
+
+/**
+ * Point the cards held here at freshly-drawn placeholders.
+ *
+ * cover.js does the redraw and swaps the results in by walking document.images,
+ * which reaches the dialog and every card on screen and by definition misses
+ * the ones parked in the map above. Those are the whole point of the map — a
+ * disc filtered out at the instant the webfonts arrived keeps its Arial Narrow
+ * cover, and is re-attached still wearing it the next time it matches, which is
+ * the one case the repaint exists to prevent. Nothing else can see these nodes,
+ * so the other half of the swap has to live here.
+ *
+ * Takes cover.js's stale-src → fresh-src map rather than the discs, so the two
+ * passes can't come to different conclusions about which covers were stale.
+ */
+export function repointCardImages(swaps) {
+  if (!swaps || swaps.size === 0) return;
+  for (const byView of cardNodes.values()) {
+    for (const entry of Object.values(byView)) {
+      const img = entry.card && entry.card.querySelector('img');
+      if (!img) continue;
+      const fresh = swaps.get(img.getAttribute('src'));
+      if (fresh) img.src = fresh;
+    }
+  }
+}
 
 /**
  * The cached node pair for a disc in a view, built on first use.
@@ -296,6 +366,7 @@ export function renderCards(discs) {
   const view = state.view;
   const isList = view === 'list';
   dom.grid.classList.toggle('is-list', isList);
+  labelGrid(view);
 
   const fresh = [];
   const frag = document.createDocumentFragment();
@@ -317,6 +388,31 @@ export function renderCards(discs) {
 
   dom.grid.appendChild(frag);
   revealCards(fresh, isList);
+}
+
+/**
+ * Keep the grid's accessible name honest about which view it's wearing.
+ *
+ * The grid and the list are one <ul> with a class toggled on it, and the name
+ * is the one thing about the element that can't be shared: "Album covers"
+ * announced over a column of text rows describes the markup as it was written,
+ * not what is in it — and the name is all a screen reader user gets before
+ * deciding whether to walk in.
+ *
+ * Kept behind a memo on the view rather than written on every call, because
+ * renderCards runs on every filter change and the search box refilters every
+ * 120ms while you type: the name changes only when the toggle does, so that is
+ * the only thing worth comparing.
+ */
+let labelledView = '';
+function labelGrid(view) {
+  if (view === labelledView) return;
+  labelledView = view;
+  // Deliberately no count. The element is a <ul>, so assistive tech already
+  // says how many items are in it — putting the same figure in the name would
+  // have it read twice in one breath, and #results-count is where the number
+  // lives for everyone else.
+  dom.grid.setAttribute('aria-label', view === 'list' ? 'Album list' : 'Album covers');
 }
 
 /**
@@ -428,19 +524,41 @@ function buildRow(disc) {
  * Decide what image a card shows.
  * - Real Art URL: load it CORS-enabled; on load, sample color and tint the
  *   shadow; on error, swap in a generated placeholder.
- * - No Art URL: generate a placeholder immediately and tint from its hash.
+ * - Art we already found: same thing, straight away — no placeholder, no dwell.
+ * - Nothing known: generate a placeholder immediately, tint from its hash, and
+ *   go looking once the card is actually on screen.
  */
 function setCoverImage(img, disc, card) {
   if (disc.art) {
     // Explicit Art URL from the sheet always wins — load it directly.
     loadRealCover(img, disc, card, disc.art);
-  } else {
-    // No Art URL: show the generated placeholder now, then try to find real art
-    // via MusicBrainz — but only once this card scrolls on-screen (lazy), so we
-    // never look up covers the visitor doesn't actually see.
-    applyPlaceholder(img, disc, card);
-    observeForArt(img, disc, card);
+    return;
   }
+
+  // No sheet URL, but the disc may still have real art in hand. `_resolvedArt`
+  // is what a lookup found earlier this session — here or in the detail view —
+  // and art.js's localStorage cache answers for one found on any previous
+  // visit, synchronously, for nothing. Not asking meant every repeat visit drew
+  // a canvas placeholder and then sat out the 200ms observer dwell before
+  // swapping in a URL the browser had had all along, on every card, every time.
+  // detail.js does the same peek through the same helper; neither did before.
+  const known = disc._resolvedArt || cachedCoverArt(disc);
+  if (known) {
+    // Same note resolveAndSwap leaves below, for the same reason: this is what
+    // the detail view reads instead of running its own lookup.
+    disc._resolvedArt = known;
+    // buildCardShell sets img.loading = 'lazy' before calling us, so pointing
+    // the <img> at a remote URL here buys the right src, not an eager download
+    // — the fetch still waits for the card to come near the viewport.
+    loadRealCover(img, disc, card, known);
+    return;
+  }
+
+  // Nothing to go on: show the generated placeholder now, then try to find real
+  // art via MusicBrainz — but only once this card scrolls on-screen (lazy), so
+  // we never look up covers the visitor doesn't actually see.
+  applyPlaceholder(img, disc, card);
+  observeForArt(img, disc, card);
 }
 
 /**
@@ -453,10 +571,24 @@ function loadRealCover(img, disc, card, url) {
   img.src = url;
 
   img.addEventListener('load', () => {
-    // Skip if this load is the placeholder swapped in after an error (the
-    // error handler drops crossOrigin), or if we already have a sampled color
-    // cached from a previous render — re-sampling would just repeat the work.
-    if (!img.crossOrigin || disc._sampled) return;
+    // The placeholder the error handler swaps in fires a load event of its own,
+    // and it drops crossOrigin on the way through — that missing attribute is
+    // how the two are told apart. There is nothing to sample off a data URL we
+    // drew ourselves, so this bail stays first.
+    if (!img.crossOrigin) return;
+
+    if (disc._sampled) {
+      // Already sampled, on some earlier card for this disc — usually the other
+      // view's, since a disc gets one card per view. Re-sampling would only
+      // repeat the work, but THIS card is a different node and may never have
+      // been told the color: it was built (buildCardShell reads coverColor) at
+      // a moment when the sample hadn't landed yet. Dropping straight through
+      // is what left such a card wearing the stylesheet's neutral shadow while
+      // its twin in the other view had the real one.
+      card.style.setProperty('--card-shadow', disc.coverColor);
+      return;
+    }
+
     const color = sampleDominantColor(img) || CONFIG.NEUTRAL_SHADOW;
     disc.coverColor = color;
     disc._sampled = true;
@@ -472,15 +604,25 @@ function loadRealCover(img, disc, card, url) {
 function applyPlaceholder(img, disc, card) {
   img.removeAttribute('crossorigin'); // it's a data URL now; no CORS needed
   img.src = generatePlaceholderCover(disc); // memoized per disc
-  const color = colorForArtist(disc.artist);
-  disc.coverColor = color;
-  card.style.setProperty('--card-shadow', color);
+  // The hashed color is a stand-in for one sampled off real art, so it must
+  // never overwrite a real sample. It used to: switching to list view builds a
+  // second card for the disc (nodes are cached per disc PER VIEW), that card
+  // comes back through here, and the hash landed on top of the sampled color —
+  // after which loadRealCover's `_sampled` guard skipped the re-sample that
+  // would have put the real one back. The row kept the hash for the rest of the
+  // session, and so did the detail dialog's tint, which reads disc.coverColor:
+  // whether a disc's dialog was the right color depended on whether you had
+  // ever opened list view.
+  if (!disc._sampled) disc.coverColor = colorForArtist(disc.artist);
+  card.style.setProperty('--card-shadow', disc.coverColor);
 }
 
 // --- Lazy, on-screen-only art resolution --------------------------------
 // One shared observer for the whole grid. When a placeholder card lingers near
-// the viewport, resolve its real art (once) and swap it in if found. rootMargin
-// starts the lookup a bit before the card is fully visible.
+// the viewport, resolve its real art and swap it in if found. rootMargin starts
+// the lookup a bit before the card is fully visible. Once per card is the aim,
+// but it's spelled "once per ANSWER" in the callback below — a lookup that
+// bailed without learning anything doesn't spend the card's one chance.
 //
 // We do NOT fire on the intersecting edge directly: a fast scroll-past would
 // enter the margin and leave it a moment later, but the lookup — once queued —
@@ -502,9 +644,22 @@ function getArtObserver() {
         if (card._artDwellTimer) continue; // already armed
         card._artDwellTimer = setTimeout(() => {
           card._artDwellTimer = null;
-          obs.unobserve(card); // resolve at most once per card
           const { disc, img } = card._artTarget || {};
-          if (disc && img) resolveAndSwap(img, disc, card);
+          if (!disc || !img) { obs.unobserve(card); return; }
+          resolveAndSwap(img, disc, card).then(() => {
+            // Stop watching once the ANSWER is in, not once the attempt is made.
+            // Unobserving unconditionally right here — which is what this did —
+            // made every non-answer permanent: browse offline and each card
+            // bails at art.js's navigator.onLine check having learned nothing,
+            // gets unobserved anyway, and is never asked again. The card-reuse
+            // map hands the same <li> back for that disc all session and
+            // observeForArt runs once per disc per view, so nothing re-attaches
+            // the observer — reconnecting fixed nothing short of a reload, while
+            // three comments claimed the opposite. Leaving an open question
+            // observed costs one more dwell the next time the card re-enters the
+            // margin, and art.js caps how many of those reach the network.
+            if (artLookupSettled(disc)) obs.unobserve(card);
+          });
         }, ART_DWELL_MS);
       } else if (card._artDwellTimer) {
         // Left the margin before dwelling long enough — cancel; nothing queued.
@@ -531,12 +686,14 @@ function observeForArt(img, disc, card) {
 // Resolve real art for a placeholder disc and, if found, swap it in. Always
 // loads the real cover when a URL exists — even after a re-render where the
 // disc was sampled on a prior card — so the freshly-built placeholder card
-// still gets the real art. loadRealCover's own guard skips re-sampling.
+// still gets the real art. loadRealCover's own guard skips the re-sample and
+// just re-applies the color the first card found.
 async function resolveAndSwap(img, disc, card) {
   const url = await resolveCoverArt(disc);
   if (url) {
-    // Remember the resolved URL on the disc so the detail view can reuse it
-    // directly instead of running another lookup.
+    // Remember the resolved URL on the disc so the detail view — and the next
+    // card built for it, in the other view — can reuse it directly instead of
+    // running another lookup.
     disc._resolvedArt = url;
     loadRealCover(img, disc, card, url);
   }

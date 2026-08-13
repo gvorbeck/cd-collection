@@ -2,8 +2,9 @@
    collection.js — the shared data layer
    ------------------------------------------------------------
    Everything about *reading the sheet* lives here — the CSV
-   source, the column names, the blank-cell fallbacks, and the
-   parsing that turns a raw CSV row into a disc object. Anything
+   source (and the committed snapshot it falls back to when the
+   sheet won't answer), the column names, the blank-cell fallbacks,
+   and the parsing that turns a raw CSV row into a disc object. Anything
    about *showing* a disc (colors, covers, layout) stays in the
    page that shows it — the two DOM helpers here (el, escapeHtml)
    are the exception, because every page builds elements and none
@@ -29,6 +30,13 @@ export const CONFIG = {
   // bundled sample.csv instead of the live sheet, so layouts can be built out
   // with a full spread of dummy discs. Production (no query param) is untouched.
   SAMPLE_URL: 'sample.csv',
+
+  // A committed copy of the real sheet, written by `node scripts/snapshot.js`
+  // and precached by the service worker. It's what load() falls back to when
+  // docs.google.com can't be reached — a first visit with no connection, or the
+  // published-CSV endpoint having one of its days. Possibly stale, which is why
+  // the page says so; a stale shelf beats an error page in a record shop.
+  SNAPSHOT_URL: 'data/collection.csv',
 
   // Column names as they appear in the sheet header row.
   // Change these if you rename a column; the rest of the code reads through here.
@@ -160,6 +168,14 @@ export function el(tag, className, text) {
 
 // Escape text destined for innerHTML. We mostly use textContent, but a few
 // spots build markup — keep them safe.
+//
+// TEXT positions only. The div/textContent trick escapes &, < and > and nothing
+// else: quotes come back out untouched, because inside an element's text they
+// mean nothing. Every caller today (the labels page's print sheet) drops values
+// between tags, where that holds. Interpolating into an ATTRIBUTE —
+// `title="${escapeHtml(x)}"` — is NOT covered by this helper and a value with a
+// quote in it will break straight out of the attribute. Build the element and
+// set the attribute instead (el() is right there), which can't go wrong.
 export function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
@@ -209,15 +225,92 @@ export function registerServiceWorker() {
    ---------------------------------------------------------- */
 
 /**
- * Load the sheet with PapaParse and normalize into disc objects.
- * We read only the columns we know, but keep the raw row around so adding
- * a new column later never breaks parsing.
+ * Where the discs currently in memory actually came from. Not a boolean,
+ * because there are more than two answers and they don't mean the same thing:
+ *
+ *   sheet    the live published CSV — what you get on a normal visit
+ *   snapshot the committed data/collection.csv, because the sheet didn't answer.
+ *            Possibly days old, so the page owes the visitor a banner
+ *   cache    the service worker's last-known-good copy of the sheet. Also
+ *            stale, but stale in a different way (it's the sheet as *this*
+ *            browser last saw it, not as the last commit saw it), so it gets
+ *            its own value rather than being folded into `snapshot`
+ *   sample   ?sample — dummy data on purpose. Nothing to warn anyone about
+ *
+ * The worker serves the sheet URL network-first, so a `sheet` answer can in
+ * fact have come out of its cache; only the worker knows which, which is why
+ * `cache` is set from that side via noteDataSource() rather than in here.
  */
-export function load() {
-  const source = usingSample() ? CONFIG.SAMPLE_URL : CONFIG.CSV_URL;
+export const DATA_SOURCES = {
+  SHEET:    'sheet',
+  SNAPSHOT: 'snapshot',
+  CACHE:    'cache',
+  SAMPLE:   'sample',
+};
 
+let dataSource = '';
+
+/** Which DATA_SOURCES value answered the last load(), or '' before one has. */
+export function loadedFrom() {
+  return dataSource;
+}
+
+/** Record a source discovered elsewhere — the service worker's cached copy. */
+export function noteDataSource(source) {
+  dataSource = source;
+}
+
+/**
+ * Load the collection and normalize it into disc objects, remembering which
+ * source answered (see loadedFrom).
+ *
+ * The live sheet first, and a single retry against the committed snapshot if
+ * that rejects. The whole point of the site is being useful in a shop with no
+ * signal, and a visitor whose service worker hasn't cached the sheet yet — a
+ * first visit, a new device, a cleared browser — otherwise gets an error page
+ * for a collection that is sitting right there in the repo.
+ *
+ * ?sample is exempt on purpose: it's a dev switch that means "show me
+ * sample.csv", so if sample.csv is missing that's a broken checkout to fix, not
+ * a cue to quietly load the real collection under a flag that promises dummy
+ * data.
+ */
+export async function load() {
+  if (usingSample()) {
+    const discs = await parseCsv(CONFIG.SAMPLE_URL);
+    dataSource = DATA_SOURCES.SAMPLE;
+    return discs;
+  }
+
+  try {
+    const discs = await parseCsv(CONFIG.CSV_URL);
+    dataSource = DATA_SOURCES.SHEET;
+    return discs;
+  } catch (err) {
+    console.warn('Live sheet unavailable; falling back to the committed snapshot:', err);
+    try {
+      const discs = await parseCsv(CONFIG.SNAPSHOT_URL);
+      dataSource = DATA_SOURCES.SNAPSHOT;
+      return discs;
+    } catch (snapshotErr) {
+      console.warn('Snapshot unavailable too:', snapshotErr);
+      // Both routes gone. Rethrow the *sheet's* error, not the snapshot's: the
+      // snapshot is the backup, so the failure worth reporting is the one that
+      // made us reach for it.
+      throw err;
+    }
+  }
+}
+
+/**
+ * Parse one CSV URL with PapaParse into disc objects.
+ * We read only the columns we know, but keep the raw row around so adding
+ * a new column later never breaks parsing. Rejects on a download failure or a
+ * header row that isn't the sheet's; load() decides what to do about it.
+ */
+function parseCsv(url) {
   return new Promise((resolve, reject) => {
-    Papa.parse(source, {
+    Papa.parse(url, {
       download: true,
       header: true,
       skipEmptyLines: 'greedy', // drop rows that are entirely blank
@@ -239,8 +332,16 @@ export function load() {
  * Without this, a renamed/moved column just makes col() return '' everywhere,
  * so every disc silently falls back (all "Various Artists", all "Self-Titled")
  * and the page looks "loaded" but wrong. Artist and Title are a disc's identity;
- * if neither header is present the sheet is misconfigured, so throw and let
- * the caller's catch show the error state instead of a wall of fallbacks.
+ * if neither header is present the sheet is misconfigured, so throw rather than
+ * hand back a wall of fallbacks.
+ *
+ * What the throw buys is load()'s fallback chain, though — not an error screen.
+ * A misconfigured sheet leaves that try block by the same door an unreachable
+ * one does, so the committed snapshot gets served and the page says the discs
+ * came from a saved copy. Deliberate: a visitor gets the collection rather than
+ * an apology for a column its owner renamed. The cost is that the
+ * misconfiguration is quiet — it's in load()'s console.warn, and it only reaches
+ * the screen if the snapshot has gone missing too.
  */
 function assertExpectedHeaders(fields) {
   const headers = Array.isArray(fields) ? fields.map(clean) : [];
@@ -265,10 +366,20 @@ function normalizeRows(rows) {
     const rawValues = Object.keys(CONFIG.COLUMNS).map((k) => col(row, k));
     if (rawValues.every((v) => v === '')) return;
 
-    const artist = col(row, 'artist') || CONFIG.FALLBACKS.artist;
-    const title  = col(row, 'title')  || CONFIG.FALLBACKS.title;
+    // Both halves of the three fallback fields: the cell as the sheet has it,
+    // and the display value with the fallback applied. Everything on screen
+    // wants the resolved one — the raw copies exist for the CSV export, which
+    // would otherwise write a deliberately blank Artist out as the literal
+    // "Various Artists" and invent data the moment it's pasted back.
+    const rawArtist = col(row, 'artist');
+    const rawTitle  = col(row, 'title');
+    const rawGenre  = col(row, 'genre');
+    const artist = rawArtist || CONFIG.FALLBACKS.artist;
+    const title  = rawTitle  || CONFIG.FALLBACKS.title;
+    // Year has no raw twin: its fallback is '' — a missing year shows nothing —
+    // so the resolved value already is the cell.
     const year   = col(row, 'year')   || CONFIG.FALLBACKS.year;
-    const genre  = col(row, 'genre')  || CONFIG.FALLBACKS.genre;
+    const genre  = rawGenre || CONFIG.FALLBACKS.genre;
     const book   = col(row, 'book');   // which book/binder; may be blank
     const number = col(row, 'number'); // may be blank — card still renders
     const art    = col(row, 'art');
@@ -305,6 +416,12 @@ function normalizeRows(rows) {
       sortTitle:  sortKey(title),
       year,
       genre,
+      // The three cells exactly as the sheet has them, blanks included. Read by
+      // the CSV export and nothing else; display code wants the resolved values
+      // above.
+      rawArtist,
+      rawTitle,
+      rawGenre,
       tags,
       art,
       notes,

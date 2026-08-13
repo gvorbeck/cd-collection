@@ -14,6 +14,22 @@
      cover art        cache-first, in a separate capped cache
      MusicBrainz API  never cached here (app.js caches in localStorage)
 
+   Two things the pages depend on beyond plain caching:
+
+   The shell precaches data/collection.csv, a committed snapshot of
+   the sheet written by scripts/snapshot.js. Before it existed the
+   only real data offline was whatever an earlier online visit had
+   left in DATA_CACHE, so the very first launch of a fresh install
+   with no signal showed "Could not load the collection" — in the
+   record shop this whole file opens by claiming to cover.
+
+   And when the sheet does fall back to the cached copy, the page
+   is told: every controlled client gets a { type: 'sheet-stale' }
+   message carrying the time the entry was written. A cached CSV is
+   indistinguishable from a live one on the page side, so without
+   the message the site shows last month's collection with all the
+   confidence of today's.
+
    Bump CACHE_VERSION whenever the shell changes. Old caches are
    deleted on activate, so a bump is also the way to force a
    refresh of anything stuck.
@@ -26,10 +42,17 @@
    contract between the two.
    ============================================================ */
 
-const CACHE_VERSION = 'v7';
+const CACHE_VERSION = 'v8';
 const SHELL_CACHE = `cdc-shell-${CACHE_VERSION}`;
 const DATA_CACHE  = `cdc-data-${CACHE_VERSION}`;
 const ART_CACHE   = `cdc-art-${CACHE_VERSION}`;
+
+// Our own header, stamped onto a sheet response on its way into DATA_CACHE.
+// It has to be ours: the sheet is cross-origin, so the response the worker
+// gets has its headers filtered down to the CORS-safelist, and Date is not on
+// that list — cached.headers.get('date') is null, every time, no matter how
+// reasonable it looks. Don't try it again.
+const CACHED_AT_HEADER = 'x-cdc-cached-at';
 
 // Cover art is unbounded in principle — one image per disc, forever. Trim it
 // back to this many entries whenever it grows past it.
@@ -37,6 +60,11 @@ const ART_CACHE_MAX = 400;
 
 // Everything needed to render the site with no network. Relative URLs so this
 // keeps working if the site ever moves off the domain root.
+//
+// Kept by hand, because there is no build step to generate it. Run
+// `node scripts/check-shell-assets.js` after editing this list — it walks the
+// imports out of each page and tells you what you left off. CI runs it before
+// anything deploys, which is the only reason drift here is survivable.
 const SHELL_ASSETS = [
   './',
   'index.html',
@@ -64,11 +92,22 @@ const SHELL_ASSETS = [
   'js/labels.js',
   'js/labelDraft.js',
   'sample.csv',
+  // The real collection, frozen into the tree by scripts/snapshot.js. This is
+  // the one asset that may legitimately not be there — it is generated, so a
+  // checkout where the script has never been run simply doesn't have it. The
+  // per-asset catch in install() is what keeps that from failing the whole
+  // precache and taking every other offline asset down with it.
+  'data/collection.csv',
   'manifest.webmanifest',
+  // Every icon manifest.webmanifest declares, plus the Apple touch icon the
+  // pages link directly. The two lists drifted once — icon-maskable-512.png
+  // was declared in the manifest and precached nowhere — so CI now checks that
+  // everything the manifest names appears here.
   'icons/icon.svg',
   'icons/icon-180.png',
   'icons/icon-192.png',
   'icons/icon-512.png',
+  'icons/icon-maskable-512.png',
   // Third-party, but the site does not render without them.
   'https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js',
 ];
@@ -79,7 +118,9 @@ self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(SHELL_CACHE);
     // addAll() is all-or-nothing: one 404 and the whole install fails, taking
-    // offline support with it. Add them individually and tolerate misses.
+    // offline support with it. Add them individually and tolerate misses —
+    // load-bearing now that data/collection.csv is on the list, since that one
+    // is generated and a fresh clone hasn't got it until snapshot.js runs.
     await Promise.all(SHELL_ASSETS.map(async (url) => {
       try {
         await cache.add(new Request(url, { cache: 'reload' }));
@@ -158,13 +199,75 @@ async function networkFirst(request, cacheName) {
   const cache = await caches.open(cacheName);
   try {
     const response = await fetch(request);
-    if (response && response.ok) cache.put(request, response.clone());
+    if (response && response.ok && isCsv(response)) {
+      // Stamped and stored, not stored as-is: the fallback below has no other
+      // way to tell the page how old the copy it's serving is. Awaiting the
+      // body here is free — the caller parses the whole CSV anyway — and it
+      // guarantees the write finishes before respondWith() settles and the
+      // worker becomes killable.
+      await cache.put(request, await stampCachedAt(response.clone()));
+    }
     return response;
   } catch (err) {
     const cached = await cache.match(request);
-    if (cached) return cached;
+    if (cached) {
+      // Hand back the frozen sheet, but say so. A cached response is
+      // byte-identical to a live one from the page's side, so this message is
+      // the only thing standing between an offline visitor and the belief that
+      // they are looking at the current collection.
+      await notifyClients({ type: 'sheet-stale', cachedAt: cached.headers.get(CACHED_AT_HEADER) });
+      return cached;
+    }
     throw err;
   }
+}
+
+/**
+ * Is this response actually the sheet?
+ *
+ * A 200 is not proof of one: an unpublished sheet, or a URL that has picked up
+ * a login redirect, comes back as a perfectly successful page of HTML. Caching
+ * that would evict the last good CSV and leave the shop-floor fallback serving
+ * a login wall — the same clobbering scripts/snapshot.js refuses to do to
+ * data/collection.csv, for the same reason.
+ *
+ * Content-Type is readable here despite the sheet being cross-origin: unlike
+ * Date, it is on the CORS-safelist. If Google ever stops sending a CSV type the
+ * cost is that the copy stops refreshing rather than the copy going wrong, which
+ * is the right way round to fail: the live response still goes straight back to
+ * the page, and PapaParse doesn't look at content types, so a sheet suddenly
+ * served as text/plain keeps loading.
+ *
+ * Nothing posts sheet-stale on that path, and nothing should. The fetch
+ * succeeded and what the page is holding is the live response, not the frozen
+ * one — there's no stale copy in play to warn about. And if what came back was
+ * the login wall this guard is really for, the page works that out for itself:
+ * the HTML fails assertExpectedHeaders in collection.js, load() falls back to
+ * the committed snapshot, and that route puts up its own "from a saved copy"
+ * line.
+ */
+function isCsv(response) {
+  return (response.headers.get('content-type') || '').toLowerCase().includes('csv');
+}
+
+// Rebuild a response with the time it was cached written onto it. Responses
+// are immutable, so this is a copy rather than a header edit.
+async function stampCachedAt(response) {
+  const headers = new Headers(response.headers);
+  headers.set(CACHED_AT_HEADER, new Date().toISOString());
+  return new Response(await response.blob(), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+// Tell the open pages something. Controlled clients only: an uncontrolled page
+// isn't having its fetches routed through here, so nothing it shows came from
+// this worker and nothing here is news to it.
+async function notifyClients(message) {
+  const clients = await self.clients.matchAll({ type: 'window' });
+  for (const client of clients) client.postMessage(message);
 }
 
 /**

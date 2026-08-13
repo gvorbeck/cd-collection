@@ -16,14 +16,13 @@
    ============================================================ */
 import { CONFIG } from './config.js';
 import { readStore, writeStore } from './util.js';
-// The throttle lives in musicbrainz.js, shared with the labels page: MB's
-// 1/sec rule is per client, and this page and that one are the same client.
-// Cache hits never enter the queue, so browsing cached discs stays instant.
+// The lookup itself lives in musicbrainz.js, shared with the labels page, and
+// so does the throttle behind it: MB's 1/sec rule is per client, and this page
+// and that one are the same client. What's left here is the caching layer over
+// it — cache hits never enter the queue, so browsing cached discs stays instant.
 import {
-  throttledFetch,
-  escapeLucene,
-  pickBestRelease,
-  flattenTracks,
+  findReleaseGroup,
+  tracksForReleaseGroup,
 } from './musicbrainz.js';
 
 
@@ -47,8 +46,65 @@ export function artCacheKey(disc) {
   return `${norm(disc.artist)}|${norm(disc.title)}`;
 }
 
+/**
+ * The cover URL already cached for a disc, or null — read synchronously, with
+ * no lookup started and nothing written. Both the grid and the dialog check
+ * this before doing anything slower.
+ *
+ * It lives here, and not at the two call sites, because here it can test
+ * against ART_MISS itself. The callers can't: the sentinel is module-local on
+ * purpose (a copy of it elsewhere goes stale the day it changes), so each of
+ * them was left guessing at the shape of a *hit* instead — the grid looked for
+ * an MBID in the path, the dialog for a leading `https?:` — and those two
+ * guesses disagree about any cached URL that isn't a Cover Art Archive one.
+ * Same question, two answers, two files: harmless right up until it isn't.
+ */
+export function cachedCoverArt(disc) {
+  const cached = artCache[artCacheKey(disc)];
+  return !cached || cached === ART_MISS ? null : cached;
+}
+
 
 // --- resolution ---------------------------------------------------------
+
+// What a lookup that *failed* resolves to, as distinct from one that finished
+// and found nothing. Only the second is a fact about the disc worth keeping: a
+// dropped connection or a 503 must never be written as ART_MISS, because sw.js
+// sends musicbrainz.org straight to the network — so a single offline browse
+// would permanently mark every disc it touched as having no cover, recoverable
+// only by bumping CACHE_KEY or clearing localStorage by hand. A Symbol so it
+// can't be confused with an MBID, and module-local so it never escapes: both
+// consumers below turn it back into a plain null.
+const LOOKUP_FAILED = Symbol('mb-lookup-failed');
+
+// How many times a lookup that actually reached the network may come back
+// empty-handed before a disc is left on its placeholder for the session.
+// Retries are what makes the offline story work at all — render.js keeps a card
+// under the art observer while its question is still open, so scrolling past it
+// after the connection returns asks again — but "keeps watching" with no
+// ceiling means a MusicBrainz outage turns every scroll up and down the shelf
+// into a fresh queue of doomed requests, which is the pile-up ART_DWELL_MS was
+// added to prevent. Offline bails deliberately don't count against this: they
+// cost no request and no throttle slot, so spending the budget on them would
+// mean a long offline browse left the whole shelf permanently un-lookupable the
+// moment it came back — the exact bug this ceiling is guarding the fix for.
+const MAX_LOOKUP_ATTEMPTS = 3;
+
+/**
+ * Is this disc's cover-art question closed?
+ *
+ * True once there's a cached outcome — a URL or a known miss — or once the
+ * network attempts above have been spent. False means the last try taught us
+ * nothing and asking again later is worth it, which is render.js's cue to leave
+ * the card under the art observer instead of unobserving it after one go. The
+ * two bail paths in resolveCoverArt below are exactly the cases that leave this
+ * false, and exactly the cases that deserve another chance.
+ */
+export function artLookupSettled(disc) {
+  if (Object.prototype.hasOwnProperty.call(artCache, artCacheKey(disc))) return true;
+  return (disc._artTries || 0) >= MAX_LOOKUP_ATTEMPTS;
+}
+
 /**
  * Resolve a cover-art image URL for a disc that has no Art URL of its own.
  * Returns a Promise<string|null> — a CAA image URL, or null if none was found.
@@ -63,6 +119,24 @@ export async function resolveCoverArt(disc) {
     return cached === ART_MISS ? null : cached;
   }
 
+  // Nothing cached and the browser says there's no connection: this lookup can
+  // only fail, and it would spend a full throttle slot doing it — ahead of the
+  // disc scrolled to a second after the connection comes back. navigator.onLine
+  // is unreliable in one direction only (true can still mean a captive portal
+  // or a dead uplink), and false is the direction being trusted here. Nothing
+  // is written and no promise is armed, so the disc is simply un-looked-up —
+  // and artLookupSettled stays false for it, which is what keeps render.js's
+  // observer on the card rather than retiring it over this non-answer. Dwell on
+  // it again once the connection is back and it asks for real. That's also why
+  // this file owns no 'online' listener: there's no latch here to release, only
+  // a question nobody has answered yet.
+  if (navigator.onLine === false) return null;
+
+  // Out of tries — see MAX_LOOKUP_ATTEMPTS. Same shape as the bail above (no
+  // write, no promise), but artLookupSettled reports this one as closed, so the
+  // observer lets the card go and the shelf stops asking.
+  if ((disc._artTries || 0) >= MAX_LOOKUP_ATTEMPTS) return null;
+
   // In-flight de-dupe: if this disc is already resolving (e.g. its card and the
   // detail view both asked), reuse the same promise.
   if (disc._artPromise) return disc._artPromise;
@@ -71,16 +145,32 @@ export async function resolveCoverArt(disc) {
     let url = null;
     try {
       const mbid = await resolveReleaseGroupMbid(disc);
+      if (mbid === LOOKUP_FAILED) {
+        // The search never completed, so we learned nothing about this disc.
+        // Falling through to the write below would record a dropped connection
+        // as "MusicBrainz has no cover for this", forever. Clear the promise so
+        // a later scroll past this card can try again — the card is still under
+        // the observer, because artLookupSettled reads an unanswered question as
+        // open too. This one did spend a request, so it costs a try.
+        disc._artTries = (disc._artTries || 0) + 1;
+        disc._artPromise = null;
+        return null;
+      }
       if (mbid) {
         url = `${CONFIG.MUSICBRAINZ.CAA_URL}/${mbid}/front-${CONFIG.MUSICBRAINZ.CAA_SIZE}`;
       }
     } catch (err) {
       // Network/parse failure: treat as a miss for now, but DON'T cache it as a
       // permanent miss — a transient failure shouldn't poison the disc forever.
+      // Belt and braces: resolveReleaseGroupMbid catches its own failures and
+      // reports them as LOOKUP_FAILED above, so nothing is expected to land here.
+      // Counts as a try for the same reason that path does.
+      disc._artTries = (disc._artTries || 0) + 1;
       disc._artPromise = null;
       return null;
     }
-    // Cache the settled outcome (real URL, or a permanent miss sentinel).
+    // Cache the settled outcome: a real URL, or the miss sentinel — which now
+    // means only that MusicBrainz answered and had no release group to offer.
     artCache[key] = url || ART_MISS;
     persistArtCache();
     return url;
@@ -90,7 +180,9 @@ export async function resolveCoverArt(disc) {
 }
 
 /**
- * The release-group MBID for a disc, or null if MusicBrainz doesn't know it.
+ * The release-group MBID for a disc, null if MusicBrainz doesn't know it, or
+ * LOOKUP_FAILED if the question never got an answer — the two are the same
+ * outcome on screen but opposite outcomes for the cache.
  *
  * This is the join point for everything that needs MusicBrainz: cover art, the
  * tracklist, and the "look it up" link all want the same id, and it costs a
@@ -117,12 +209,18 @@ async function resolveReleaseGroupMbid(disc) {
 
   disc._mbidPromise = (async () => {
     try {
-      disc._mbid = await findReleaseGroupMbid(disc);
+      disc._mbid = await findReleaseGroup({
+        artist: disc.artist,
+        title: disc.title,
+        year: discYear(disc),
+      });
       return disc._mbid;
     } catch (err) {
-      // Transient failure — clear the promise so a later attempt can retry.
+      // Transient failure — clear the promise so a later attempt can retry, and
+      // say *failed* rather than null: a null here reads as "no such release
+      // group" and gets written to the cache as a permanent miss.
       disc._mbidPromise = null;
-      return null;
+      return LOOKUP_FAILED;
     }
   })();
 
@@ -140,101 +238,6 @@ export function mbidFromCaaUrl(url) {
 // which pressing of the one we settled on.
 function discYear(disc) {
   return parseInt(String((disc && disc.year) || '').slice(0, 4), 10) || null;
-}
-
-// A release group's 4-digit first-release year, or null when MB has no date.
-function groupYear(rg) {
-  return parseInt((rg['first-release-date'] || '').slice(0, 4), 10) || null;
-}
-
-// Titles compared the way a person would: case, spacing and punctuation are
-// noise, the words are the title.
-function normalizeTitle(str) {
-  return String(str || '')
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .trim();
-}
-
-/**
- * Score a release group from a search result against the disc we're holding.
- *
- * MusicBrainz's own relevance can't separate a record from the EP, single and
- * remix set that reuse its name — searching Amy Winehouse for "Back to Black"
- * returns the 2006 album, a 2006 remixes EP, a 2007 single and a B-sides EP,
- * several of them exact title matches — so relevance alone picked whichever
- * sorted first and the detail view showed three tracks for an eleven-track
- * record.
- *
- * Type carries the most weight, because a shelf of CDs is overwhelmingly
- * albums, and the year in the sheet is usually the *pressing* year rather than
- * the group's first release: "Back to Black" reissued in 2007 must not start
- * matching the 2007 single. So the year breaks ties between plausible records
- * instead of choosing on its own, and a disc that really is an EP or a single
- * wins on its title matching exactly where the album's doesn't.
- */
-function scoreReleaseGroup(rg, wantTitle, wantYear) {
-  let score = 0;
-
-  const primary = (rg['primary-type'] || '').toLowerCase();
-  if (primary === 'album') score += 100;
-  else if (primary === 'ep') score += 30;
-
-  // The disc's own name, not a longer title that merely contains it —
-  // "Back to Black" is not "Back to Black: B-Sides" or "Frank & Back to Black".
-  if (wantTitle && normalizeTitle(rg.title) === wantTitle) score += 90;
-
-  const rgYear = groupYear(rg);
-  if (wantYear && rgYear) {
-    const diff = Math.abs(rgYear - wantYear);
-    // Exact wins; a pressing a few years off the original still counts for
-    // something; a decade away contributes nothing either way.
-    score += diff === 0 ? 60 : Math.max(0, 45 - diff * 6);
-  }
-
-  // Compilations, live records and remix sets are their own titles; when one
-  // shares a name with the studio album, the studio album is the likelier disc.
-  if ((rg['secondary-types'] || []).length) score -= 25;
-
-  score += (rg.score || 0) / 100; // MB's own relevance as a tiebreaker.
-  return score;
-}
-
-/**
- * Query MusicBrainz for the release group that best matches this disc and
- * return its MBID, or null. We search by artist + release title, then choose
- * among the matches with scoreReleaseGroup — MusicBrainz sorts by text
- * relevance, which doesn't know which "Back to Black" is on the shelf.
- */
-async function findReleaseGroupMbid(disc) {
-  // Lucene-style query: quote the values and escape embedded quotes.
-  const q = `artist:"${escapeLucene(disc.artist)}" AND releasegroup:"${escapeLucene(disc.title)}"`;
-  const params = new URLSearchParams({
-    query: q,
-    fmt: 'json',
-    // Enough candidates that the album and its same-named EP, single and
-    // compilation are all in hand to choose between. Still one request.
-    limit: '10',
-    // Identify the app per MusicBrainz etiquette (can't set User-Agent header
-    // from a browser; the app= param is the sanctioned alternative).
-    app: CONFIG.MUSICBRAINZ.APP_IDENTITY,
-  });
-  const url = `${CONFIG.MUSICBRAINZ.SEARCH_URL}?${params.toString()}`;
-
-  const res = await throttledFetch(url);
-  if (!res.ok) throw new Error(`MusicBrainz ${res.status}`);
-  const data = await res.json();
-
-  const groups = data['release-groups'] || [];
-  if (groups.length === 0) return null;
-
-  const wantTitle = normalizeTitle(disc.title);
-  const wantYear = discYear(disc);
-  const best = groups
-    .slice()
-    .sort((a, b) =>
-      scoreReleaseGroup(b, wantTitle, wantYear) - scoreReleaseGroup(a, wantTitle, wantYear))[0];
-  return best.id || null;
 }
 
 
@@ -276,7 +279,9 @@ function persistTracksCache() {
  */
 export async function resolveTracklist(disc) {
   const mbid = await resolveReleaseGroupMbid(disc);
-  if (!mbid) return null;
+  // A failed lookup is a truthy Symbol, not an id — there's nothing to browse
+  // and nothing worth writing down, so the next open of this disc tries again.
+  if (!mbid || mbid === LOOKUP_FAILED) return null;
 
   // Keyed by group *and* year: which pressing within the group we pick depends
   // on the year, so two discs sharing a release group but not a year — an
@@ -295,7 +300,7 @@ export async function resolveTracklist(disc) {
 
   disc._tracksPromise = (async () => {
     try {
-      const tracks = await fetchTracklist(mbid, wantYear);
+      const tracks = await tracksForReleaseGroup(mbid, wantYear);
       if (tracks && tracks.length) {
         tracksCache[key] = { t: tracks.map((t) => [t.title, t.length]), at: Date.now() };
         persistTracksCache();
@@ -309,33 +314,4 @@ export async function resolveTracklist(disc) {
   })();
 
   return disc._tracksPromise;
-}
-
-/**
- * Browse the releases in a release group, with their recordings, pick the one
- * that best matches the disc on the shelf, and flatten its tracks.
- *
- * A release group holds every pressing of a title — vinyl, cassette, promos,
- * deluxe reissues with a second disc of B-sides — and their running orders are
- * not interchangeable, so the choice goes through the same scoring the labels
- * page uses: official CD pressings first, then the year closest to the sheet's.
- * One request either way; the recordings just come back for all of them.
- */
-async function fetchTracklist(mbid, wantYear) {
-  const params = new URLSearchParams({
-    'release-group': mbid,
-    inc: 'recordings',
-    fmt: 'json',
-    limit: '25',
-    app: CONFIG.MUSICBRAINZ.APP_IDENTITY,
-  });
-  const res = await throttledFetch(`${CONFIG.MUSICBRAINZ.RELEASE_URL}?${params.toString()}`);
-  if (!res.ok) throw new Error(`MusicBrainz ${res.status}`);
-  const data = await res.json();
-
-  const release = pickBestRelease(data.releases, wantYear);
-  if (!release) return null;
-
-  const out = flattenTracks(release);
-  return out.length ? out : null;
 }

@@ -5,9 +5,14 @@
    LOOKS. The sheet URL, the column names, and the blank-cell
    fallbacks are NOT here — they're in collection.js, shared with
    the stats and labels pages.
-   ============================================================ */
-import { APP_IDENTITY, WS_BASE } from './musicbrainz.js';
 
+   Nothing here imports anything, on purpose. This file used to
+   pull the MusicBrainz web-service base and app identity out of
+   musicbrainz.js to build endpoint URLs, which quietly dragged
+   the whole web-service module into the import graph of color.js
+   and render.js — modules that only ever wanted a palette. These
+   are values; they should cost nothing to read.
+   ============================================================ */
 
 export const CONFIG = {
   // Palette used to color generated placeholder covers.
@@ -43,14 +48,11 @@ export const CONFIG = {
   // are cached in localStorage, so we stay well under MusicBrainz's ~1 req/sec
   // limit and never look a disc up more than once per browser.
   MUSICBRAINZ: {
-    // MusicBrainz asks every client to identify itself with a descriptive
-    // User-Agent (app name/version + contact). Sent via a query param since
-    // browsers can't set User-Agent on fetch; MB reads either.
-    APP_IDENTITY: APP_IDENTITY,
-    // Release-group text search endpoint.
-    SEARCH_URL: `${WS_BASE}/release-group`,
-    // Release browse endpoint — used to pull a tracklist for a release group.
-    RELEASE_URL: `${WS_BASE}/release`,
+    // Only the Cover Art Archive is named here: it's a different host with its
+    // own URL shape, built by hand from a release-group id. The ws/2 endpoints
+    // and the app identity MusicBrainz wants sent with them live in
+    // musicbrainz.js, which is the only module that should be calling them.
+    //
     // Cover Art Archive front-image endpoint (CORS-enabled + canvas-readable).
     // {mbid} is a release-group id; size is one of 250 / 500 / 1200.
     CAA_URL: 'https://coverartarchive.org/release-group',
@@ -61,12 +63,17 @@ export const CONFIG = {
     // v1 can point at the wrong record entirely — the same-named EP rather than
     // the album. The tracklist reads its release group back out of these URLs,
     // so a stale one here is a stale tracklist too; both caches start over.
-    CACHE_KEY: 'cdc:art-cache:v2',
+    // v3: a lookup that merely *failed* used to be written here as a permanent
+    // miss, so any browsing done offline left discs that would never be looked
+    // up again — those entries have to go. And the release tiebreakers no
+    // longer overturn an exact year match, which changes which pressing inside
+    // a group a tracklist is taken from; both caches start over again.
+    CACHE_KEY: 'cdc:art-cache:v3',
     // Cached tracklists, keyed by release-group MBID + the disc's year (which
     // pressing within the group we pick depends on it). Capped because these
     // are much bigger than a cover URL and localStorage is a shared ~5MB
     // budget — past the cap the least-recently-fetched entries are dropped.
-    TRACKS_CACHE_KEY: 'cdc:tracks:v2',
+    TRACKS_CACHE_KEY: 'cdc:tracks:v3',
     TRACKS_CACHE_MAX: 250,
   },
 };

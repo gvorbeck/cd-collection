@@ -7,6 +7,19 @@
    ============================================================ */
 
 :root {
+  /* One theme, and `only light` rather than bare `light`: the bare keyword just
+     says which schemes are supported, and Chrome for Android's Auto Dark Theme
+     will still invert the page anyway. `only` is the part that opts out.
+     There is no dark mode here on purpose, and it is a bigger job than a second
+     set of tokens: --paper seeds PAPER_RGB in js/color.js, which is what every
+     detail dialog's cover tint gets mixed against; the page grain below is
+     mix-blend-mode: multiply, which only ever subtracts light and so vanishes
+     over a dark ground; every hard offset shadow on the site (.card, .panel) is
+     drawn as "darker than whatever it sits on"; and js/cover.js memoizes a
+     placeholder PNG per disc, so a live swap would have to invalidate all of
+     them. Four coupled changes, not a palette. */
+  color-scheme: only light;
+
   /* Warm paper base — reads as construction paper, not flat white */
   --paper:        #f5edd6;
   --paper-deep:   #ece0c2;
@@ -40,6 +53,19 @@
      it passes, which also puts it a shade clear of --brick so the hover state
      still reads as a change. */
   --orange-deep: #a8551a;                 /* 5.07:1 under --surface type */
+
+  /* --teal needs it in both directions at once: it is the fill under a pressed
+     pill's 12.5px bold label AND the type in the "years covered" figure, which
+     clamps to 22px — under the 24px that would let it count as large text. Flat
+     --teal is 3.73:1 on --surface, so it misses 4.5 as either one. Darkened
+     until it clears AA both ways, and far enough that it also passes as type on
+     the darkest paper tone, the way the two -ink tokens above do.
+     The stats bars keep plain --teal deliberately: a bar fill is a non-text
+     graphic that owes 3:1 against its track and nothing more, and js/stats.js
+     cycles --brick/--mustard/--teal/--orange/--forest as one five-color set, so
+     darkening one member alone would leave the chart looking mis-keyed. The two
+     are not the same job — don't merge them. */
+  --teal-deep: #246b67;                   /* 5.98:1 under --surface type, 4.74:1 as type on --paper-deep */
 
   /* Default card shadow tint (used until/if cover color is sampled) */
   --shadow-neutral: #3a3128;
@@ -86,6 +112,122 @@ body {
   /* pervasive across the whole page, not just the placeholder covers */
   opacity: 0.19;
   mix-blend-mode: multiply;
+}
+
+/* ---------- The same grain, tiled onto the covers ----------
+   Generated placeholder covers used to carry their own grain, drawn per pixel
+   onto the canvas. It came out: per-pixel random noise is the worst thing you
+   can hand DEFLATE, and the identical 400px cover encoded to 147,418 bytes with
+   it against 1,435 without. This tile is where that texture went.
+
+   BOTH selectors are load-bearing, for different reasons:
+   - .card-cover-wrap IS under the .grain overlay above, so this is a second
+     coat there — deliberately. A cover on this site has always been grainier
+     than the paper around it; that was the baked-in pass plus the overlay, and
+     this is the tile plus the overlay. The one change is that real cover photos
+     now get it too, which is the fix for generated and photographed covers
+     sitting side by side in the same grid at visibly different textures.
+   - .detail-cover is not under the overlay at all. .grain is position: fixed at
+     z-index 9999 and the detail view is a modal <dialog>, which the browser
+     paints in the top layer — above every z-index in the document, the overlay
+     included. The baked-in grain was the only grain that ever reached inside
+     that dialog. Delete this half and the dialog silently goes flat.
+
+   NOT the overlay's SVG with a different opacity. Four things diverge — octaves,
+   the contrast stretch, the blend, the opacity — and every one of them is here
+   because copying the overlay verbatim was the first draft and it shipped covers
+   with no visible grain at all. Twice. The first attempt copied 0.19/multiply and
+   measured sd 1.03 against the baked-in pass's 3.75; the second fixed the blend
+   and the colour space and still read flat in the detail dialog, because it was
+   tuned on a 180px card and the dialog cover is ~1000px of one flat colour, which
+   is the least forgiving surface on the site. Tune this on the dialog, not a card.
+
+   Three reasons it kept coming out faint, all worth knowing before touching the
+   numbers:
+   - SVG filters interpolate in linearRGB unless told otherwise, and feTurbulence
+     centres its output at 0.5 *there*. Converted for display that is 0.73, so
+     the "grey" noise arrives at mean 187 of 255 and squashed. sRGB puts it back
+     at 127.5 with two-thirds more contrast to work with.
+   - multiply scales with what is underneath it. On near-white paper that is
+     most of the signal; on a saturated cover it is a third of it, and on a dark
+     one less again. So multiply can't give the covers the same texture as the
+     paper no matter what opacity it is handed — it can only darken them toward
+     mud. soft-light pivots around mid-grey instead: it lightens and darkens in
+     equal measure, which is what the baked-in ±13-per-channel pass did, and it
+     lands within 5% of the same amplitude on a mid-tone and on a dark cover.
+     The mean colour of the cover is left exactly where it was.
+   - soft-light still only returns about half of what an additive pass gave on a
+     dark saturated cover, and opacity stops at 1, so on its own it cannot get
+     back to the baked-in amplitude no matter how it is tuned. That is what the
+     feComponentTransfer is for: a linear stretch about mid-grey (slope 1.5,
+     intercept -0.25, which is (1-slope)/2 and is what keeps the midpoint from
+     moving) widens the noise before it is ever blended. It is the amplitude
+     control; opacity scales whatever it produces.
+
+   The feColorMatrix is not optional padding either: feTurbulence generates each
+   of R, G, B and A independently, so turbulence on its own is colored speckle,
+   not grain. Every page overlay desaturates it (index/stats/labels all do), the
+   baked-in pass this replaced was monochrome, and the first draft of this rule
+   left it out — which is the whole reason it is called out here.
+
+   numOctaves is 1 here and 3 on the page overlay, and that is not an oversight.
+   Three octaves measure slightly *more* total variance at the same opacity (4.75
+   against 4.12) but spend the difference on a low-frequency cloudiness that reads
+   as uneven lighting across a big flat cover rather than as paper. The pass this
+   replaces was per-pixel white noise with no low-frequency component at all, so
+   one octave is the closer likeness; the contrast stretch above pays back the
+   amplitude it costs. On the paper overlay the cloudiness is wanted, which is why
+   that one keeps its three.
+
+   Sized so one
+   SVG user unit is one CSS pixel — so the noise is the same size on a 40px row
+   thumb, a 180px card and a 500px dialog cover as it is on the paper around
+   them. It is page texture, not cover texture; it must not scale with the box.
+   The filter region is pinned to the tile in userSpaceOnUse (the default region
+   is 10% larger on every side, which would put the stitchTiles seam somewhere
+   other than the tile edge).
+
+   opacity is the knob to reach for first, and sd moves in a straight line with
+   it: halve it for half the grain. Reach for the slope above only if you run out
+   of opacity headroom, which is what happened here.
+
+   Calibrated against the pass this replaces, rendered side by side with it at
+   dialog size on a 2x display and measured off the screenshots rather than
+   simulated. The baked-in pass came in at sd 4.94 on that red cover; slope 1.5
+   at opacity 0.8 reproduces it at 4.97. Shipped at 0.9 — sd 5.58, about 13% over
+   the original — deliberately, because this rule has now twice been signed off as
+   correct while being invisible on the surface that matters, and the cost of
+   being slightly too present is a great deal lower than the cost of that. Drop it
+   to 0.8 for exact parity.
+
+   That parity is with the dialog. Cards measure 5.5 at the same setting, where
+   the baked-in pass gave them about 3.75 — because that pass was drawn at 400px
+   and then downscaled into a 180px card, which averaged half its amplitude away,
+   and a fixed tile has no equivalent loss. So cards are somewhat grainier than
+   they used to be and every cover on the site now carries the same texture at
+   every size, which is the point of a tile. Checked at 40px too: the row thumbs
+   read as texture rather than sand.
+
+   Two things that sound like they would help and measurably do not, so they are
+   not worth rediscovering: background-size in percentages, so the grain scales
+   with the cover the way the baked-in pass did (moves sd by 0.01 — the tile is
+   already within a third of a pixel of the old feature size at every box size on
+   the site), and raising numOctaves back up (see above). If the doubled coat on
+   cards ever reads too heavy, split this into two rules and take the card one
+   down — the dialog's has to stay, because there it isn't a second coat, it's the
+   only one. The page overlay is deliberately left on 0.19/multiply/linearRGB: it
+   sits on paper, where multiply is at its strongest and the texture is already
+   right, and changing it would restyle every page. */
+.card-cover-wrap::after,
+.detail-cover::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='g' filterUnits='userSpaceOnUse' x='0' y='0' width='200' height='200' color-interpolation-filters='sRGB'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='1' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3CfeComponentTransfer%3E%3CfeFuncR type='linear' slope='1.5' intercept='-0.25'/%3E%3CfeFuncG type='linear' slope='1.5' intercept='-0.25'/%3E%3CfeFuncB type='linear' slope='1.5' intercept='-0.25'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23g)'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+  opacity: 0.9;
+  mix-blend-mode: soft-light;
 }
 
 /* ---------- Screen-reader-only utility ---------- */
@@ -480,7 +622,7 @@ body {
 .pill:active { transform: translate(1px, 1px); box-shadow: 1px 1px 0 var(--ink); }
 /* Active state: filled + a leading check mark so meaning isn't color-only */
 .pill[aria-pressed="true"] {
-  background: var(--teal);
+  background: var(--teal-deep);
   color: var(--surface);
 }
 .pill[aria-pressed="true"]::before { content: "✓ "; }
@@ -504,6 +646,33 @@ body {
   letter-spacing: 0.08em;
   color: var(--ink-soft);
   margin: 0;
+}
+/* "These discs came from a saved copy" — #stale-notice, on this page and on
+   stats.html, which reaches the same rule through .panel-note. Both of those
+   are quiet grey furniture and one of them shouts: .results-count is
+   text-transform: uppercase with 0.08em of tracking, which is right for
+   "42 OF 300 DISCS" and wrong for a sentence with a date in the middle of it.
+   So the sentence is set as a sentence, and in the brick and the weight
+   .state-msg.is-error uses — it is the same kind of news, that what is on
+   screen is not quite what was asked for. Louder than a count, and still not
+   an error: the discs are all there.
+
+   Written as compounds, not a bare `.sheet-stale`, because a bare one loses.
+   Both hosts are a single class, so the override was winning on source order
+   alone: .results-count is above this block and .panel-note is far below it,
+   which meant the rule worked on index.html and quietly did nothing on
+   stats.html — same sentence, two weights, and the smaller of the two on the
+   page that has no #live-region to say it out loud. Compounds put it a class
+   ahead of whatever it is layered on, so it stops depending on where in this
+   file the host happens to sit. Add a host, add it here. */
+.results-count.sheet-stale,
+.panel-note.sheet-stale {
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 700;
+  color: var(--brick-ink);
 }
 /* Right-hand cluster: clear-filters (when shown) + the sort control. */
 .results-tools {
@@ -558,7 +727,11 @@ body {
   justify-content: center;
   width: 2rem;
   height: 1.85rem;
-  padding: 0;
+  /* The 2px at the bottom is the space the pressed state's underline moves
+     into. Held open on every button, pressed or not, so the icon doesn't hop
+     up and down as you toggle: the height is fixed and box-sizing is border-box
+     everywhere, so padding here and border there give the same content box. */
+  padding: 0 0 2px;
   border: none;
   background: none;
   color: var(--ink);
@@ -567,7 +740,23 @@ body {
 .view-toggle button + button { border-left: 2px solid var(--ink); }
 .view-toggle button svg { width: 0.85rem; height: 0.85rem; }
 .view-toggle button:hover { background: var(--mustard); }
-.view-toggle button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+/* On/off was the inversion alone, and forced-colors mode overrides both halves
+   of it — background and color both become system colors — so in that mode the
+   control had no state at all. Same problem the pills solved with a "✓ ", except
+   there is no room for a glyph beside a 0.85rem icon. A border survives where
+   the inversion doesn't: forced colors remaps border-color to a system color
+   rather than dropping the border, the way it drops box-shadow outright. So the
+   underline is a border in currentColor — --paper against the ink fill here,
+   CanvasText against Canvas there, visible in both.
+   2px, not 3: the focus ring is a 3px ink line sitting 2px off this same edge,
+   and two 3px rules that close together read as one thick smudge rather than as
+   two separate things. */
+.view-toggle button[aria-pressed="true"] {
+  background: var(--ink);
+  color: var(--paper);
+  padding-bottom: 0;
+  border-bottom: 2px solid currentColor;
+}
 
 /* ---------- Sort dropdown ----------
    Same construction-paper language as the pills/inputs: hard 2px border, offset
@@ -628,6 +817,65 @@ body {
 
 .grid-item { min-width: 0; }
 
+/* Skip layout for the items nobody is looking at. A few hundred discs are all
+   in the DOM at once, and the page forces a layout flush more than once per
+   session — the tag row measures every pill's offsetWidth to decide how many
+   fit, and the shuffle reads offsetWidth on a card to restart its animation.
+   Each of those flushes lays out the entire collection; this keeps them to the
+   part that's on screen.
+
+   @media screen is NOT optional here, however redundant "screen" looks on a
+   rule about scrolling. content-visibility skips the contents of anything
+   off-screen, and a printer's viewport is one page: with this applied to print,
+   the whole shelf inventory below the fold comes out blank. The print block at
+   the bottom of this file exists precisely to make that list print.
+
+   Depends on the min-width: 0 above, too. Skipped items are size-contained, so
+   an off-screen card contributes 300px as its min-content width; without that
+   zero the 1fr tracks would each demand 300px and two covers across on a phone
+   would overflow the screen. (The art prefetch is fine: its observer margin is
+   200px and the browser starts rendering a skipped item further out than that,
+   so the card is laid out before the observer wants it.) */
+@media screen {
+  .grid-item {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 300px;
+
+    /* content-visibility: auto applies paint containment *permanently* — not
+       only while an item is being skipped — and paint containment clips to the
+       padding box. Without room reserved here, everything .card paints outside
+       its own border box is cut off: the 6px/8px offset shadow that is the
+       card's entire visual signature, the hover lift, and the 3px
+       :focus-visible ring at 2px offset. That last one is why this is a
+       correctness bug and not a cosmetic one — the card is a real button (see
+       below), so a clipped ring means tabbing through the grid moves a focus
+       nobody can see. The reduced-motion shuffle ring is the widest at 7px
+       (4px at 3px offset, in the block near the end of this file); hovering a
+       shuffled card puts its 3px lift on top of that, so 12px is the number to
+       beat.
+
+       The negative margin gives every one of those pixels straight back to the
+       layout, which makes this purely a paint allowance: the margin box — the
+       thing the grid actually sizes and spaces — is unchanged, so cards sit
+       exactly where they always did and neither the 1.1rem gap above nor the
+       much tighter 0.4rem one in list view has to be retuned to match. Reserving
+       the room by shrinking the card instead would have had to be done twice,
+       differently, and re-done on every future gap change.
+
+       Neighbouring items' clip boxes overlap in the gap as a result. That is
+       harmless: the overlap is transparent padding on both sides, and .card is
+       inset from it, so no card is ever covered and no click target moves. */
+    padding: 12px;
+    margin: -12px;
+  }
+  /* A row is a fraction of a card's height. Sharing the card's 300px would
+     overstate a 500-disc list by something like 40 screens of scrollbar, and
+     then reel it back in as each row rendered — `auto` only remembers a size
+     once the row has been laid out at least once, so the guess is what a first
+     scroll through gets. */
+  .grid.is-list .grid-item { contain-intrinsic-size: auto 3.4rem; }
+}
+
 /* Card is a real button so it's keyboard-operable end to end */
 .card {
   --card-shadow: var(--shadow-neutral);
@@ -670,6 +918,12 @@ body {
   position: absolute;
   top: 0;
   left: 0;
+  /* Above the grain tile. The tile is this wrapper's ::after, so tree order
+     alone would paint it over the tag — and the tag would then be the one
+     element on the page wearing two coats of grain, since the page overlay
+     already covers it. The baked-in version was part of the cover art, i.e.
+     under this tag; this keeps it there. */
+  z-index: 1;
   font-family: var(--font-mono);
   font-weight: 700;
   font-size: 0.7rem;
@@ -832,6 +1086,10 @@ body.modal-open { overflow: hidden; }
 .detail-close:active,
 .detail-close:focus-visible { transform: translate(2px, 2px); }   /* 2px shadow */
 .detail-cover {
+  /* Containing block for the grain tile (::after, up in the grain section).
+     Without it the tile escapes to .detail-inner and covers the whole dialog.
+     The close button keeps its own z-index: 2, so it still sits above both. */
+  position: relative;
   /* Square and full width: a CD sleeve is square, so this shows the whole
      artwork at the largest size the dialog allows, uncropped. */
   aspect-ratio: 1 / 1;
@@ -891,6 +1149,40 @@ body.modal-open { overflow: hidden; }
 .detail-tags { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.9rem; }
 /* No tags is the common case, and an empty flex row still spends its margin. */
 .detail-tags:empty { display: none; }
+
+/* ---------- Genre and tag, as filters ----------
+   filterButton in js/detail.js renders both as real <button>s now, and a button
+   turns up wearing the UA's own font, color and border. The tags survived that
+   on .detail-tag's chip alone; the genre, which has no chip, came out as a grey
+   system-font box sitting in the middle of hand-set type. This is the
+   unstyling that takes the chrome back off.
+
+   Deliberately ABOVE .detail-tag rather than below it. A tag button carries
+   both classes at the same specificity, so source order is the entire
+   mechanism deciding that the chip's mono type, fill and border win over this
+   reset — move this block down and every tag goes plain. */
+.detail-filter {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+/* The genre keeps reading as the meta value it used to be, plus the underline
+   .clear-filters uses to say a word is a control. :not() because the chips are
+   already shaped like controls and a second cue would only clutter them. */
+.detail-filter:not(.detail-tag) {
+  border-bottom: 2px solid var(--brick-ink);
+  color: var(--brick-ink);
+}
+/* Specificity, not order, is what carries these two over .detail-tag. */
+.detail-filter:hover { background: var(--mustard); color: var(--ink); }
+/* Pressed is the pills' check mark rather than a fill, and for the pills'
+   reason: the dialog can be opened with that genre already filtered, and a
+   state carried by color alone says nothing to anyone who can't see it. */
+.detail-filter[aria-pressed="true"]::before { content: "✓ "; }
+
 .detail-tag {
   font-family: var(--font-mono);
   font-size: 0.72rem;
@@ -1117,7 +1409,9 @@ body.modal-open { overflow: hidden; }
    matching the big numerals and wrapping mid-range. */
 .figure-card.is-wide .figure-value {
   font-size: clamp(1.4rem, 4.5vw, 1.9rem);
-  color: var(--teal);
+  /* Sizing down to 22px is what takes this below WCAG's large-text threshold,
+     so it needs the text-safe teal, not the fill one. */
+  color: var(--teal-deep);
 }
 .figure-label {
   font-family: var(--font-mono);
@@ -1186,6 +1480,17 @@ body.modal-open { overflow: hidden; }
   display: block;
   height: 100%;
   background: var(--ink-soft);
+  /* Printers drop background colors by default and keep text colors, which for
+     a bar chart means the labels and counts print and the bars themselves come
+     out as empty outlined boxes — the one element on this site whose entire
+     content is a background. Declared here rather than in the print block so it
+     sits with the background it is protecting.
+     Nothing else printed needs it: the track's paper-deep is decorative and its
+     own border draws the extent, the panels and figure cards all have borders,
+     the row thumbnails are display: none by then, and the grain is dropped on
+     purpose. */
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
   /* Bars grow in on load; the transition is on width only so a zero-count row
      doesn't animate from somewhere it never was. */
   transition: width 0.5s var(--ease);
@@ -1245,6 +1550,9 @@ body.modal-open { overflow: hidden; }
    rows to plain ruled lines, and let the browser paginate. */
 @media print {
   body { background: #fff; }
+  /* The cover tile goes with the page overlay — same texture, same reason, and
+     it would otherwise be the one bit of grain that survived into print. */
+  .card-cover-wrap::after,
   .grain,
   .controls,
   .filters,
@@ -1263,6 +1571,13 @@ body.modal-open { overflow: hidden; }
   /* Thumbnails are the first thing to go: they cost ink and add nothing to a
      list you're scanning by catalog number — so the columns lose theirs too. */
   .row-thumb { display: none; }
+  /* Genre is display: none until 720px, and US Letter at 1in margins is about
+     624px — so the printed page took the phone layout, dropped the genre, and
+     then laid out the four-column template below with only three things to put
+     in it: the year landed in the genre's column and the last column printed
+     empty. Screen width is the wrong question on paper; the column is there, so
+     fill it. */
+  .row-genre { display: block; }
   .card.row {
     box-shadow: none;
     border: none;
@@ -1283,6 +1598,18 @@ body.modal-open { overflow: hidden; }
   .card.is-in { transform: none; }
   .card:hover, .card:active { transform: none; }
   .shuffle-btn.is-shuffling .shuffle-icon { animation: none; }
-  .card.is-shuffled { animation: none; outline: 4px solid var(--mustard); outline-offset: 3px; }
+  /* The whole shuffle, for a reduced-motion reader: no pulse, no scroll they can
+     watch, just this outline appearing on the card it landed on — and only for
+     about 950ms, since js/state.js now takes the class back off (a shade behind
+     the 0.9s pulse everyone else gets). Mustard measured 1.88:1 against paper,
+     under the 3:1 a non-text indicator owes and far too quiet to catch inside a
+     second from wherever on the page you were looking. Brick ink is 5.34:1 on
+     --paper and 6.00:1 on --surface.
+     Two classes beat one pseudo-class, so for that second this outline also
+     replaces the :focus-visible ring on a card the shuffle just focused — which
+     is the other half of why the contrast had to come up: at 1.88:1 the shuffle
+     was quietly downgrading the focus indicator too. Left at 4px and offset 3px
+     so it stays visibly not that 3px ink ring. */
+  .card.is-shuffled { animation: none; outline: 4px solid var(--brick-ink); outline-offset: 3px; }
   body { transition: none; }
 }

@@ -44,6 +44,16 @@
   </header>
 
   <main class="site-main stats-page">
+    <!-- Shown only when these numbers were counted from something other than
+         the live sheet — the committed data/collection.csv, or the worker's
+         cached copy — because a figure with no date on it reads as today's.
+         Filled from loadedFrom() in js/collection.js once load() resolves, and
+         hidden otherwise, so it stays clear of #state-msg below, whose text is
+         the counting and error states. Same id as index.html's so one handler
+         serves both pages. role=status here, unlike on index.html: that page
+         has a dedicated #live-region to speak through and this one does not. -->
+    <p class="panel-note sheet-stale" id="stale-notice" role="status" aria-live="polite" hidden></p>
+
     <!-- Headline figures. Populated by stats.js. -->
     <section class="figure-row" id="figures" aria-label="Collection totals">
       <!-- figures injected here -->
@@ -67,8 +77,11 @@
       <div class="chart" id="chart-artists"></div>
     </section>
 
-    <!-- role=status so the swap from "counting" to an error is announced;
-         this element is the whole status channel on this page. -->
+    <!-- role=status so the swap from "counting" to an error is announced.
+         #stale-notice at the top of main is the only other thing that speaks
+         here, and it is filled only on the path where the figures actually
+         rendered — the same moment this element goes hidden — so the two never
+         talk over each other. -->
     <div class="state-msg" id="state-msg" role="status" aria-live="polite">Counting the collection…</div>
   </main>
 
