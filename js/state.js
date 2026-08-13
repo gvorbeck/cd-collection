@@ -281,9 +281,16 @@ export function exportCurrentCsv() {
   const C = SHEET.COLUMNS;
   // Ordered to match the sheet's header row, so a paste lines up column for
   // column instead of quietly landing Notes under Art URL.
-  const headers = [C.book, C.number, C.artist, C.title, C.year, C.genre, C.tags, C.art, C.notes];
+  const headers = [
+    C.book, C.number, C.artist, C.title, C.year, C.genre, C.tags, C.art, C.notes, C.barcode,
+  ];
+  // Barcode as the *cell*, not as the digits the lookup uses: normalizing it on
+  // the way out would rewrite the sheet's own formatting for no reason, and a
+  // cell parseBarcode rejects would come back blank, which isn't a rewrite —
+  // it's a deletion of whatever was in there.
   const rows = discs.map((d) => [
-    d.book, d.number, d.rawArtist, d.rawTitle, d.year, d.rawGenre, d.tags.join(', '), d.art, d.notes,
+    d.book, d.number, d.rawArtist, d.rawTitle, d.year, d.rawGenre, d.tags.join(', '),
+    d.art, d.notes, d.rawBarcode,
   ]);
 
   const csv = [headers, ...rows].map((r) => r.map(csvCell).join(',')).join('\r\n');

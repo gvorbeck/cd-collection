@@ -167,12 +167,26 @@ function swapWhenLoaded(img, url, discId) {
   pre.src = url;
 }
 
-// The release-group MBID this page can name for a disc without asking anyone:
-// one a lookup already resolved, or the one sitting inside a cached Cover Art
-// Archive URL, which has the id in its path. null when nothing here knows it —
-// which is also the answer to "would MusicBrainz have to be asked?".
-function knownMbid(disc) {
-  return disc._mbid || mbidFromCaaUrl(disc._resolvedArt || cachedCoverArt(disc));
+/**
+ * The MusicBrainz thing this page can name for a disc without asking anyone —
+ * `{ kind, id }`, or null when nothing here knows one, which is also the answer
+ * to "would MusicBrainz have to be asked?". Either an id a lookup already
+ * resolved this session, or the one sitting inside a cached Cover Art Archive
+ * URL, which carries it in its path.
+ *
+ * The pinned release comes first when there is one: it's the more specific of
+ * the two answers, and it's the pressing the sheet went to the trouble of
+ * naming. Its group is a fine page to land on but not the one that was asked
+ * for, and a release id in a /release-group/ URL is simply a 404.
+ */
+function knownMbEntity(disc) {
+  const art = disc._resolvedArt || cachedCoverArt(disc);
+
+  const release = disc._releaseMbid || mbidFromCaaUrl(art, 'release');
+  if (release) return { kind: 'release', id: release };
+
+  const group = disc._mbid || mbidFromCaaUrl(art);
+  return group ? { kind: 'release-group', id: group } : null;
 }
 
 // One label/value row of the meta list. `value` is a string or a node — the
@@ -303,14 +317,14 @@ function renderDetailLinks(disc) {
     dom.detailLinks.appendChild(makeDetailLink(svc.name, svc.href(query)));
   }
 
-  // MusicBrainz last: a direct release-group link if we already resolved one
-  // (from the cover-art lookup), otherwise its search page. Never fires a
-  // lookup of its own — a link shouldn't cost a request to draw.
-  const mbid = knownMbid(disc);
+  // MusicBrainz last: a direct link to whatever we already resolved (from the
+  // cover-art lookup, or from the disc's barcode), otherwise its search page.
+  // Never fires a lookup of its own — a link shouldn't cost a request to draw.
+  const found = knownMbEntity(disc);
   dom.detailLinks.appendChild(makeDetailLink(
     'MusicBrainz',
-    mbid
-      ? `https://musicbrainz.org/release-group/${mbid}`
+    found
+      ? `https://musicbrainz.org/${found.kind}/${found.id}`
       : `https://musicbrainz.org/search?type=release_group&query=${query}`
   ));
 }

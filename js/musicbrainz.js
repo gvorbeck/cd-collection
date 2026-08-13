@@ -11,8 +11,9 @@
    client is the whole page.
 
    The two-step lookup at the bottom — find the release group,
-   then pull one release's tracks out of it — lives here too, and
-   deliberately caches nothing. art.js layers localStorage over
+   then pull one release's tracks out of it — lives here too, plus
+   the shortcut past it for a disc whose sheet row carries a
+   barcode. Both deliberately cache nothing. art.js layers localStorage over
    it; the labels page calls it straight and wants no cache at
    all. Sharing the logic without sharing the storage is the whole
    reason it moved out of art.js: the labels page's Auto-fill used
@@ -233,6 +234,73 @@ export function flattenTracks(release) {
     });
   });
   return out;
+}
+
+
+/* ---------- The pinned lookup ----------
+   A row that carries a barcode doesn't need any of the guessing the two-step
+   lookup below does. The barcode is printed on the back of the case and names
+   exactly one pressing, so MusicBrainz can be asked for that pressing directly
+   and neither piece of scoring — which record, then which pressing of it — has
+   to run at all. That is the whole point of the column: the discs the search
+   gets wrong are the ones with a common title or a dozen reissues, and those
+   are precisely the ones a barcode settles outright. */
+
+/**
+ * The Lucene query for a barcode, asked in every form MusicBrainz might be
+ * holding it in.
+ *
+ * A UPC-A and an EAN-13 for the same product differ by one leading zero, and
+ * which of the two MB has on file depends on whoever typed it in off the box.
+ * A spreadsheet compounds it: a cell left to default formatting is read as a
+ * number, and the leading zero is gone before we ever see it. So ask for the
+ * digits given, the digits with a zero on the front, and — when they already
+ * start with one — the digits without it. A form that can't exist simply
+ * matches nothing, and the whole set is still one request.
+ */
+export function barcodeQuery(barcode) {
+  const forms = new Set([barcode, `0${barcode}`]);
+  if (barcode.startsWith('0')) forms.add(barcode.slice(1));
+  // Stripping the zero off "0" leaves nothing, and `barcode:` with nothing
+  // after it isn't a weak query — it's a parse error at the far end that takes
+  // the whole search down with it. Nothing upstream can produce a bare zero,
+  // since parseBarcode won't pass anything shorter than eight digits, but this
+  // is exported and tested on its own and a query builder that *can* emit a
+  // broken query eventually does.
+  forms.delete('');
+  return [...forms].map((form) => `barcode:${form}`).join(' OR ');
+}
+
+/**
+ * The MBID of the release a barcode names, or null when MusicBrainz holds no
+ * release carrying it. `year` is the disc's year as a number, or null.
+ *
+ * A barcode is meant to identify one product and nearly always does, but MB
+ * does hold the occasional duplicate — the same disc entered twice, or once per
+ * country by two people reading the same box. pickBestRelease settles those the
+ * way every other choice on this site is settled rather than taking whichever
+ * sorted first. They are the same physical disc either way, so what it is
+ * really picking between is two descriptions of it, and it prefers the better
+ * documented one.
+ */
+export async function findReleaseByBarcode(barcode, year) {
+  const data = await wsFetch('/release', { query: barcodeQuery(barcode), limit: '10' });
+  const best = pickBestRelease(data.releases, year);
+  return best ? best.id || null : null;
+}
+
+/**
+ * Flatten one known release's tracks, fetched with its recordings attached.
+ * Null when MusicBrainz has the release but no usable tracklist for it — a
+ * pressing catalogued off a sleeve, with no recordings linked to its tracks.
+ *
+ * The one-request cousin of tracksForReleaseGroup: there is no pressing to pick
+ * here, because the caller already knows which one it wants.
+ */
+export async function tracksForRelease(mbid) {
+  const release = await wsFetch(`/release/${mbid}`, { inc: 'recordings' });
+  const out = flattenTracks(release);
+  return out.length ? out : null;
 }
 
 
