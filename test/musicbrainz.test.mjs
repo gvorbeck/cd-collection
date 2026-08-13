@@ -317,6 +317,96 @@ describe('flattenTracks', () => {
     assert.deepEqual(flattenTracks({}), []);
     assert.deepEqual(flattenTracks({ media: [{}] }), []);
   });
+
+  /* ---------- Per-track artist credits ----------
+     The rule is MusicBrainz's own: name the artist on a track only when it
+     isn't the one the release is credited to. Every deepEqual above is part of
+     this — none of them mention `artist`, so they only pass while an ordinary
+     album stays exactly as clean as it was. */
+
+  it('names the band on each track of a Various Artists compilation', () => {
+    const rel = {
+      'artist-credit': [{ name: 'Various Artists' }],
+      media: [{ tracks: [
+        { title: 'Le Freak', length: 212000, 'artist-credit': [{ name: 'Chic' }] },
+        { title: 'Good Times', length: 494000, 'artist-credit': [{ name: 'Chic' }] },
+      ] }],
+    };
+    assert.deepEqual(flattenTracks(rel), [
+      { title: 'Le Freak', length: 212000, artist: 'Chic' },
+      { title: 'Good Times', length: 494000, artist: 'Chic' },
+    ]);
+  });
+
+  it('says nothing on an album whose tracks are by the album artist', () => {
+    // The case that has to stay silent, and the reason the test above is worth
+    // having: artist-credits comes back on every request now, so without this
+    // rule every line of every ordinary album would repeat the artist already
+    // printed at the top of the dialog.
+    const rel = {
+      'artist-credit': [{ name: 'Amy Winehouse' }],
+      media: [{ tracks: [
+        { title: 'Rehab', length: 214000, 'artist-credit': [{ name: 'Amy Winehouse' }] },
+      ] }],
+    };
+    assert.deepEqual(flattenTracks(rel), [{ title: 'Rehab', length: 214000 }]);
+  });
+
+  it('names a guest, because a featured credit is a different credit', () => {
+    const rel = {
+      'artist-credit': [{ name: 'Gorillaz' }],
+      media: [{ tracks: [
+        { title: 'Feel Good Inc.', length: 222000, 'artist-credit': [
+          { name: 'Gorillaz', joinphrase: ' feat. ' },
+          { name: 'De La Soul' },
+        ] },
+        { title: 'Dare', length: 244000, 'artist-credit': [{ name: 'Gorillaz' }] },
+      ] }],
+    };
+    assert.deepEqual(flattenTracks(rel), [
+      // Join phrases carry their own spacing — nothing is inserted between parts.
+      { title: 'Feel Good Inc.', length: 222000, artist: 'Gorillaz feat. De La Soul' },
+      { title: 'Dare', length: 244000 },
+    ]);
+  });
+
+  it('credits the sleeve name, not the database name', () => {
+    // `name` is how this record credits the artist; `artist.name` is what
+    // MusicBrainz files them under. They differ on a pseudonym, and the sleeve
+    // is what someone holding the disc is reading.
+    const rel = {
+      'artist-credit': [{ name: 'Various Artists' }],
+      media: [{ tracks: [
+        { title: 'Windowlicker', length: 366000, 'artist-credit': [
+          { name: 'AFX', artist: { name: 'Aphex Twin' } },
+        ] },
+      ] }],
+    };
+    assert.deepEqual(flattenTracks(rel), [
+      { title: 'Windowlicker', length: 366000, artist: 'AFX' },
+    ]);
+  });
+
+  it('falls back to the recording when the track carries no credit of its own', () => {
+    const rel = {
+      'artist-credit': [{ name: 'Various Artists' }],
+      media: [{ tracks: [
+        { title: 'Teenage Riot', recording: { 'artist-credit': [{ name: 'Sonic Youth' }] } },
+      ] }],
+    };
+    assert.deepEqual(flattenTracks(rel), [
+      { title: 'Teenage Riot', length: 0, artist: 'Sonic Youth' },
+    ]);
+  });
+
+  it('says nothing when there is no credit to be had', () => {
+    // A release fetched without artist-credits, which is every entry written to
+    // the tracklist cache before this shipped. It has to degrade to the old
+    // shape rather than to `artist: ''`, so a caller can test `if (t.artist)`
+    // and a v3 cache entry read back by mistake still renders as a plain list.
+    const rel = { media: [{ tracks: [{ title: 'Untitled 3', length: 100000 }] }] };
+    assert.deepEqual(flattenTracks(rel), [{ title: 'Untitled 3', length: 100000 }]);
+  });
 });
 
 

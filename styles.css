@@ -1286,8 +1286,30 @@ body.modal-open { overflow: hidden; }
   color: var(--ink-soft);
 }
 .track-title { flex: 0 1 auto; min-width: 0; }
+/* Who a track is by, when that isn't who the disc is by — a compilation, or a
+   guest on an otherwise ordinary album. Nested inside .track-title (see
+   trackCredit in detail.js), so it's part of the same wrapping run of text and
+   not a flex item of its own. Smaller and dimmer than the title, because on a
+   Various Artists disc it is on every single line and at full weight the list
+   would read as forty things instead of twenty. The middle dot is punctuation
+   and belongs to the stylesheet; the word "by" it stands in for is in the
+   markup, screen-reader-only. */
+.track-artist {
+  font-size: 0.76rem;
+  color: var(--ink-soft);
+}
+.track-artist::before {
+  /* No-break space, dot, ordinary space. The first glues the dot to the end of
+     the title so a wrap can't start a line with a stray "·"; the second is a
+     real break opportunity, so a long credit still wraps onto the next line
+     rather than dragging the title along with it. white-space: nowrap here
+     would suppress both, which is the trap: with no space after the dot in the
+     markup, "Title · Artist" would become one unbreakable word. */
+  content: "\00a0· ";
+}
 /* Dotted leader out to the duration, same device as the genre counts. Drawn on
-   the item rather than an extra element so the markup stays two spans. */
+   the item rather than as an element of its own, so it costs the markup
+   nothing — the row's spans are all things someone might read. */
 .tracklist-item::after {
   content: "";
   order: 1;                 /* between the title and the duration */

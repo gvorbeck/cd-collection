@@ -443,7 +443,20 @@ function renderTracklist(disc) {
       // the items have to be flex for the dotted leader — so the numbers were
       // there in the markup and invisible on screen.
       li.appendChild(el('span', 'track-num', `${i + 1}.`));
-      li.appendChild(el('span', 'track-title', t.title));
+      const title = el('span', 'track-title', t.title);
+      // The band that actually played this one, on the discs where that isn't
+      // the disc's own artist — a Various Artists compilation, mainly, where
+      // the running order is otherwise twenty titles with no clue who any of
+      // them are by. flattenTracks only sets this when MusicBrainz credits the
+      // track to somebody other than the release, so an ordinary album adds
+      // nothing here.
+      //
+      // Inside the title span rather than beside it: as a sibling it would be a
+      // second flex item and a long title and a long credit would shrink
+      // against each other, each wrapping in its own narrow column. Nested,
+      // they're one run of text that wraps like a sentence.
+      if (t.artist) title.appendChild(trackCredit(t.artist));
+      li.appendChild(title);
       const len = formatDuration(t.length);
       if (len) li.appendChild(el('span', 'track-len', len));
       ol.appendChild(li);
@@ -491,6 +504,22 @@ function renderTracklist(disc) {
     if (settled || dom.detail.dataset.discId !== disc.id) return;
     setMakeLabelPending(false);
   }, TRACKLIST_WAIT_CAP);
+}
+
+/**
+ * The "· Chic" that follows a track title on a compilation.
+ *
+ * The separator is drawn by CSS (.track-artist::before) because it's
+ * punctuation between two things, not a word anyone needs read to them. That
+ * leaves the credit reading as a bare name in the middle of a sentence, so the
+ * "by" a sighted reader gets from the smaller, dimmer type is spelled out for a
+ * screen reader instead: "1. Le Freak by Chic 3:32" rather than "Le Freak Chic".
+ */
+function trackCredit(artist) {
+  const credit = el('span', 'track-artist');
+  credit.appendChild(el('span', 'sr-only', ' by '));
+  credit.appendChild(document.createTextNode(artist));
+  return credit;
 }
 
 /**

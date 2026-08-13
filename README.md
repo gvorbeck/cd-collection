@@ -86,7 +86,10 @@ Opening a card gives you the shelf location, notes, and:
   Store, and Spotify's web player, built from artist + title. No API keys.
   MusicBrainz gets a direct release-group link once one has been identified.
 - **Tracklist** — fetched from MusicBrainz on first open, then cached in
-  `localStorage`. A failed lookup isn't cached, so re-opening retries.
+  `localStorage`. A failed lookup isn't cached, so re-opening retries. A track
+  credited to somebody other than the disc's own artist names them alongside
+  the title, which is what makes a Various Artists compilation readable; an
+  album whose tracks are all by the album artist says nothing extra.
 - **Make label** — opens the labels page with this release already filled in,
   tracklist and all if one has been fetched. See [Labels](#labels).
 

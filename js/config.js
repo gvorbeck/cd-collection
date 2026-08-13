@@ -84,7 +84,14 @@ export const CONFIG = {
     // pressing within the group we pick depends on it). Capped because these
     // are much bigger than a cover URL and localStorage is a shared ~5MB
     // budget — past the cap the least-recently-fetched entries are dropped.
-    TRACKS_CACHE_KEY: 'cdc:tracks:v3',
+    // v4: tracks now carry the artist credited with them when it differs from
+    // the release's, and a v3 entry was written before that field was fetched.
+    // Reading one back is not wrong, it is silently incomplete — the entry
+    // still parses, so a compilation cached under v3 would print with no
+    // artists at all and no way to tell it apart from a compilation that
+    // genuinely has none. Unlike the art cache next door, throwing these away
+    // costs only a re-fetch of the tracklists a visitor actually opens.
+    TRACKS_CACHE_KEY: 'cdc:tracks:v4',
     TRACKS_CACHE_MAX: 250,
   },
 };

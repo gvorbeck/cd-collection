@@ -217,20 +217,63 @@ export function pickBestRelease(releases, wantYear) {
 }
 
 /**
- * Flatten a release fetched with `inc=recordings` into [{ title, length }],
- * in playing order across every medium. A two-disc set comes back as one
- * continuous list, which is what both callers want: the detail view prints
- * it as one tracklist, and the labels page as one numbered column.
- * Untitled tracks are dropped rather than rendered blank.
+ * Read an artist credit off a release, a track, or a recording as one string.
+ *
+ * MusicBrainz stores a credit as a list of parts, each carrying the name as it
+ * appears on THIS record plus the punctuation that leads to the next one:
+ * [{name:'Gorillaz', joinphrase:' feat. '}, {name:'De La Soul'}] is how
+ * "Gorillaz feat. De La Soul" is spelled. Joining the parts in order is the
+ * whole of it — the join phrases already contain their own spaces, which is why
+ * nothing is inserted between them.
+ *
+ * `name` rather than `artist.name` on purpose: the first is the credit as
+ * printed on the sleeve, the second the artist's canonical name in the
+ * database. They differ exactly when the sleeve says something the database
+ * wouldn't (a pseudonym, a pre-rename act), and the sleeve is what the shelf
+ * shows.
+ */
+function creditName(entity) {
+  const parts = (entity && entity['artist-credit']) || [];
+  return parts
+    .map((part) => `${part.name || (part.artist && part.artist.name) || ''}${part.joinphrase || ''}`)
+    .join('')
+    .trim();
+}
+
+/**
+ * Flatten a release fetched with `inc=recordings+artist-credits` into
+ * [{ title, length }], in playing order across every medium. A two-disc set
+ * comes back as one continuous list, which is what both callers want: the
+ * detail view prints it as one tracklist, and the labels page as one numbered
+ * column. Untitled tracks are dropped rather than rendered blank.
+ *
+ * A track also carries `artist` — but only when its credit differs from the
+ * release's own. That is MusicBrainz's display rule and it is the one that
+ * matches what a shelf looks like: a compilation is credited to "Various
+ * Artists" and every track disagrees with it, so every track names its band; an
+ * ordinary album agrees with itself on every line and stays clean. A guest spot
+ * falls out of the same test for free, since "Deltron 3030 feat. Damon Albarn"
+ * is not "Deltron 3030".
+ *
+ * The key is ABSENT rather than empty when there's nothing to say, so a caller
+ * can ask `if (t.artist)` and a stored tracklist doesn't carry a blank field on
+ * every line of every ordinary album.
  */
 export function flattenTracks(release) {
   const out = [];
+  const releaseCredit = creditName(release);
   ((release && release.media) || []).forEach((medium) => {
     (medium.tracks || []).forEach((track) => {
       const title = track.title || (track.recording && track.recording.title) || '';
       if (!title) return;
       const length = track.length || (track.recording && track.recording.length) || 0;
-      out.push({ title, length });
+      const entry = { title, length };
+      // The track's own credit first: it's the one printed against this line.
+      // The recording's is the fallback for a release catalogued without
+      // per-track credits, where the recording it points at still has one.
+      const artist = creditName(track) || creditName(track.recording);
+      if (artist && artist !== releaseCredit) entry.artist = artist;
+      out.push(entry);
     });
   });
   return out;
@@ -298,7 +341,12 @@ export async function findReleaseByBarcode(barcode, year) {
  * here, because the caller already knows which one it wants.
  */
 export async function tracksForRelease(mbid) {
-  const release = await wsFetch(`/release/${mbid}`, { inc: 'recordings' });
+  // Two incs, separated by a space — URLSearchParams encodes that as the `+`
+  // MusicBrainz documents, and writing the `+` here instead would send %2B and
+  // get the whole parameter rejected. artist-credits is what lets flattenTracks
+  // name the band on a compilation's tracks; it costs nothing extra, since it
+  // rides along on the same request.
+  const release = await wsFetch(`/release/${mbid}`, { inc: 'recordings artist-credits' });
   const out = flattenTracks(release);
   return out.length ? out : null;
 }
@@ -413,7 +461,8 @@ export async function findReleaseGroup({ artist, title, year }) {
 export async function tracksForReleaseGroup(mbid, year) {
   const data = await wsFetch('/release', {
     'release-group': mbid,
-    inc: 'recordings',
+    // See tracksForRelease on the space: it is the wire form, not a typo.
+    inc: 'recordings artist-credits',
     limit: '25',
   });
 

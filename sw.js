@@ -293,6 +293,71 @@ async function navigationFirst(request) {
   }
 }
 
+/**
+ * Can this cached response answer this request?
+ *
+ * The Cache API matches on URL alone — request mode is not part of the lookup —
+ * so an opaque response stored from a no-cors request is handed straight back
+ * to a cors one for the same URL. The browser then rejects it, because a cors
+ * request may not be satisfied by a response it isn't allowed to read, and the
+ * image fires `error`.
+ *
+ * That is what put a cover in the detail dialog and a placeholder on the card
+ * behind it. The dialog's <img> is a plain request; the card's carries
+ * crossOrigin="anonymous", because the shadow tint is sampled off the pixels
+ * and a canvas won't give them up otherwise. Both ask for the same URL, and
+ * whichever lands in the cache first is what everyone gets afterwards — so a
+ * disc opened while its card was still resolving cached the dialog's opaque
+ * copy, and the card fell back to its placeholder from then on. Permanently:
+ * the cache outlives the tab, so no amount of reloading changed it.
+ *
+ * Refetching lets the cors response overwrite the opaque one, which is strictly
+ * the more useful of the two — a no-cors request is happy with either, so the
+ * entry converges on the copy that answers both and stays there. Nothing has to
+ * be thrown away to repair a poisoned entry, which is why CACHE_VERSION isn't
+ * bumped for this: the first cors request after this ships fixes the disc it
+ * was asking about.
+ */
+function answers(cached, request) {
+  return !(cached.type === 'opaque' && request.mode === 'cors');
+}
+
+/**
+ * Fetch art in the mode that can answer both kinds of request.
+ *
+ * Asking CORS-first regardless of how the page asked is what stops the cache
+ * entry being poisoned again by the next no-cors request, and it buys
+ * something the opaque copy never could: a readable status. An opaque response
+ * is status 0 whether the archive sent back an image or a 404, so a cover the
+ * archive simply hasn't got was indistinguishable from one it had, and the
+ * miss went into the cache as though it were art — a junk entry, holding a slot
+ * against ART_CACHE_MAX, evicting a real cover to do it. Optimistic URLs make
+ * that common rather than rare: caaUrl builds a front-image address out of an
+ * MBID without asking whether there's an image at it. A cors 404 is visibly not
+ * ok and is never stored.
+ *
+ * The no-cors fallback is for the day the archive stops sending CORS headers.
+ * Nothing suggests it will — the whole card path has always depended on those
+ * headers, since the shadow tint is sampled off the pixels — but the failure
+ * mode without a fallback is every cover on the site disappearing, and an
+ * opaque copy still paints.
+ */
+async function fetchArt(request) {
+  try {
+    return await fetch(new Request(request.url, { mode: 'cors', credentials: 'omit' }));
+  } catch (err) {
+    // No point handing an opaque response to a caller that can't accept one —
+    // let it fail, and render.js's un-CORS retry comes back through here as a
+    // no-cors request that can.
+    if (request.mode === 'cors') throw err;
+    return fetch(request);
+  }
+}
+
+// The art strategy, and only that despite the general-sounding name — it goes
+// through fetchArt, which knows the archive sends CORS headers. Route something
+// else here and that assumption comes with it.
+//
 // Takes the FetchEvent for the same reason staleWhileRevalidate does: the trim
 // runs after the response is handed back, and without waitUntil() the worker is
 // free to be killed mid-delete — which is how a capped cache quietly stops
@@ -301,11 +366,24 @@ async function cacheFirst(event, cacheName, { trimTo } = {}) {
   const { request } = event;
   const cache = await caches.open(cacheName);
   const cached = await cache.match(request);
-  if (cached) return cached;
+  if (cached && answers(cached, request)) return cached;
 
-  const response = await fetch(request);
-  // Opaque responses (no-cors, status 0) are still worth storing — they render
-  // fine in an <img>, we just can't inspect them.
+  let response;
+  try {
+    response = await fetchArt(request);
+  } catch (err) {
+    // Offline, or a CORS failure on the one path that gets here holding
+    // something: an opaque entry a cors request can't use. Hand it over anyway
+    // rather than failing outright — the cors <img> still can't read it, but
+    // render.js retries without CORS on that error, and the retry is answered
+    // from this same entry.
+    if (cached) return cached;
+    throw err;
+  }
+
+  // Opaque responses only reach here from fetchArt's fallback, and only because
+  // an opaque image still paints. They're stored for the same reason, with the
+  // known cost that a miss is opaque too and gets stored looking like a hit.
   if (response && (response.ok || response.type === 'opaque')) {
     await cache.put(request, response.clone());
     if (trimTo) event.waitUntil(trimCache(cacheName, trimTo));

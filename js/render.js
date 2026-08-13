@@ -563,18 +563,22 @@ function setCoverImage(img, disc, card) {
 
 /**
  * Point an <img> at a real cover URL, CORS-enabled so its dominant color stays
- * canvas-readable. On load, sample + tint the card shadow; on error, fall back
- * to the generated placeholder.
+ * canvas-readable. On load, sample + tint the card shadow. On error, ask once
+ * more without CORS — the art may be perfectly reachable and only the stricter
+ * request refused — and fall back to the generated placeholder only if that
+ * fails too.
  */
 function loadRealCover(img, disc, card, url) {
   img.crossOrigin = 'anonymous'; // so the canvas stays readable for sampling
   img.src = url;
 
   img.addEventListener('load', () => {
-    // The placeholder the error handler swaps in fires a load event of its own,
-    // and it drops crossOrigin on the way through — that missing attribute is
-    // how the two are told apart. There is nothing to sample off a data URL we
-    // drew ourselves, so this bail stays first.
+    // Two things reach this handler with no crossOrigin, and neither has pixels
+    // worth reading: the placeholder the error handler draws (a data URL of our
+    // own making) and the un-CORS retry it tries first (real art, but tainted —
+    // sampling it would throw). Both already tinted the card on their way past.
+    // The missing attribute is what tells them from the CORS load below, so this
+    // bail stays first.
     if (!img.crossOrigin) return;
 
     if (disc._sampled) {
@@ -596,7 +600,25 @@ function loadRealCover(img, disc, card, url) {
   });
 
   img.addEventListener('error', () => {
-    // Broken/blocked image → fall back to a designed placeholder.
+    // A cors request is the fussier of the two ways to ask for this URL, and
+    // failing it doesn't mean the image is unreachable — only that this
+    // particular request couldn't have it. The detail dialog asks plainly and
+    // may well be showing the very cover that just failed here, which is
+    // exactly the complaint that put this branch in: art in the modal, a
+    // placeholder on the card behind it, unchanged by any amount of reloading.
+    // (sw.js's `answers` guard is the other half of that fix and repairs the
+    // cache entry itself; this is what saves the card that's already on screen
+    // when the response comes from somewhere the guard doesn't reach.) So try
+    // once more without CORS before giving up on the art. The cost is the
+    // sampled shadow — the pixels stay unreadable — so the tint falls back to
+    // the artist hash, same as a placeholder would use.
+    if (img.crossOrigin && img.getAttribute('src') === url) {
+      img.removeAttribute('crossorigin');
+      img.src = url;
+      tintFromArtist(disc, card);
+      return;
+    }
+    // Genuinely broken/blocked → fall back to a designed placeholder.
     applyPlaceholder(img, disc, card);
   });
 }
@@ -604,15 +626,21 @@ function loadRealCover(img, disc, card, url) {
 function applyPlaceholder(img, disc, card) {
   img.removeAttribute('crossorigin'); // it's a data URL now; no CORS needed
   img.src = generatePlaceholderCover(disc); // memoized per disc
-  // The hashed color is a stand-in for one sampled off real art, so it must
-  // never overwrite a real sample. It used to: switching to list view builds a
-  // second card for the disc (nodes are cached per disc PER VIEW), that card
-  // comes back through here, and the hash landed on top of the sampled color —
-  // after which loadRealCover's `_sampled` guard skipped the re-sample that
-  // would have put the real one back. The row kept the hash for the rest of the
-  // session, and so did the detail dialog's tint, which reads disc.coverColor:
-  // whether a disc's dialog was the right color depended on whether you had
-  // ever opened list view.
+  tintFromArtist(disc, card);
+}
+
+// Tint a card from its artist hash — the stand-in for a color sampled off real
+// art, used both by the placeholder and by a cover we can display but not read.
+//
+// The hash must never overwrite a real sample. It used to: switching to list
+// view builds a second card for the disc (nodes are cached per disc PER VIEW),
+// that card comes back through here, and the hash landed on top of the sampled
+// color — after which loadRealCover's `_sampled` guard skipped the re-sample
+// that would have put the real one back. The row kept the hash for the rest of
+// the session, and so did the detail dialog's tint, which reads disc.coverColor:
+// whether a disc's dialog was the right color depended on whether you had ever
+// opened list view.
+function tintFromArtist(disc, card) {
   if (!disc._sampled) disc.coverColor = colorForArtist(disc.artist);
   card.style.setProperty('--card-shadow', disc.coverColor);
 }

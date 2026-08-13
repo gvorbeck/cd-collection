@@ -387,7 +387,9 @@ function persistTracksCache() {
 
 /**
  * Tracklist for a disc as an array of { title, length } (length in ms, or 0
- * when MusicBrainz doesn't have it). Returns null when nothing was found.
+ * when MusicBrainz doesn't have it), plus `artist` on the tracks credited to
+ * somebody other than the release itself — see flattenTracks. Returns null when
+ * nothing was found.
  */
 export async function resolveTracklist(disc) {
   const found = await resolveMbEntity(disc);
@@ -412,7 +414,12 @@ export async function resolveTracklist(disc) {
     // Touch it so the LRU eviction keeps the discs actually being browsed.
     hit.at = Date.now();
     persistTracksCache();
-    return hit.t.map(([title, length]) => ({ title, length }));
+    // The third slot is only written for a track that has an artist to name, so
+    // most tuples are still two long and the key stays off the object here for
+    // the same reason flattenTracks leaves it off: callers test `if (t.artist)`.
+    return hit.t.map(([title, length, artist]) => (
+      artist ? { title, length, artist } : { title, length }
+    ));
   }
 
   if (disc._tracksPromise) return disc._tracksPromise;
@@ -423,7 +430,14 @@ export async function resolveTracklist(disc) {
         ? await tracksForRelease(found.id)
         : await tracksForReleaseGroup(found.id, wantYear);
       if (tracks && tracks.length) {
-        tracksCache[key] = { t: tracks.map((t) => [t.title, t.length]), at: Date.now() };
+        tracksCache[key] = {
+          // Tuples, not objects, because this is 250 tracklists in a shared 5MB
+          // localStorage budget and the key names would outweigh the values.
+          // The artist slot is appended only when there is one — a compilation
+          // pays for it on every line, an ordinary album on none.
+          t: tracks.map((t) => (t.artist ? [t.title, t.length, t.artist] : [t.title, t.length])),
+          at: Date.now(),
+        };
         persistTracksCache();
       }
       return tracks;
