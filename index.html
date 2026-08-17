@@ -77,7 +77,7 @@
              wants one. It used to test the query as a single run against a blob
              laid out in the shelf's column order (book, number, artist, title,
              year, genre, tags, notes) — an order nobody types in, which is why
-             "miles kind of blue" found nothing. searchTerms in js/state.js
+             "miles kind of blue" found nothing. searchTerms in js/discs.js
              matches each word independently now, so the old wording described a
              rule that had stopped existing. -->
         <input
@@ -175,7 +175,12 @@
         </div>
 
         <!-- Sort order. Default "random" reshuffles on every page load so the
-             shelf never looks identical two visits running. -->
+             shelf never looks identical two visits running.
+             Whichever option is `selected` here must match
+             SOURCES.collection.DEFAULT_SORT in js/collection.js — url.js leaves
+             the default out of the link and readStateFromUrl puts it back, so a
+             mismatch quietly reorders every link this page hands out. A test in
+             test/collection.test.mjs holds the two together. -->
         <div class="sort-wrap">
           <label class="sort-label" for="sort">Sort</label>
           <select class="sort-select" id="sort">
@@ -241,9 +246,10 @@
        Version-pinned + Subresource Integrity: if the CDN ever serves altered
        bytes the browser refuses to run them (the app then shows its error
        state via the catch in init). crossorigin is required for SRI here. -->
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"
-          integrity="sha384-D/t0ZMqQW31H3az8ktEiNb39wyKnS82iFY52QPACM+IjKW3jDUhyIgh2PApRqJZs"
-          crossorigin="anonymous"></script>
+  <!-- Vendored, not linked: see vendor/README.md. Same origin, so no integrity
+       or crossorigin attribute — SRI guards a file someone else is serving, and
+       this one ships in the repo alongside the page that loads it. -->
+  <script src="vendor/papaparse.min.js"></script>
 
   <!-- The app is ES modules: js/app.js pulls in the rest through imports, so
        this is the only one the page names. A module script is deferred, and

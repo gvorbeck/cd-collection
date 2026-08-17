@@ -158,7 +158,13 @@
              that sorts every row into the same "blanks last" bucket is a control
              that does nothing. Artist A–Z is the default rather than Random for
              the same reason the shop check is at the top — this is a list you
-             read down, not a shelf you browse. -->
+             read down, not a shelf you browse.
+             That default is also written down in js/collection.js as
+             SOURCES.wishlist.DEFAULT_SORT, and the two have to agree: url.js
+             omits the sort from the link when it equals the default, so back
+             when both pages shared one 'random', picking Random here produced a
+             link that reopened sorted by artist. test/collection.test.mjs now
+             fails if they drift apart again. -->
         <div class="sort-wrap">
           <label class="sort-label" for="sort">Sort</label>
           <select class="sort-select" id="sort">
@@ -204,9 +210,10 @@
     </div>
   </dialog>
 
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"
-          integrity="sha384-D/t0ZMqQW31H3az8ktEiNb39wyKnS82iFY52QPACM+IjKW3jDUhyIgh2PApRqJZs"
-          crossorigin="anonymous"></script>
+  <!-- Vendored, not linked: see vendor/README.md. Same origin, so no integrity
+       or crossorigin attribute — SRI guards a file someone else is serving, and
+       this one ships in the repo alongside the page that loads it. -->
+  <script src="vendor/papaparse.min.js"></script>
 
   <script type="module" src="js/app.js"></script>
 </body>

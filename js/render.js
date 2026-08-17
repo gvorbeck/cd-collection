@@ -15,8 +15,40 @@ import { colorForArtist, sampleDominantColor } from './color.js';
 import { cachedCoverArt, resolveCoverArt, artLookupSettled } from './art.js';
 import { generatePlaceholderCover } from './cover.js';
 import { dom } from './dom.js';
-import { openDetail } from './detail.js';
-import { state } from './state.js';
+import { state } from './store.js';
+
+
+/* ----------------------------------------------------------
+   What happens when a card is activated
+   ----------------------------------------------------------
+   Every card gets a click handler here, but what that handler *does*
+   is registered from outside rather than imported. This file used to
+   `import { openDetail } from './detail.js'`, and detail.js needs
+   what's on screen to build the dialog, so the two imported each
+   other — the last link in a cycle that ran render → detail → url →
+   state → render.
+
+   Inverting this one edge unpicks the whole thing: detail.js is free
+   to import render.js, and render.js knows only that something wants
+   to be told which disc was picked. app.js does the introduction, in
+   wireEvents(), and state.js's shuffle goes through openCard() too so
+   that landing on a disc and clicking it are the same act.
+
+   The default is a no-op, so a card clicked before app.js has wired
+   anything up (or on a page that has cards but no dialog) does
+   nothing rather than throwing.
+   ---------------------------------------------------------- */
+let cardOpener = () => {};
+
+// Say what opening a disc means. Called once, at startup.
+export function setCardOpener(fn) {
+  cardOpener = fn;
+}
+
+// Open a disc the same way clicking its card would.
+export function openCard(disc) {
+  cardOpener(disc);
+}
 
 
 // Announce something to screen readers via the polite live region. Discrete
@@ -456,7 +488,7 @@ function buildCardShell(disc, { className = 'card', coverClass = 'card-cover-wra
   // doesn't arise — so the stylesheet's rules are all scoped to the attribute
   // being there rather than to the page.
   if (disc._shelf) card.dataset.shelf = disc._shelf.status;
-  card.addEventListener('click', () => openDetail(disc));
+  card.addEventListener('click', () => openCard(disc));
 
   const coverWrap = el('div', coverClass);
   const img = document.createElement('img');

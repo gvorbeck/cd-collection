@@ -19,8 +19,10 @@ import { cachedCoverArt, resolveCoverArt, mbidFromCaaUrl, resolveTracklist } fro
 import { generatePlaceholderCover } from './cover.js';
 import { dom } from './dom.js';
 import { saveLabelDraft } from './labelDraft.js';
-import { state, togglePill } from './state.js';
-import { DISC_HASH_PREFIX, buildUrl, discSlugFromHash, syncControlsToState } from './url.js';
+import { state } from './store.js';
+import { syncControlsToState } from './controls.js';
+import { togglePill } from './state.js';
+import { DISC_HASH_PREFIX, buildUrl, discSlugFromHash } from './url.js';
 
 
 // The disc the dialog is currently showing, and the tracklist painted for it.

@@ -42,7 +42,7 @@
    contract between the two.
    ============================================================ */
 
-const CACHE_VERSION = 'v10';
+const CACHE_VERSION = 'v12';
 const SHELL_CACHE = `cdc-shell-${CACHE_VERSION}`;
 const DATA_CACHE  = `cdc-data-${CACHE_VERSION}`;
 const ART_CACHE   = `cdc-art-${CACHE_VERSION}`;
@@ -76,6 +76,7 @@ const SHELL_ASSETS = [
   // Every module, listed one by one. A page names only its entry point, but
   // the browser resolves imports at fetch time, so an unlisted module is a
   // network request the offline shell can't answer.
+  'js/errors.js',
   'js/collection.js',
   'js/musicbrainz.js',
   'js/config.js',
@@ -84,9 +85,12 @@ const SHELL_ASSETS = [
   'js/art.js',
   'js/cover.js',
   'js/dom.js',
+  'js/discs.js',
+  'js/store.js',
   'js/owned.js',
   'js/shop.js',
   'js/render.js',
+  'js/controls.js',
   'js/detail.js',
   'js/state.js',
   'js/url.js',
@@ -112,8 +116,13 @@ const SHELL_ASSETS = [
   'icons/icon-192.png',
   'icons/icon-512.png',
   'icons/icon-maskable-512.png',
-  // Third-party, but the site does not render without them.
-  'https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js',
+  // Third-party code, vendored rather than linked. It is the only runtime
+  // dependency the site has, three pages do not render a single row without it,
+  // and served from here there is no second origin left that has to be up — or
+  // still exist — for a clone of this repo to work. The file is the byte-for-
+  // byte papaparse@5.4.1 build that used to be loaded from cdn.jsdelivr.net,
+  // and vendor/README.md records where it came from and how to check that.
+  'vendor/papaparse.min.js',
 ];
 
 /* ---------- Install: precache the shell ---------- */
@@ -191,8 +200,10 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Our own assets, plus the pinned PapaParse build.
-  if (url.origin === self.location.origin || url.hostname === 'cdn.jsdelivr.net') {
+  // Our own assets. PapaParse used to need naming here too, back when it came
+  // from cdn.jsdelivr.net; it is vendored into vendor/ now and arrives on this
+  // origin like everything else.
+  if (url.origin === self.location.origin) {
     event.respondWith(staleWhileRevalidate(event, SHELL_CACHE));
   }
 });

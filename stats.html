@@ -99,9 +99,10 @@
     <p>An archive of physical discs. Data lives in a Google Sheet; this page just counts it.</p>
   </footer>
 
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"
-          integrity="sha384-D/t0ZMqQW31H3az8ktEiNb39wyKnS82iFY52QPACM+IjKW3jDUhyIgh2PApRqJZs"
-          crossorigin="anonymous"></script>
+  <!-- Vendored, not linked: see vendor/README.md. Same origin, so no integrity
+       or crossorigin attribute — SRI guards a file someone else is serving, and
+       this one ships in the repo alongside the page that loads it. -->
+  <script src="vendor/papaparse.min.js"></script>
 
   <!-- ES module; it imports collection.js itself. Module scripts are deferred
        and PapaParse above is not, so window.Papa is ready before this runs. -->

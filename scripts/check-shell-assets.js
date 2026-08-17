@@ -25,6 +25,8 @@
      - every path SHELL_ASSETS names exists in the tree
      - every module reachable by following imports out of each
        page's entry script is precached, and is itself in the tree
+     - every non-module <script src> a page loads from this repo is
+       precached too
 
    Run it:
 
@@ -145,16 +147,23 @@ function importsOf(source) {
   return [...source.matchAll(IMPORT_RE)].map((match) => match[1]);
 }
 
-// Module scripts a page names directly. Classic scripts are skipped: PapaParse
-// is a plain <script src> from a CDN, and it imports nothing.
-function moduleEntries(html) {
-  const entries = [];
+// Every <script src> on a page, split by whether it's a module.
+//
+// The modules are entry points to walk imports from. The classic ones are
+// PapaParse, which imports nothing and so has no graph to follow — but it is
+// vendored in this repo now rather than loaded from a CDN, which makes it a
+// file that has to be precached like any other. It used to be exempt from this
+// check for the good reason that it lived on somebody else's server, and stayed
+// exempt after it moved for no reason at all.
+function scriptEntries(html) {
+  const modules = [];
+  const classic = [];
   for (const tag of html.match(/<script\b[^>]*>/gi) || []) {
-    if (!/\btype\s*=\s*["']module["']/i.test(tag)) continue;
     const src = tag.match(/\bsrc\s*=\s*["']([^"']+)["']/i);
-    if (src) entries.push(src[1]);
+    if (!src) continue;   // inline script, nothing to fetch
+    (/\btype\s*=\s*["']module["']/i.test(tag) ? modules : classic).push(src[1]);
   }
-  return entries;
+  return { modules, classic };
 }
 
 // Resolve a specifier against the file that wrote it, in repo-relative terms:
@@ -171,9 +180,10 @@ function resolveFrom(fromPath, specifier) {
  * file that isn't there. That is a page broken online as well as off, so it is
  * caught here rather than in somebody's browser console.
  *
- * The seen-set is doing real work: detail.js, state.js and render.js import
- * each other in a cycle, which the browser handles fine and a naive walk does
- * not.
+ * The seen-set is doing real work even though the graph is acyclic (which
+ * test/imports.test.mjs enforces). It's a diamond, not a tree: util.js is
+ * imported by nearly everything, and store.js and dom.js by most of the rest.
+ * Without the set those subtrees get re-walked once per path into them.
  */
 function walkImports(entries) {
   const reachable = new Set();
@@ -271,12 +281,27 @@ function main() {
   /* The one that needed a graph walk: every module a page can reach. */
   const pages = listPages();
   const entries = [];
+  const classic = new Set();
   for (const page of pages) {
     const html = fs.readFileSync(path.join(ROOT, page), 'utf8');
-    for (const src of moduleEntries(html)) entries.push(resolveFrom(page, src));
+    const { modules, classic: plain } = scriptEntries(html);
+    for (const src of modules) entries.push(resolveFrom(page, src));
+    // Absolute URLs are somebody else's server to cache or not.
+    for (const src of plain) if (!/^https?:\/\//i.test(src)) classic.add(resolveFrom(page, src));
   }
   if (entries.length === 0) {
     throw new Error(`No module <script> found in any of ${pages.join(', ')} — has the markup changed?`);
+  }
+
+  /* Classic <script src> tags name repo files too, and a page whose parser is
+     missing offline shows an empty shelf rather than a broken one. */
+  const unlistedClassic = [...classic].filter((file) => !assets.has(file)).sort();
+  if (unlistedClassic.length) {
+    problems.push([
+      `${plural(unlistedClassic.length, 'script')} loaded by a page but missing from SHELL_ASSETS in sw.js:`,
+      ...unlistedClassic.map((file) => `    ${file}`),
+      '  not a module, so nothing else 404s with it — the page just quietly loses what it does.',
+    ].join('\n'));
   }
 
   const { reachable, broken } = walkImports(entries);
@@ -313,6 +338,7 @@ function main() {
   console.log(`check-shell-assets: ${plural(listed.length, 'asset')} precached, nothing has drifted.`);
   console.log(`  ${plural(modules.length, 'module')} under js/, ${plural(icons.length, 'icon')} in the manifest, all listed.`);
   console.log(`  ${plural(reachable.size, 'module')} reachable from ${pages.join(', ')}, all precached.`);
+  console.log(`  ${plural(classic.size, 'classic script')} loaded by a page, all precached.`);
   for (const note of notes) console.log(`  note: ${note}`);
 }
 
