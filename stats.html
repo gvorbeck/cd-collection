@@ -71,6 +71,14 @@
       <div class="chart" id="chart-genres"></div>
     </section>
 
+    <!-- Hidden by stats.js when the sheet has no tags in it at all, rather than
+         printing a heading over an empty box. -->
+    <section class="panel" aria-labelledby="h-tags" id="panel-tags">
+      <h2 class="panel-title" id="h-tags">Tag Cloud</h2>
+      <p class="panel-note">Every tag in the collection, sized by how often it turns up. Pick one to jump back to the shelf, filtered.</p>
+      <div class="tag-cloud" id="tag-cloud"></div>
+    </section>
+
     <section class="panel" aria-labelledby="h-artists">
       <h2 class="panel-title" id="h-artists">Most Shelf Space</h2>
       <p class="panel-note">Artists with the most releases in the books.</p>

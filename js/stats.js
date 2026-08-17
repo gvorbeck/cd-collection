@@ -23,6 +23,14 @@ const TOP_ARTISTS = 15;
 // Bar colors, cycled in order. Same five accents the rest of the site uses.
 const BAR_COLORS = ['--brick', '--mustard', '--teal', '--orange', '--forest'];
 
+// The tag cloud's type-size range, in rem. The floor is the smallest mono size
+// used anywhere on the site (the panel notes sit at 0.68rem) — a cloud that
+// scales all the way down to unreadable is a cloud that hides its long tail.
+// The ceiling is a shade under .panel-title's smallest clamp, so the busiest
+// tag never out-shouts the heading above it.
+const TAG_SIZE_MIN = 0.72;
+const TAG_SIZE_MAX = 1.75;
+
 const dom = {};
 
 document.addEventListener('DOMContentLoaded', init);
@@ -34,6 +42,8 @@ async function init() {
   dom.figures     = document.getElementById('figures');
   dom.decades     = document.getElementById('chart-decades');
   dom.genres      = document.getElementById('chart-genres');
+  dom.tags        = document.getElementById('tag-cloud');
+  dom.tagPanel    = document.getElementById('panel-tags');
   dom.artists     = document.getElementById('chart-artists');
   dom.stateMsg    = document.getElementById('state-msg');
   dom.staleNotice = document.getElementById('stale-notice');
@@ -74,6 +84,7 @@ function render(discs) {
   renderFigures(discs);
   renderDecades(discs);
   renderGenres(discs);
+  renderTags(discs);
   renderArtists(discs);
 }
 
@@ -321,6 +332,68 @@ function renderGenres(discs) {
   }
 
   dom.genres.replaceChildren(...rows);
+}
+
+
+/* ----------------------------------------------------------
+   By tag
+   ----------------------------------------------------------
+   The one chart here that isn't ranked. Genres are a short controlled list and
+   rank cleanly; tags are the opposite — a long, self-invented vocabulary where
+   more than half the entries appear exactly once. Ranked, that reads as a
+   twelve-row chart with ninety-nine rows of tail cut off it. A cloud shows the
+   whole vocabulary at once and lets size carry the count, which is the actual
+   shape of this column.
+   ---------------------------------------------------------- */
+
+function renderTags(discs) {
+  // Set per disc: a row that lists the same tag twice ("punk, punk") is a typo
+  // in the sheet, not two releases' worth of evidence for it.
+  const ranked = rank(discs.flatMap((d) => [...new Set(d.tags)]));
+  if (!ranked.length) { dom.tagPanel.hidden = true; return; }
+
+  // rank() is heaviest-first, so the ends of it are the scale's ends.
+  const max = ranked[0].count;
+  const min = ranked[ranked.length - 1].count;
+
+  // Display order is A–Z, not by count. In a cloud the size is what says which
+  // tags are big, so sorting by size too spends the alphabet on nothing —
+  // where you'd go looking for a particular tag is under its letter.
+  const shown = [...ranked].sort((a, b) => a.name.localeCompare(b.name));
+  dom.tags.replaceChildren(...shown.map((entry) => tagCloudItem(entry, min, max)));
+}
+
+/**
+ * One word in the cloud: a link back to the grid with that tag pressed, sized
+ * by its share of the collection, with the count printed small beside it.
+ */
+function tagCloudItem({ name, count }, min, max) {
+  const item = el('a', 'tag-cloud-item');
+  item.href = gridUrl(`tag=${encodeURIComponent(name)}`);
+
+  // Square-rooted rather than linear. Type size is read as area, so a linear
+  // map makes the top tag look several times heavier than it is and squashes
+  // everything below the median into the floor — with a distribution this
+  // lopsided (one tag at 43, most at 1) that's nearly the whole cloud.
+  // When every tag is equally common there's no scale to draw, so sit them all
+  // in the middle rather than at the floor.
+  const t = max > min
+    ? (Math.sqrt(count) - Math.sqrt(min)) / (Math.sqrt(max) - Math.sqrt(min))
+    : 0.5;
+  item.style.fontSize = `${(TAG_SIZE_MIN + t * (TAG_SIZE_MAX - TAG_SIZE_MIN)).toFixed(3)}rem`;
+
+  // Ink weight tracks type size, so the three tiers are legible in a printout
+  // or a screenshot where the sizes have nothing to be compared against. Both
+  // colors are the text-safe tokens — see the palette note in styles.css.
+  if (t > 0.6) item.classList.add('is-heavy');
+  else if (t < 0.2) item.classList.add('is-light');
+
+  // The count is on screen, but it reads as a bare number appended to the tag
+  // ("ambient 20"). Label the link with the whole sentence instead; it still
+  // starts with the visible name, so a voice command for the tag still hits it.
+  item.setAttribute('aria-label', `${name}, ${count} ${count === 1 ? 'release' : 'releases'}`);
+  item.append(name, el('span', 'tag-cloud-count', String(count)));
+  return item;
 }
 
 

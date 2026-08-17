@@ -1546,6 +1546,55 @@ body.modal-open { overflow: hidden; }
 .bar-row.is-link:focus-visible .bar-track { box-shadow: 3px 3px 0 var(--ink); }
 .bar-row.is-link:hover .bar-label { text-decoration: underline; }
 
+/* ---------- Tag cloud ----------
+   Words, not bars: the size of each one is the count. Sizes are set inline by
+   js/stats.js — everything here is what they sit in. */
+.tag-cloud {
+  display: flex;
+  flex-wrap: wrap;
+  /* Baseline, not center: the words on a line sit on a shared rule the way set
+     type does, instead of floating around a mid-line that no glyph touches. */
+  align-items: baseline;
+  /* Row gap is generous because the rows are ragged by design — a 1.75rem tag
+     directly above a 0.72rem one needs the air to stay separate. */
+  gap: 0.5rem 0.85rem;
+  font-family: var(--font-mono);
+  line-height: 1.2;
+}
+.tag-cloud-item {
+  /* inline-block, not flex: the count inside rides on vertical-align, which is
+     an inline-layout property and does nothing to a flex child. */
+  display: inline-block;
+  font-weight: 700;
+  text-decoration: none;
+  color: var(--ink);
+  transition: background-color 0.15s, color 0.15s;
+}
+/* The two ends of the scale. Mid-weight tags keep plain --ink above. */
+.tag-cloud-item.is-heavy { color: var(--brick-ink); }
+.tag-cloud-item.is-light { color: var(--ink-soft); }
+
+.tag-cloud-count {
+  font-size: 0.6em;
+  font-weight: 400;
+  vertical-align: super;
+  margin-left: 0.15em;
+  color: var(--ink-soft);
+}
+
+/* Same mustard a .pill takes on hover, so the two ways of picking a tag on this
+   site light up the same way. The highlight is drawn as a box-shadow rather
+   than padding: padding on a wrapped inline word would re-flow the whole cloud
+   under the cursor, and these lines are ragged enough already. */
+.tag-cloud-item:hover,
+.tag-cloud-item:focus-visible {
+  background: var(--mustard);
+  color: var(--ink);
+  box-shadow: 0 0 0 0.15em var(--mustard);
+}
+.tag-cloud-item:hover .tag-cloud-count,
+.tag-cloud-item:focus-visible .tag-cloud-count { color: var(--ink); }
+
 .chart-tail {
   font-family: var(--font-mono);
   font-size: 0.68rem;
