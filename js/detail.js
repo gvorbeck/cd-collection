@@ -11,7 +11,8 @@
    cleanup that removes the hash live here too, next to the code
    that sets them.
    ============================================================ */
-import { el, formatLocation } from './collection.js';
+import { el, formatLocation, activeSource } from './collection.js';
+import { shelfLine } from './owned.js';
 import { formatDuration } from './musicbrainz.js';
 import { hexToRgb, safeHex, blendWithPaper } from './color.js';
 import { cachedCoverArt, resolveCoverArt, mbidFromCaaUrl, resolveTracklist } from './art.js';
@@ -43,9 +44,21 @@ let currentTracks = [];
  */
 export function openDetail(disc, { pushUrl = true } = {}) {
   // Location line, spelled out: "Book 2 · Catalog #42–43 (2 discs)".
-  // Blank (no book and no number) reads as uncataloged.
+  // Blank (no book and no number) reads as uncataloged — except on the
+  // wishlist, where nothing has a location by definition and the interesting
+  // thing to say in that slot is what the shelf makes of it.
   const loc = formatLocation(disc, { verbose: true });
-  dom.detailNumber.textContent = loc || 'Uncataloged';
+  dom.detailNumber.textContent = loc || shelfLine(disc) || 'Uncataloged';
+
+  // A label is for a disc in a book. Offering to print one for a record that
+  // hasn't been bought yet is a control that can only mislead — and the
+  // wishlist tab has no Book or Number column at all, so there is nothing to
+  // put on the label whatever the shelf makes of the row. Keyed off the page's
+  // source rather than off `disc._shelf`: that mark is only written when the
+  // collection tab loaded (see markOwnership), so reading it here would put the
+  // button back the moment the shelf became unreachable.
+  const actions = dom.detailMakeLabel.closest('.detail-actions');
+  if (actions) actions.hidden = activeSource() !== 'collection';
   dom.detailTitle.textContent = disc.title;
   dom.detailArtist.textContent = disc.artist;
 

@@ -9,7 +9,7 @@
    combination reachable here is a link that can be sent to someone.
    ============================================================ */
 import { reducedMotion, foldText, hideWithoutLosingFocus } from './util.js';
-import { CONFIG as SHEET } from './collection.js';
+import { CONFIG as SHEET, noun, activeSource } from './collection.js';
 import { dom } from './dom.js';
 import { announce, announceCount, cancelCountAnnounce, layoutTagCloud, renderCards } from './render.js';
 import { openDetail } from './detail.js';
@@ -169,9 +169,12 @@ export function applyFilters({ announceResults = true } = {}) {
   const total = DISCS.length;
   const anyFilter = state.search || state.genres.size || state.tags.size;
 
+  // "discs" on the shelf, "records" on the wishlist — see SOURCES in
+  // collection.js. Both counts describe the same number, so both take their
+  // plural from the total rather than from the filtered figure beside it.
   dom.resultsCount.textContent = anyFilter
-    ? `${n} of ${total} disc${total === 1 ? '' : 's'}`
-    : `${total} disc${total === 1 ? '' : 's'}`;
+    ? `${n} of ${total} ${noun(total)}`
+    : `${total} ${noun(total)}`;
 
   // "Clear filters" hides itself the instant it works, and the UA's [hidden]
   // rule would take the keyboard user's focus down with it. Hand focus to the
@@ -188,7 +191,7 @@ export function applyFilters({ announceResults = true } = {}) {
   if (n === 0) {
     dom.stateMsg.hidden = false;
     dom.stateMsg.classList.remove('is-error');
-    dom.stateMsg.textContent = 'No discs match those filters.';
+    dom.stateMsg.textContent = `No ${noun()} match those filters.`;
   } else {
     dom.stateMsg.hidden = true;
   }
@@ -197,7 +200,9 @@ export function applyFilters({ announceResults = true } = {}) {
   // polite count would arrive ~700ms later saying the same thing a second time.
   // When focus just moved there, the readout speaks for itself.
   if (announceResults && !focusMoved) {
-    announceCount(anyFilter ? `${n} disc${n === 1 ? '' : 's'} match your filters.` : `Showing all ${total} discs.`);
+    announceCount(anyFilter
+      ? `${n} ${noun(n)} match your filters.`
+      : `Showing all ${total} ${noun(total)}.`);
   } else {
     // Deciding not to announce has to be said out loud, because the last
     // keystroke's 700ms timer is still armed and will otherwise read out the
@@ -274,22 +279,28 @@ export function syncViewControls() {
 export function exportCurrentCsv() {
   const discs = sortDiscs(currentMatches());
   if (discs.length === 0) {
-    announce('Nothing to export — no discs match your filters.');
+    announce(`Nothing to export — no ${noun()} match your filters.`);
     return;
   }
 
   const C = SHEET.COLUMNS;
   // Ordered to match the sheet's header row, so a paste lines up column for
-  // column instead of quietly landing Notes under Art URL.
+  // column instead of quietly landing Notes under Art URL. The wishlist tab has
+  // no Book or Number — nothing on it has a shelf position, which is the point
+  // of it — so those two are dropped rather than exported as a pair of empty
+  // columns that would shift every cell of a paste-back one place left.
+  const shelved = activeSource() === 'collection';
   const headers = [
-    C.book, C.number, C.artist, C.title, C.year, C.genre, C.tags, C.art, C.notes, C.barcode,
+    ...(shelved ? [C.book, C.number] : []),
+    C.artist, C.title, C.year, C.genre, C.tags, C.art, C.notes, C.barcode,
   ];
   // Barcode as the *cell*, not as the digits the lookup uses: normalizing it on
   // the way out would rewrite the sheet's own formatting for no reason, and a
   // cell parseBarcode rejects would come back blank, which isn't a rewrite —
   // it's a deletion of whatever was in there.
   const rows = discs.map((d) => [
-    d.book, d.number, d.rawArtist, d.rawTitle, d.year, d.rawGenre, d.tags.join(', '),
+    ...(shelved ? [d.book, d.number] : []),
+    d.rawArtist, d.rawTitle, d.year, d.rawGenre, d.tags.join(', '),
     d.art, d.notes, d.rawBarcode,
   ]);
 
@@ -298,7 +309,7 @@ export function exportCurrentCsv() {
   // Written as an escape, not a literal: a raw U+FEFF is invisible in every
   // editor and the next whitespace cleanup would silently delete it.
   downloadFile(`\uFEFF${csv}`, 'text/csv;charset=utf-8', exportFilename());
-  announce(`Exported ${discs.length} disc${discs.length === 1 ? '' : 's'}.`);
+  announce(`Exported ${discs.length} ${noun(discs.length)}.`);
 }
 
 // A cell whose first character is one of these is read as a formula by Excel,
@@ -332,7 +343,7 @@ function csvCell(value) {
 function exportFilename() {
   const stamp = new Date().toISOString().slice(0, 10);
   const filtered = state.search || state.genres.size || state.tags.size;
-  return `cd-collection${filtered ? '-filtered' : ''}-${stamp}.csv`;
+  return `cd-${activeSource()}${filtered ? '-filtered' : ''}-${stamp}.csv`;
 }
 
 // Hand a generated string to the browser as a file download.
@@ -361,7 +372,7 @@ const SHUFFLE_MARK_MS = 950;
 export function shuffle() {
   const pool = currentMatches();
   if (pool.length === 0) {
-    announce('No discs to shuffle. Clear a filter and try again.');
+    announce(`No ${noun()} to shuffle. Clear a filter and try again.`);
     return;
   }
 

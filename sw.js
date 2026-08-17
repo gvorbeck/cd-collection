@@ -42,7 +42,7 @@
    contract between the two.
    ============================================================ */
 
-const CACHE_VERSION = 'v9';
+const CACHE_VERSION = 'v10';
 const SHELL_CACHE = `cdc-shell-${CACHE_VERSION}`;
 const DATA_CACHE  = `cdc-data-${CACHE_VERSION}`;
 const ART_CACHE   = `cdc-art-${CACHE_VERSION}`;
@@ -68,6 +68,7 @@ const ART_CACHE_MAX = 400;
 const SHELL_ASSETS = [
   './',
   'index.html',
+  'wishlist.html',
   'labels.html',
   'stats.html',
   'styles.css',
@@ -83,6 +84,8 @@ const SHELL_ASSETS = [
   'js/art.js',
   'js/cover.js',
   'js/dom.js',
+  'js/owned.js',
+  'js/shop.js',
   'js/render.js',
   'js/detail.js',
   'js/state.js',
@@ -98,6 +101,7 @@ const SHELL_ASSETS = [
   // per-asset catch in install() is what keeps that from failing the whole
   // precache and taking every other offline asset down with it.
   'data/collection.csv',
+  'data/wishlist.csv',
   'manifest.webmanifest',
   // Every icon manifest.webmanifest declares, plus the Apple touch icon the
   // pages link directly. The two lists drifted once — icon-maskable-512.png
@@ -198,7 +202,7 @@ self.addEventListener('fetch', (event) => {
 async function networkFirst(request, cacheName) {
   const cache = await caches.open(cacheName);
   try {
-    const response = await fetch(request);
+    const response = await fetch(revalidating(request));
     if (response && response.ok && isCsv(response)) {
       // Stamped and stored, not stored as-is: the fallback below has no other
       // way to tell the page how old the copy it's serving is. Awaiting the
@@ -215,11 +219,59 @@ async function networkFirst(request, cacheName) {
       // byte-identical to a live one from the page's side, so this message is
       // the only thing standing between an offline visitor and the belief that
       // they are looking at the current collection.
-      await notifyClients({ type: 'sheet-stale', cachedAt: cached.headers.get(CACHED_AT_HEADER) });
+      // `url` because there is more than one sheet now: the collection tab and
+      // the wishlist tab are separate published CSVs, and the wishlist page
+      // fetches both (its own rows, plus the shelf it checks them against). A
+      // message that only said "a sheet is stale" would have that page reporting
+      // whichever one it happens to be built around, regardless of which one
+      // actually came out of the cache.
+      await notifyClients({
+        type: 'sheet-stale',
+        url: request.url,
+        cachedAt: cached.headers.get(CACHED_AT_HEADER),
+      });
       return cached;
     }
     throw err;
   }
+}
+
+/**
+ * The same request, with the browser's own HTTP cache told to check first.
+ *
+ * Without this the whole network-first strategy can be a no-op. Google serves
+ * the published CSV with a cache lifetime of its own, so a plain fetch() is
+ * free to answer out of the browser's HTTP cache without going near the
+ * network — the worker sees a 200, the page sees a 200, and what everyone is
+ * actually holding is the sheet as it stood the last time it was fetched. Add
+ * an edit to the sheet and the site shows the version before it, indefinitely,
+ * with nothing on screen to say so: the stale banner only fires when the
+ * *worker's* cache is the one answering, and here it never gets asked.
+ *
+ * That was the bug worth catching. The sheet is edited constantly and the
+ * whole point of the shop check is being told what is on the shelf right now.
+ *
+ * 'no-cache' rather than 'reload' or 'no-store': it still sends the
+ * conditional headers, so an unchanged sheet comes back 304 with no body and
+ * costs nothing on a phone's connection. Only the freshness lie is removed.
+ *
+ * Offline is untouched — the fetch throws either way, and the catch above
+ * hands back the cached copy with the message that says it is one.
+ */
+function revalidating(request) {
+  // A Request is immutable, and the constructor is the only way to change the
+  // cache mode. Copy through explicitly: a bare `new Request(request)` keeps
+  // most of it, but being specific here is what stops a future header from
+  // being dropped silently. These sheets are plain cross-origin GETs.
+  return new Request(request.url, {
+    cache: 'no-cache',
+    credentials: request.credentials,
+    headers: request.headers,
+    method: request.method,
+    mode: request.mode,
+    redirect: 'follow',
+    referrer: request.referrer,
+  });
 }
 
 /**

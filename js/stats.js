@@ -12,7 +12,8 @@
    ============================================================ */
 
 import {
-  el, load, loadedFrom, noteDataSource, DATA_SOURCES, usingSample, registerServiceWorker,
+  el, load, loadedFrom, noteDataSource, sourceConfig, DATA_SOURCES, usingSample,
+  registerServiceWorker,
 } from './collection.js';
 
 // How many rows each ranked chart shows before it stops being a chart and
@@ -44,16 +45,28 @@ async function init() {
   dom.genres      = document.getElementById('chart-genres');
   dom.tags        = document.getElementById('tag-cloud');
   dom.tagPanel    = document.getElementById('panel-tags');
+  dom.tagNote     = document.getElementById('note-tags');
   dom.artists     = document.getElementById('chart-artists');
   dom.stateMsg    = document.getElementById('state-msg');
   dom.staleNotice = document.getElementById('stale-notice');
 
   try {
-    const discs = await load();
+    // The wishlist is the second tone in the tag cloud and nothing else on this
+    // page, so it fails soft: an unreachable or unpublished wishlist tab costs
+    // the comparison, not the statistics. Started alongside the collection
+    // rather than after it — they are two independent GETs and the page has
+    // nothing to draw until both are in.
+    const [discs, wants] = await Promise.all([
+      load('collection'),
+      load('wishlist').catch((err) => {
+        console.warn('Counted the collection, but the wishlist did not load — one-tone tag cloud:', err);
+        return [];
+      }),
+    ]);
 
     // Fold the worker's answer in now that load() has made its own — see the
-    // note on staleSheetReport for why it can't be applied any earlier.
-    if (staleSheetReport && loadedFrom() === DATA_SOURCES.SHEET) {
+    // note on staleSheetReports for why it can't be applied any earlier.
+    if (staleReportForPage() && loadedFrom() === DATA_SOURCES.SHEET) {
       noteDataSource(DATA_SOURCES.CACHE);
     }
 
@@ -61,7 +74,7 @@ async function init() {
       dom.stateMsg.textContent = 'The collection is empty right now.';
       return;
     }
-    render(discs);
+    render(discs, wants);
     dom.stateMsg.hidden = true;
     // Immediately after, and only here: this is the one path where the figures
     // actually rendered, so it is the one path where #state-msg goes quiet and
@@ -80,11 +93,11 @@ async function init() {
   }
 }
 
-function render(discs) {
+function render(discs, wants) {
   renderFigures(discs);
   renderDecades(discs);
   renderGenres(discs);
-  renderTags(discs);
+  renderTags(discs, wants);
   renderArtists(discs);
 }
 
@@ -92,9 +105,12 @@ function render(discs) {
 /* ----------------------------------------------------------
    Where these numbers came from
    ----------------------------------------------------------
-   A deliberate duplicate of the same four functions in app.js. Two of them —
-   listenForStaleSheet and savedOn — are meant to be the same code, and any
-   difference in them is drift to be reconciled. The other two are not:
+   A deliberate duplicate of the same five functions in app.js. Three of them —
+   staleReportForPage, listenForStaleSheet and savedOn — are meant to be the
+   same code, and any difference in them is drift to be reconciled. (They have
+   already drifted once: app.js was given the URL-keyed map when the wishlist
+   arrived and this file was not, which had a cached wishlist reporting the
+   collection's figures as saved.) The other two are not:
 
      dataSourceNotice   one word apart. This page *counted* from the saved copy
                         where the grid page is *showing* it, because that is
@@ -113,11 +129,23 @@ function render(discs) {
    reason to open it — and if you edit one of them, edit the other.
    ---------------------------------------------------------- */
 
-// What the service worker said about the sheet request, or null if it said
-// nothing. Held rather than acted on: the message lands while load() is still
-// fetching, and load() records its own source when the parse resolves, so
-// anything applied before then is overwritten a moment later.
-let staleSheetReport = null;
+// What the service worker said about each sheet request it served from cache,
+// keyed by the URL it was asked for. Keyed, not single, because this page reads
+// two sheets now — the collection it counts, and the wishlist that gives the tag
+// cloud its second tone — and they go stale independently. A lone value here had
+// a cached wishlist telling the page that the *collection* figures came off a
+// saved copy, over numbers that were live. Held rather than acted on: the message
+// lands while load() is still fetching, and load() records its own source when
+// the parse resolves, so anything applied before then is overwritten a moment
+// later.
+const staleSheetReports = new Map();
+
+// The worker's word about the sheet this page's figures are counted from — the
+// collection — or null. The wishlist's own staleness isn't reported anywhere:
+// it costs a comparison in one panel, not a number on screen.
+function staleReportForPage() {
+  return staleSheetReports.get(sourceConfig().CSV_URL) || null;
+}
 
 /**
  * Start listening for the worker's word that it answered the sheet request out
@@ -132,14 +160,19 @@ function listenForStaleSheet() {
     if (!data || data.type !== 'sheet-stale') return;
     // cachedAt is an ISO string stamped when the copy was stored, or null from
     // a worker old enough to predate the stamp. Both are usable answers.
-    staleSheetReport = { cachedAt: typeof data.cachedAt === 'string' ? data.cachedAt : null };
+    // A worker that predates the `url` field reports for the collection, which
+    // is what it meant back when there was only one sheet to report on.
+    const key = typeof data.url === 'string' ? data.url : sourceConfig().CSV_URL;
+    staleSheetReports.set(key, {
+      cachedAt: typeof data.cachedAt === 'string' ? data.cachedAt : null,
+    });
   });
 
   // A ServiceWorkerContainer's message queue starts disabled and is only
   // enabled by onmessage, startMessages(), or the window's load event. We used
   // addEventListener and we run from DOMContentLoaded, which is earlier than
   // load — so without this the worker's message can still be sitting in the
-  // queue when init() reads staleSheetReport, and the notice reports the wrong
+  // queue when init() reads staleSheetReports, and the notice reports the wrong
   // source. No-op if the queue is already going.
   navigator.serviceWorker.startMessages();
 }
@@ -168,9 +201,8 @@ function dataSourceNotice() {
 // started stamping them. The notice stands either way; the date is what makes
 // it possible to judge.
 function savedOn() {
-  const at = staleSheetReport && staleSheetReport.cachedAt
-    ? new Date(staleSheetReport.cachedAt)
-    : null;
+  const report = staleReportForPage();
+  const at = report && report.cachedAt ? new Date(report.cachedAt) : null;
   if (!at || Number.isNaN(at.getTime())) return '';
   return ` (${at.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })})`;
 }
@@ -344,32 +376,80 @@ function renderGenres(discs) {
    twelve-row chart with ninety-nine rows of tail cut off it. A cloud shows the
    whole vocabulary at once and lets size carry the count, which is the actual
    shape of this column.
+
+   Drawn in two tones once the wishlist loads: what is on the shelf in ink, what
+   is only wanted in teal. One cloud rather than two, because the interesting
+   thing is not either list on its own — it is where they overlap and where they
+   don't. Two clouds side by side put "shoegaze" in both and left you comparing
+   two alphabets by eye; in one cloud a teal word is a corner of the vocabulary
+   you have been circling and own nothing of, which is the fact worth having.
+
+   One scale across both, so the two lists are sized against each other and a
+   wanted tag reads at the weight it has actually earned. A word's size is the
+   count printed next to it and nothing else: the shelf count for a shelf tag
+   (the wishlist's extras ride along as a small "+2", not as size — this is
+   still the page that counts the collection), and the wishlist count for a tag
+   the shelf doesn't have. Tone, count and aria-label each say which list a word
+   came from, so nothing here depends on telling teal from ink.
    ---------------------------------------------------------- */
 
-function renderTags(discs) {
+function renderTags(discs, wants) {
   // Set per disc: a row that lists the same tag twice ("punk, punk") is a typo
   // in the sheet, not two releases' worth of evidence for it.
-  const ranked = rank(discs.flatMap((d) => [...new Set(d.tags)]));
-  if (!ranked.length) { dom.tagPanel.hidden = true; return; }
+  const owned = rank(discs.flatMap((d) => [...new Set(d.tags)]));
+  const wanted = rank(wants.flatMap((d) => [...new Set(d.tags)]));
+  if (!owned.length && !wanted.length) { dom.tagPanel.hidden = true; return; }
 
-  // rank() is heaviest-first, so the ends of it are the scale's ends.
-  const max = ranked[0].count;
-  const min = ranked[ranked.length - 1].count;
+  const wantedBy = new Map(wanted.map((e) => [e.name, e.count]));
+  const entries = owned.map((e) => ({ ...e, wanted: wantedBy.get(e.name) || 0 }));
+
+  // Wishlist-only tags join the cloud at their own count. Everything already on
+  // the shelf is in `entries` above, so this is exactly the tail that would
+  // otherwise be invisible here — the whole point of drawing the two together.
+  const ownedNames = new Set(owned.map((e) => e.name));
+  for (const e of wanted) {
+    if (!ownedNames.has(e.name)) entries.push({ name: e.name, count: e.count, wanted: e.count });
+  }
+
+  // The scale runs over every word actually drawn, so the two lists are sized
+  // against each other rather than each against itself.
+  const counts = entries.map((e) => e.count);
+  const max = Math.max(...counts);
+  const min = Math.min(...counts);
 
   // Display order is A–Z, not by count. In a cloud the size is what says which
   // tags are big, so sorting by size too spends the alphabet on nothing —
   // where you'd go looking for a particular tag is under its letter.
-  const shown = [...ranked].sort((a, b) => a.name.localeCompare(b.name));
-  dom.tags.replaceChildren(...shown.map((entry) => tagCloudItem(entry, min, max)));
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  dom.tags.replaceChildren(...entries.map((entry) => tagCloudItem(entry, min, max, ownedNames)));
+
+  // The legend, written only when there is something to legend. With no
+  // wishlist loaded (offline, or the tab unpublished) the cloud is exactly what
+  // it was before and the note stays as stats.html wrote it — a key to a color
+  // that isn't on screen is worse than no key.
+  const only = entries.filter((e) => !ownedNames.has(e.name)).length;
+  if (only) {
+    dom.tagNote.append(` ${only} ${only === 1 ? 'tag is' : 'tags are'} on the wishlist `
+      + 'only, in teal — nothing on the shelf carries them yet.');
+  }
 }
 
 /**
- * One word in the cloud: a link back to the grid with that tag pressed, sized
- * by its share of the collection, with the count printed small beside it.
+ * One word in the cloud: a link to the list it lives on with that tag pressed,
+ * sized by how many releases carry it, with the count printed small beside it.
  */
-function tagCloudItem({ name, count }, min, max) {
+function tagCloudItem({ name, count, wanted }, min, max, ownedNames) {
   const item = el('a', 'tag-cloud-item');
-  item.href = gridUrl(`tag=${encodeURIComponent(name)}`);
+
+  // A tag nothing on the shelf carries would land on an empty grid, so it goes
+  // where its releases actually are. Everything else keeps pointing at the
+  // shelf even when the wishlist also has it: the shelf is the bigger answer,
+  // and the superscript says the other half is there.
+  const onShelf = ownedNames.has(name);
+  const query = `tag=${encodeURIComponent(name)}`;
+  item.href = onShelf ? gridUrl(query) : wishlistUrl(query);
+  if (!onShelf) item.classList.add('is-wanted');
+  else if (wanted) item.classList.add('is-also-wanted');
 
   // Square-rooted rather than linear. Type size is read as area, so a linear
   // map makes the top tag look several times heavier than it is and squashes
@@ -385,15 +465,33 @@ function tagCloudItem({ name, count }, min, max) {
   // Ink weight tracks type size, so the three tiers are legible in a printout
   // or a screenshot where the sizes have nothing to be compared against. Both
   // colors are the text-safe tokens — see the palette note in styles.css.
-  if (t > 0.6) item.classList.add('is-heavy');
+  // Not on a wanted word: its color is already carrying which list it is on,
+  // and a second meaning stacked on the same channel makes both unreadable.
+  if (!onShelf) { /* teal, and that is the whole of it */ }
+  else if (t > 0.6) item.classList.add('is-heavy');
   else if (t < 0.2) item.classList.add('is-light');
 
   // The count is on screen, but it reads as a bare number appended to the tag
   // ("ambient 20"). Label the link with the whole sentence instead; it still
   // starts with the visible name, so a voice command for the tag still hits it.
-  item.setAttribute('aria-label', `${name}, ${count} ${count === 1 ? 'release' : 'releases'}`);
+  item.setAttribute('aria-label', tagLabel(name, count, wanted, onShelf));
   item.append(name, el('span', 'tag-cloud-count', String(count)));
+  if (onShelf && wanted) {
+    // "+2" after the shelf count. Marked aria-hidden because the label above
+    // already says it in words — read out, "43 +2" is a sum, not two counts.
+    const also = el('span', 'tag-cloud-wanted', `+${wanted}`);
+    also.setAttribute('aria-hidden', 'true');
+    item.append(also);
+  }
   return item;
+}
+
+function tagLabel(name, count, wanted, onShelf) {
+  const releases = (n) => `${n} ${n === 1 ? 'release' : 'releases'}`;
+  if (!onShelf) return `${name}, wishlist only, ${releases(count)}`;
+  return wanted
+    ? `${name}, ${releases(count)} on the shelf, ${wanted} more on the wishlist`
+    : `${name}, ${releases(count)}`;
 }
 
 
@@ -458,6 +556,11 @@ function barRow({ label, count, max, color, href }) {
  */
 function gridUrl(query) {
   return `index.html?${usingSample() ? 'sample&' : ''}${query}`;
+}
+
+/** The same, pointed at the wishlist. Its page reads the same query params. */
+function wishlistUrl(query) {
+  return `wishlist.html?${usingSample() ? 'sample&' : ''}${query}`;
 }
 
 /** Count occurrences of each string, heaviest first, ties broken A–Z. */

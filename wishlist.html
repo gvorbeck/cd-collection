@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Wishlist — CD Collection</title>
+  <meta name="description" content="Records not on the shelf yet, and a shop check for whether one already is." />
+
+  <link rel="manifest" href="manifest.webmanifest" />
+  <meta name="theme-color" content="#f5edd6" />
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icons/icon-180.png" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Space+Mono:wght@400;700&family=Archivo:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<!-- data-source is what makes this the same app pointed at the other tab of the
+     same spreadsheet. js/collection.js reads it (activeSource) to pick which
+     CSV to fetch, which snapshot to fall back to, what a blank Title cell
+     means, and what one row is called on screen. Everything else on this page —
+     the search, the pills, the sort, the grid, the dialog, the export — is
+     index.html's, unchanged, because the two tabs share every column. -->
+<body data-source="wishlist">
+  <svg class="grain" aria-hidden="true" focusable="false">
+    <filter id="grain-filter">
+      <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="3" stitchTiles="stitch" />
+      <feColorMatrix type="saturate" values="0" />
+    </filter>
+    <rect width="100%" height="100%" filter="url(#grain-filter)" />
+  </svg>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="masthead">
+        <nav class="eyebrow" aria-label="Site"><a href="index.html">The Collection</a> · <span aria-current="page">Wishlist</span> · <a href="labels.html">Labels</a> · <a href="stats.html">Statistics</a> · <a href="https://docs.google.com/spreadsheets/d/18D6C4P16KTyaPtHCgJxq7Rzc0rt_09juUbIwM06Lnmc/edit" target="_blank" rel="noopener">Shelved by Number</a></nav>
+        <div class="title-row">
+          <h1 class="site-title">Wishlist</h1>
+          <span class="cd-logo" aria-hidden="true"></span>
+        </div>
+      </div>
+
+      <aside class="stats-card" aria-label="Wishlist statistics">
+        <div class="stats-total">
+          <span class="stats-figure" id="stat-total">—</span>
+          <span class="stats-label">records wanted</span>
+        </div>
+        <ul class="stats-genres" id="stat-genres" role="list"><!-- per-genre counts injected here --></ul>
+      </aside>
+    </div>
+  </header>
+
+  <main class="site-main">
+    <!-- The reason this page exists on a phone. Both sheets are loaded here —
+         the wishlist to show, the shelf to check it against — so one box can
+         answer both halves of the only question worth asking with a case in
+         your hand. Ahead of the browse controls because in a shop it is the
+         thing you came for; a <form> so the phone keyboard offers "Go" and
+         Enter submits, and novalidate/autocomplete off because the field takes
+         a barcode as readily as a band name.
+         The answer is a live region: on a phone the result may land below the
+         fold, and this is a page you use without looking. -->
+    <section class="shop-check" aria-labelledby="h-shop">
+      <h2 class="shop-check-title" id="h-shop">In a shop?</h2>
+      <form class="shop-check-form" id="shop-form" novalidate>
+        <label class="search-label" for="shop-input">Barcode, artist, or title</label>
+        <input
+          type="search"
+          id="shop-input"
+          class="search-input"
+          placeholder="Scan or type a barcode — or “bouncing souls”"
+          autocomplete="off"
+          autocapitalize="none"
+          spellcheck="false"
+        />
+        <button type="submit" class="shop-check-btn">Check</button>
+      </form>
+      <div class="shop-answer" id="shop-answer" role="status" aria-live="polite"></div>
+      <!-- "3 records on this list are already on the shelf." Filled by app.js
+           when the cross-check finds any, hidden otherwise. Not a live region:
+           this page has exactly one (#live-region), and the same sentence rides
+           along in the load announcement there. -->
+      <p class="shop-stale" id="wishlist-stale" hidden></p>
+    </section>
+
+    <section class="controls" aria-label="Browse controls">
+      <div class="search-wrap">
+        <label class="search-label" for="search">Search the wishlist</label>
+        <input
+          type="search"
+          id="search"
+          class="search-input"
+          placeholder="Search artist, title, genre, tag, year — in any order"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <button type="button" id="shuffle" class="shuffle-btn">
+        <svg class="shuffle-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"
+             fill="none" stroke="currentColor" stroke-width="2.4"
+             stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="16 3 21 3 21 8" />
+          <line x1="4" y1="20" x2="21" y2="3" />
+          <polyline points="21 16 21 21 16 21" />
+          <line x1="15" y1="15" x2="21" y2="21" />
+          <line x1="4" y1="4" x2="9" y2="9" />
+        </svg>
+        <span class="shuffle-text">Random</span>
+      </button>
+    </section>
+
+    <section class="filters" aria-label="Filter records">
+      <div class="filter-group">
+        <h2 class="filter-heading">Genre</h2>
+        <div class="pill-rail" id="genre-pills" role="group" aria-label="Filter by genre">
+          <!-- genre pills injected here -->
+        </div>
+      </div>
+      <div class="filter-group">
+        <h2 class="filter-heading">Tags</h2>
+        <div class="pill-cloud" id="tag-pills" role="group" aria-label="Filter by tag">
+          <!-- tag pills injected here -->
+        </div>
+      </div>
+    </section>
+
+    <p class="sr-only" role="status" aria-live="polite" id="live-region"></p>
+
+    <div class="results-bar">
+      <p class="results-count" id="results-count" tabindex="-1"></p>
+      <p class="results-count sheet-stale" id="stale-notice" hidden></p>
+
+      <div class="results-tools">
+        <button type="button" class="clear-filters" id="clear-filters" hidden>Clear filters</button>
+        <button type="button" class="export-btn" id="export-csv">Export</button>
+
+        <div class="view-toggle" id="view-toggle" role="group" aria-label="View">
+          <button type="button" data-view="grid" aria-pressed="true">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="currentColor">
+              <rect x="3" y="3" width="8" height="8" /><rect x="13" y="3" width="8" height="8" />
+              <rect x="3" y="13" width="8" height="8" /><rect x="13" y="13" width="8" height="8" />
+            </svg>
+            <span class="sr-only">Grid view</span>
+          </button>
+          <button type="button" data-view="list" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="currentColor">
+              <rect x="3" y="4" width="18" height="3" /><rect x="3" y="10.5" width="18" height="3" />
+              <rect x="3" y="17" width="18" height="3" />
+            </svg>
+            <span class="sr-only">List view</span>
+          </button>
+        </div>
+
+        <!-- No "Catalog #" and no "Book": nothing here has either, and an option
+             that sorts every row into the same "blanks last" bucket is a control
+             that does nothing. Artist A–Z is the default rather than Random for
+             the same reason the shop check is at the top — this is a list you
+             read down, not a shelf you browse. -->
+        <div class="sort-wrap">
+          <label class="sort-label" for="sort">Sort</label>
+          <select class="sort-select" id="sort">
+            <option value="artist" selected>Artist (A–Z)</option>
+            <option value="title">Title (A–Z)</option>
+            <option value="year-desc">Year (newest)</option>
+            <option value="year-asc">Year (oldest)</option>
+            <option value="random">Random</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <ul class="grid" id="grid" role="list" aria-label="Album covers"><!-- cards injected here --></ul>
+
+    <div class="state-msg" id="state-msg">Loading the wishlist…</div>
+  </main>
+
+  <footer class="site-footer">
+    <p>Records not on the shelf yet. Data lives in the Wishlist tab of the same Google Sheet.</p>
+  </footer>
+
+  <dialog class="detail" id="detail" aria-labelledby="detail-title">
+    <div class="detail-inner">
+      <button type="button" class="detail-close" id="detail-close" aria-label="Close details">✕</button>
+      <div class="detail-cover" id="detail-cover"><!-- cover injected --></div>
+      <div class="detail-body">
+        <p class="detail-number" id="detail-number"></p>
+        <h2 class="detail-title" id="detail-title"></h2>
+        <p class="detail-artist" id="detail-artist"></p>
+        <dl class="detail-meta" id="detail-meta"><!-- year / genre / etc injected --></dl>
+        <div class="detail-tags" id="detail-tags"><!-- tag chips injected --></div>
+        <div class="detail-notes" id="detail-notes"><!-- notes injected --></div>
+        <nav class="detail-links" id="detail-links" aria-label="Look this release up"><!-- links injected --></nav>
+        <div class="detail-tracks" id="detail-tracks" hidden><!-- tracklist injected --></div>
+        <!-- Hidden by js/detail.js for anything not on the shelf, which on this
+             page is everything but the rows the shop check has caught up with.
+             Kept in the markup so the two pages share one dialog. -->
+        <div class="detail-actions">
+          <button type="button" class="detail-action" id="detail-make-label">Make label</button>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"
+          integrity="sha384-D/t0ZMqQW31H3az8ktEiNb39wyKnS82iFY52QPACM+IjKW3jDUhyIgh2PApRqJZs"
+          crossorigin="anonymous"></script>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

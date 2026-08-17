@@ -459,14 +459,143 @@ body {
   .stats-card { flex: 1 1 auto; }
 }
 
-/* ============================================================
-   Controls: search + shuffle
-   ============================================================ */
 .site-main {
   max-width: 1200px;
   margin: 0 auto;
   padding: 1rem 1rem 4rem;
 }
+
+/* ============================================================
+   Shop check (wishlist.html only)
+   ------------------------------------------------------------
+   The one control on the site meant to be used standing up, in a
+   shop, one-handed, looking at a record rather than at the phone.
+   So it is a boxed panel rather than another row of furniture:
+   heavier border than a card, teal ground, sitting above the
+   browse controls where a thumb lands first.
+
+   Sized generously on purpose — the input is taller than the
+   site's other inputs and the verdict is set at heading weight,
+   because the whole interaction is "scan, glance, decide" and a
+   0.75rem grey line does not survive being glanced at.
+   ============================================================ */
+.shop-check {
+  border: 3px solid var(--ink);
+  background: var(--paper-deep);
+  box-shadow: 6px 6px 0 var(--teal);
+  padding: 0.9rem 1rem 1rem;
+  margin: 1rem 0 1.5rem;
+}
+.shop-check-title {
+  font-family: var(--font-display);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  font-size: 1.5rem;
+  line-height: 1;
+  margin: 0 0 0.6rem;
+  color: var(--ink);
+}
+/* Label across the top, then input and button side by side — one grid so the
+   button's bottom edge lines up with the input's however tall the label wraps. */
+.shop-check-form {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.25rem 0.7rem;
+  align-items: end;
+}
+.shop-check-form .search-label { grid-column: 1 / -1; margin-bottom: 0; }
+/* Taller than --control-h: this is the tap target you aim at without looking,
+   and a barcode scanner's payload deserves room to be seen landing. */
+.shop-check-form .search-input { height: 3rem; font-size: 1.05rem; }
+.shop-check-btn {
+  height: 3rem;
+  font-family: var(--font-display);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 1.2rem;
+  color: var(--surface);
+  background: var(--teal-deep);
+  border: 2px solid var(--ink);
+  padding: 0 1.4rem;
+  box-shadow: 3px 3px 0 var(--ink);
+  cursor: pointer;
+  transition: transform 0.12s var(--ease), box-shadow 0.12s var(--ease), background-color 0.2s;
+}
+.shop-check-btn:hover { background: var(--ink); }
+.shop-check-btn:active { transform: translate(3px, 3px); box-shadow: none; }
+
+.shop-answer:not(:empty) { margin-top: 0.9rem; }
+
+/* The verdict itself. Three states, three grounds, and the color does none of
+   the work alone — each one says in words what it is, because this is read at
+   arm's length in a shop's lighting and by people who don't see the difference
+   between the mustard and the green. */
+.shop-verdict {
+  font-family: var(--font-display);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  font-size: 1.35rem;
+  line-height: 1.1;
+  margin: 0;
+  padding: 0.4rem 0.7rem;
+  border: 2px solid var(--ink);
+}
+.shop-verdict[data-verdict="own"]     { background: var(--forest);     color: var(--surface); }
+.shop-verdict[data-verdict="want"]    { background: var(--mustard);    color: var(--ink); }
+.shop-verdict[data-verdict="neither"] { background: var(--surface);    color: var(--ink); }
+
+.shop-note {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  margin: 0.5rem 0 0;
+}
+/* The matching records. Plain text, not buttons — see hitList() in js/shop.js. */
+.shop-hits {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.shop-hits li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+}
+/* The half of the answer that saves you from buying it twice, so it leads and
+   it is the only part set in the mono face. */
+.shop-hit-loc {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 0.72rem;
+  background: var(--mustard);
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  padding: 0.1rem 0.4rem;
+  white-space: nowrap;
+}
+.shop-hit-name { font-weight: 700; }
+.shop-hit-year { font-family: var(--font-mono); font-size: 0.75rem; color: var(--ink-soft); }
+.shop-hit-more { font-size: 0.8rem; color: var(--ink-soft); font-style: italic; }
+
+/* "3 records on this list are already on the shelf." Quieter than a verdict —
+   it is true on arrival and every time after, so it sits under the box as a
+   note rather than announcing itself. */
+.shop-stale {
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--brick-ink);
+  margin: 0.75rem 0 0;
+}
+
+/* ============================================================
+   Controls: search + shuffle
+   ============================================================ */
 .controls {
   display: flex;
   gap: 0.75rem;
@@ -954,6 +1083,45 @@ body {
   border-left: 0;
   padding: 0.15rem 0.45rem;
 }
+/* ------------------------------------------------------------
+   Already on the shelf (wishlist.html)
+   ------------------------------------------------------------
+   A wishlist card whose record turned out to be in the collection
+   is the one card here you want to *stop* looking at, so it reads
+   as struck through rather than highlighted: the cover greys back
+   and takes a rubber stamp across it.
+
+   The stamp is aria-hidden and the corner tag carries the same
+   news in words ("Book 2 · 219"), so nothing here depends on
+   seeing a rotated word over a photograph.
+   ------------------------------------------------------------ */
+.card-stamp {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 1;
+  transform: translate(-50%, -50%) rotate(-12deg);
+  font-family: var(--font-display);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: clamp(1.1rem, 4.5cqw, 1.9rem);
+  color: var(--brick-ink);
+  border: 4px solid var(--brick-ink);
+  border-radius: 2px;
+  padding: 0.1em 0.4em;
+  /* Ink on a stamp pad, not paint: the cover has to stay readable underneath
+     or the card stops being identifiable at the exact moment it matters. */
+  background: rgb(255 250 240 / 0.72);
+  opacity: 0.9;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.card[data-shelf="owned"] .card-cover-wrap { container-type: inline-size; }
+.card[data-shelf="owned"] .card-cover { filter: grayscale(0.7) contrast(0.9); }
+.card[data-shelf="owned"] .card-body { opacity: 0.72; }
+/* Owning something else by the artist is context, not a verdict — the corner
+   tag says "3 on the shelf" and that is the whole of it. No fade, no stamp. */
+
 .card-body { padding: 0.5rem 0.6rem 0.65rem; display: flex; flex-direction: column; gap: 0.1rem; }
 .card-artist {
   font-family: var(--font-mono);
@@ -1574,6 +1742,28 @@ body.modal-open { overflow: hidden; }
 .tag-cloud-item.is-heavy { color: var(--brick-ink); }
 .tag-cloud-item.is-light { color: var(--ink-soft); }
 
+/* Wanted, and owned in nothing: the other tone. The dotted underline is what
+   actually carries it — the teal is a shade off the ink at small sizes and
+   there are people for whom it is no different at all, so the color is the
+   pleasant half of the signal and the rule underneath is the reliable one.
+   Skipped ink so it reads as provisional rather than as a link's underline,
+   which every word here is anyway. */
+.tag-cloud-item.is-wanted {
+  color: var(--teal-deep);
+  text-decoration: underline dotted var(--teal-deep);
+  text-underline-offset: 0.22em;
+  text-decoration-thickness: from-font;
+}
+/* On the shelf AND on the list. Left in ink — it is a shelf tag, and the "+2"
+   beside it is the whole of the news. */
+.tag-cloud-wanted {
+  font-size: 0.6em;
+  font-weight: 700;
+  vertical-align: super;
+  margin-left: 0.1em;
+  color: var(--teal-deep);
+}
+
 .tag-cloud-count {
   font-size: 0.6em;
   font-weight: 400;
@@ -1594,6 +1784,12 @@ body.modal-open { overflow: hidden; }
 }
 .tag-cloud-item:hover .tag-cloud-count,
 .tag-cloud-item:focus-visible .tag-cloud-count { color: var(--ink); }
+/* Both superscripts go to ink on the mustard, for the same reason: teal on
+   mustard is 2.1:1 and disappears exactly when the cursor is on it. */
+.tag-cloud-item:hover .tag-cloud-wanted,
+.tag-cloud-item:focus-visible .tag-cloud-wanted { color: var(--ink); }
+.tag-cloud-item.is-wanted:hover,
+.tag-cloud-item.is-wanted:focus-visible { text-decoration-color: var(--ink); }
 
 .chart-tail {
   font-family: var(--font-mono);

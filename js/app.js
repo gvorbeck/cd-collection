@@ -23,7 +23,10 @@
 import { CONFIG } from './config.js';
 import {
   load, loadedFrom, noteDataSource, DATA_SOURCES, registerServiceWorker,
+  activeSource, sourceConfig, noun,
 } from './collection.js';
+import { markOwnership } from './owned.js';
+import { wireShopCheck, staleWishlistNote } from './shop.js';
 import { $, isHex6, cssVar } from './util.js';
 import { hexToRgb, setPaperRgb } from './color.js';
 import { repaintPlaceholders } from './cover.js';
@@ -136,11 +139,18 @@ function hydrateThemeConstants() {
    Where these discs came from
    ---------------------------------------------------------- */
 
-// What the service worker said about the sheet request, or null if it said
-// nothing. Held rather than acted on: the message lands while load() is still
+// What the service worker said about each sheet request it served from cache,
+// keyed by the URL it was asked for — this page may fetch two (its own tab, and
+// on the wishlist the shelf it checks against), and they can go stale
+// separately. Held rather than acted on: the message lands while load() is still
 // fetching, and load() records its own source when the parse resolves, so
 // anything applied before then is overwritten a moment later.
-let staleSheetReport = null;
+const staleSheetReports = new Map();
+
+// The worker's word about the sheet THIS page is built around, or null.
+function staleReportForPage() {
+  return staleSheetReports.get(sourceConfig().CSV_URL) || null;
+}
 
 /**
  * Start listening for the worker's word that it answered the sheet request out
@@ -159,14 +169,19 @@ function listenForStaleSheet() {
     if (!data || data.type !== 'sheet-stale') return;
     // cachedAt is an ISO string stamped when the copy was stored, or null from
     // a worker old enough to predate the stamp. Both are usable answers.
-    staleSheetReport = { cachedAt: typeof data.cachedAt === 'string' ? data.cachedAt : null };
+    // A worker that predates the `url` field reports for whichever sheet this
+    // page is built around, which is what it meant back when there was one.
+    const key = typeof data.url === 'string' ? data.url : sourceConfig().CSV_URL;
+    staleSheetReports.set(key, {
+      cachedAt: typeof data.cachedAt === 'string' ? data.cachedAt : null,
+    });
   });
 
   // A ServiceWorkerContainer's message queue starts disabled and is only
   // enabled by onmessage, startMessages(), or the window's load event. We used
   // addEventListener and we run from DOMContentLoaded, which is earlier than
   // load — so without this the worker's message can still be sitting in the
-  // queue when init() reads staleSheetReport, and the notice reports the wrong
+  // queue when init() reads staleSheetReports, and the notice reports the wrong
   // source. No-op if the queue is already going.
   navigator.serviceWorker.startMessages();
 }
@@ -201,9 +216,8 @@ function dataSourceNotice() {
 // started stamping them. The notice stands either way; the date is what makes
 // it possible to judge whether last week's shelf additions are in there.
 function savedOn() {
-  const at = staleSheetReport && staleSheetReport.cachedAt
-    ? new Date(staleSheetReport.cachedAt)
-    : null;
+  const report = staleReportForPage();
+  const at = report && report.cachedAt ? new Date(report.cachedAt) : null;
   if (!at || Number.isNaN(at.getTime())) return '';
   return ` (${at.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })})`;
 }
@@ -252,21 +266,59 @@ async function init() {
   registerServiceWorker();
   listenForStaleSheet();
 
+  const page = activeSource();
+  const wantsShelfCheck = page === 'wishlist';
+
   try {
-    DISCS.push(...await load());
+    // Both sheets at once on the wishlist page: its own rows, and the shelf to
+    // check them against. In parallel because neither needs the other to parse,
+    // and the shelf is allowed to fail on its own — a wishlist with no
+    // ownership stamps on it is a slightly less useful wishlist, while a
+    // wishlist page that refused to render because the *collection* tab was
+    // unreachable would be no wishlist at all. Hence the catch that swallows
+    // rather than a second entry in Promise.all.
+    const [rows, shelf] = await Promise.all([
+      load(page),
+      wantsShelfCheck
+        ? load('collection').catch((err) => {
+          console.warn('Wishlist loaded, but the shelf did not — no ownership marks:', err);
+          return [];
+        })
+        : Promise.resolve([]),
+    ]);
+    DISCS.push(...rows);
 
     // Fold the worker's answer in now that load() has made its own. It has to
     // be now: the worker knows something load() can't, but it says so first and
     // load() assigns SHEET on the way out, so an earlier write is simply lost.
     // Only that one value is overridden — a fall back to the committed snapshot
     // is the older copy of the two, and the one worth naming.
-    if (staleSheetReport && loadedFrom() === DATA_SOURCES.SHEET) {
+    if (staleReportForPage() && loadedFrom() === DATA_SOURCES.SHEET) {
       noteDataSource(DATA_SOURCES.CACHE);
     }
 
+    // What the shelf makes of each wanted record, written onto the discs before
+    // anything renders — the cards read it, the rows read it, the dialog reads
+    // it, and none of them should have to wait for it. Nothing to say when the
+    // shelf didn't load; the stamps are simply absent, which is what shelfTag()
+    // and friends already return '' for.
+    if (shelf.length) markOwnership(DISCS, shelf);
+
+    // Unconditional, and ahead of the empty-list return below, because the shop
+    // check is not a page decoration that can be skipped. #shop-form has no
+    // action, so a form left unwired is not inert — the browser submits it, and
+    // that is a full navigation to `wishlist.html?` which throws away whatever
+    // filters were in the URL and answers nothing. The two cases where that
+    // could happen are precisely the two where the box matters most: the shelf
+    // unreachable (a shop with no signal) and an empty wishlist. Both still have
+    // a real answer to give. wireShopCheck no-ops where the markup isn't, so the
+    // other pages pass straight through.
+    wireShopCheck({ shelf, wants: DISCS });
+
     if (DISCS.length === 0) {
-      dom.stateMsg.textContent = 'The collection is empty right now.';
-      announce('The collection is empty right now.');
+      const empty = `The ${page === 'wishlist' ? 'wishlist' : 'collection'} is empty right now.`;
+      dom.stateMsg.textContent = empty;
+      announce(empty);
       return;
     }
 
@@ -284,7 +336,26 @@ async function init() {
     // own. It also can't be a second announce() call: the live region holds a
     // single string, and the second would overwrite the count before a screen
     // reader had finished reading it.
-    announce(`Loaded ${DISCS.length} discs.${notice ? ` ${notice}` : ''}`);
+    // Three things can want this one live region at load, so they are joined
+    // into the single string it holds rather than overwriting each other: how
+    // many rows arrived, which copy they came from, and — on the wishlist — how
+    // many of them turn out to be on the shelf already, which is the answer to
+    // "did I buy this and forget" and the reason to look at the page at all.
+    const stale = shelf.length ? staleWishlistNote(DISCS) : '';
+    // On screen as well as spoken. It sits with the shop check rather than in
+    // #stale-notice next to the count, because those two lines are about
+    // different kinds of stale — one is "this copy of the sheet is old", this
+    // one is "these rows are".
+    const staleBox = $('wishlist-stale');
+    if (staleBox) {
+      staleBox.hidden = !stale;
+      if (stale) staleBox.textContent = stale;
+    }
+    announce([
+      `Loaded ${DISCS.length} ${noun(DISCS.length)}.`,
+      notice,
+      stale,
+    ].filter(Boolean).join(' '));
 
     // The placeholder covers are drawn in Anton and Space Mono, and the CSV can
     // beat fonts.gstatic.com to the finish — every cover drawn in that window is
@@ -327,11 +398,12 @@ async function init() {
     const linked = discBySlug(discSlugFromHash());
     if (linked) openDetail(linked, { pushUrl: false });
   } catch (err) {
-    console.error('Failed to load collection:', err);
+    console.error(`Failed to load ${page}:`, err);
+    const message = `Could not load the ${page === 'wishlist' ? 'wishlist' : 'collection'}. Please try again later.`;
     dom.stateMsg.hidden = false;
     dom.stateMsg.classList.add('is-error');
-    dom.stateMsg.textContent = 'Could not load the collection. Please try again later.';
-    announce('Could not load the collection. Please try again later.');
+    dom.stateMsg.textContent = message;
+    announce(message);
   }
 }
 

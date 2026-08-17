@@ -23,20 +23,59 @@ import { foldText } from './util.js';
    Config — edit here
    ---------------------------------------------------------- */
 export const CONFIG = {
-  // Published Google Sheet, CSV output.
-  CSV_URL: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSV9mf7fFJZ25gUb2PUNWqO6y6f5KUJDApmgiiYMZ0fiFr6FELE6IC-6tbvSOj31jDZ82tazs1jdUuR/pub?gid=1454994388&single=true&output=csv',
+  /* --------------------------------------------------------
+     The two tabs, published separately
+     --------------------------------------------------------
+     One spreadsheet, two sheets, two `gid`s — the shelf and the
+     list of things not on it. They share every column name and
+     every parsing rule below, which is the whole reason a second
+     source cost so little: the wishlist simply leaves the Book and
+     Number columns out, and col() answers '' for a header that
+     isn't there.
+
+     Each entry is a complete answer to "where do these rows come
+     from and what do they mean":
+
+       CSV_URL         the published tab
+       SNAPSHOT_URL    the committed fallback (scripts/snapshot.js)
+       TITLE_FALLBACK  what a blank Title cell means HERE — the one
+                       place the two tabs genuinely disagree. On the
+                       shelf a nameless record is self-titled. On the
+                       wishlist it means "any release by this artist",
+                       which is how half the rows were jotted down
+       NOUN            what one row is called on screen, singular and
+                       plural, for the counts and the announcements
+
+     A page picks one with `data-source` on <body>; see activeSource().
+     scripts/snapshot.js walks every entry here and writes each one's
+     SNAPSHOT_URL, so adding a tab is this block plus a line in
+     SHELL_ASSETS. Declaration order only sets the order they are
+     fetched and logged in. */
+  SOURCES: {
+    collection: {
+      CSV_URL: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSV9mf7fFJZ25gUb2PUNWqO6y6f5KUJDApmgiiYMZ0fiFr6FELE6IC-6tbvSOj31jDZ82tazs1jdUuR/pub?gid=1454994388&single=true&output=csv',
+      // A committed copy of the real sheet, written by
+      // `node scripts/snapshot.js` and precached by the service worker. It's
+      // what load() falls back to when docs.google.com can't be reached — a
+      // first visit with no connection, or the published-CSV endpoint having
+      // one of its days. Possibly stale, which is why the page says so; a stale
+      // shelf beats an error page in a record shop.
+      SNAPSHOT_URL: 'data/collection.csv',
+      TITLE_FALLBACK: 'Self-Titled',
+      NOUN: ['disc', 'discs'],
+    },
+    wishlist: {
+      CSV_URL: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSV9mf7fFJZ25gUb2PUNWqO6y6f5KUJDApmgiiYMZ0fiFr6FELE6IC-6tbvSOj31jDZ82tazs1jdUuR/pub?gid=1921230268&single=true&output=csv',
+      SNAPSHOT_URL: 'data/wishlist.csv',
+      TITLE_FALLBACK: 'Any release',
+      NOUN: ['record', 'records'],
+    },
+  },
 
   // Design/preview aid: loading any page with ?sample in the URL reads the
   // bundled sample.csv instead of the live sheet, so layouts can be built out
   // with a full spread of dummy discs. Production (no query param) is untouched.
   SAMPLE_URL: 'sample.csv',
-
-  // A committed copy of the real sheet, written by `node scripts/snapshot.js`
-  // and precached by the service worker. It's what load() falls back to when
-  // docs.google.com can't be reached — a first visit with no connection, or the
-  // published-CSV endpoint having one of its days. Possibly stale, which is why
-  // the page says so; a stale shelf beats an error page in a record shop.
-  SNAPSHOT_URL: 'data/collection.csv',
 
   // Column names as they appear in the sheet header row.
   // Change these if you rename a column; the rest of the code reads through here.
@@ -57,13 +96,44 @@ export const CONFIG = {
   },
 
   // Fallbacks for blank cells. Empty string means "show nothing".
+  // Title is not here: it's the one cell whose blank means something different
+  // per tab, so it lives in SOURCES above as TITLE_FALLBACK.
   FALLBACKS: {
     artist: 'Various Artists',
-    title:  'Self-Titled',
     year:   '',              // missing year shows nothing at all
     genre:  'Uncategorized',
   },
 };
+
+// The default when a page says nothing — every page but wishlist.html.
+const DEFAULT_SOURCE = 'collection';
+
+/**
+ * Which SOURCES entry this page reads, from `data-source` on <body>.
+ *
+ * An unknown value falls back to the collection rather than throwing: the
+ * attribute is markup, markup and modules are cached and revalidated
+ * separately by the service worker, and a page that briefly disagrees with
+ * this file should show the shelf rather than nothing at all.
+ */
+export function activeSource() {
+  const name = document.body && document.body.dataset.source;
+  return Object.prototype.hasOwnProperty.call(CONFIG.SOURCES, name) ? name : DEFAULT_SOURCE;
+}
+
+/** The SOURCES entry for a name (defaulting to the collection's). */
+export function sourceConfig(name = activeSource()) {
+  return CONFIG.SOURCES[name] || CONFIG.SOURCES[DEFAULT_SOURCE];
+}
+
+/**
+ * What one row of a source is called on screen: "disc"/"discs" on the shelf,
+ * "record"/"records" on the wishlist. Pass a count to pick the number.
+ */
+export function noun(count = 2, name = activeSource()) {
+  const [one, many] = sourceConfig(name).NOUN;
+  return count === 1 ? one : many;
+}
 
 
 /* ----------------------------------------------------------
@@ -281,16 +351,23 @@ export const DATA_SOURCES = {
   SAMPLE:   'sample',
 };
 
-let dataSource = '';
+// Keyed by SOURCES name, because the wishlist page loads two of them — its own
+// rows, and the shelf it checks them against. A single value here meant the
+// second load overwrote the first, and the notice at the top of the page then
+// described the wrong sheet.
+const dataSourceByName = new Map();
 
-/** Which DATA_SOURCES value answered the last load(), or '' before one has. */
-export function loadedFrom() {
-  return dataSource;
+/**
+ * Which DATA_SOURCES value answered the last load() of a source, or '' before
+ * one has. Defaults to the source this page is built around.
+ */
+export function loadedFrom(name = activeSource()) {
+  return dataSourceByName.get(name) || '';
 }
 
 /** Record a source discovered elsewhere — the service worker's cached copy. */
-export function noteDataSource(source) {
-  dataSource = source;
+export function noteDataSource(source, name = activeSource()) {
+  dataSourceByName.set(name, source);
 }
 
 /**
@@ -308,22 +385,28 @@ export function noteDataSource(source) {
  * a cue to quietly load the real collection under a flag that promises dummy
  * data.
  */
-export async function load() {
+export async function load(name = activeSource()) {
+  const source = sourceConfig(name);
+  const record = (value) => dataSourceByName.set(name, value);
+
   if (usingSample()) {
-    const discs = await parseCsv(CONFIG.SAMPLE_URL);
-    dataSource = DATA_SOURCES.SAMPLE;
+    // One sample file, both sources. It is the shelf's shape, and the wishlist
+    // is the shelf's shape minus two columns, so it renders correctly on either
+    // page — a dev switch showing dummy rows, which is all it promises.
+    const discs = await parseCsv(CONFIG.SAMPLE_URL, source);
+    record(DATA_SOURCES.SAMPLE);
     return discs;
   }
 
   try {
-    const discs = await parseCsv(CONFIG.CSV_URL);
-    dataSource = DATA_SOURCES.SHEET;
+    const discs = await parseCsv(source.CSV_URL, source);
+    record(DATA_SOURCES.SHEET);
     return discs;
   } catch (err) {
-    console.warn('Live sheet unavailable; falling back to the committed snapshot:', err);
+    console.warn(`Live ${name} sheet unavailable; falling back to the committed snapshot:`, err);
     try {
-      const discs = await parseCsv(CONFIG.SNAPSHOT_URL);
-      dataSource = DATA_SOURCES.SNAPSHOT;
+      const discs = await parseCsv(source.SNAPSHOT_URL, source);
+      record(DATA_SOURCES.SNAPSHOT);
       return discs;
     } catch (snapshotErr) {
       console.warn('Snapshot unavailable too:', snapshotErr);
@@ -341,7 +424,7 @@ export async function load() {
  * a new column later never breaks parsing. Rejects on a download failure or a
  * header row that isn't the sheet's; load() decides what to do about it.
  */
-function parseCsv(url) {
+function parseCsv(url, source) {
   return new Promise((resolve, reject) => {
     Papa.parse(url, {
       download: true,
@@ -350,7 +433,7 @@ function parseCsv(url) {
       complete: (results) => {
         try {
           assertExpectedHeaders(results.meta && results.meta.fields);
-          resolve(normalizeRows(results.data));
+          resolve(normalizeRows(results.data, source));
         } catch (err) {
           reject(err);
         }
@@ -387,8 +470,12 @@ function assertExpectedHeaders(fields) {
   }
 }
 
-/** Turn raw CSV row objects into clean disc objects with fallbacks applied. */
-function normalizeRows(rows) {
+/**
+ * Turn raw CSV row objects into clean disc objects with fallbacks applied.
+ * `source` is the SOURCES entry the rows came from — it supplies the one
+ * fallback the two tabs disagree about (see TITLE_FALLBACK).
+ */
+function normalizeRows(rows, source = sourceConfig()) {
   const discs = [];
   // Slugs must be unique to work as links; remember the ones handed out so a
   // second "Greatest Hits" by the same artist gets "-2" rather than colliding.
@@ -408,7 +495,10 @@ function normalizeRows(rows) {
     const rawTitle  = col(row, 'title');
     const rawGenre  = col(row, 'genre');
     const artist = rawArtist || CONFIG.FALLBACKS.artist;
-    const title  = rawTitle  || CONFIG.FALLBACKS.title;
+    // "Self-Titled" on the shelf, "Any release" on the wishlist — the only
+    // cell whose blank means two different things depending on which tab it
+    // came from. See SOURCES.
+    const title  = rawTitle  || source.TITLE_FALLBACK;
     // Year has no raw twin: its fallback is '' — a missing year shows nothing —
     // so the resolved value already is the cell.
     const year   = col(row, 'year')   || CONFIG.FALLBACKS.year;

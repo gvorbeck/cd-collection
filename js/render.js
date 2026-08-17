@@ -10,6 +10,7 @@
 import { CONFIG } from './config.js';
 import { reducedMotion, hideWithoutLosingFocus } from './util.js';
 import { el } from './collection.js';
+import { shelfTag } from './owned.js';
 import { colorForArtist, sampleDominantColor } from './color.js';
 import { cachedCoverArt, resolveCoverArt, artLookupSettled } from './art.js';
 import { generatePlaceholderCover } from './cover.js';
@@ -450,6 +451,11 @@ function buildCardShell(disc, { className = 'card', coverClass = 'card-cover-wra
   // stringifies, which invalidates the box-shadow that reads it and leaves the
   // card with no shadow at all instead of the neutral one the CSS defines.
   if (disc.coverColor) card.style.setProperty('--card-shadow', disc.coverColor);
+  // What the shelf makes of this record, on the wishlist page: `owned`,
+  // `artist` or `wanted`. Absent entirely on the shelf page, where the question
+  // doesn't arise — so the stylesheet's rules are all scoped to the attribute
+  // being there rather than to the page.
+  if (disc._shelf) card.dataset.shelf = disc._shelf.status;
   card.addEventListener('click', () => openDetail(disc));
 
   const coverWrap = el('div', coverClass);
@@ -472,9 +478,21 @@ function buildCard(disc) {
   const { li, card, coverWrap } = buildCardShell(disc);
 
   // Shelf-location accession tag (omit entirely if blank). Shows book + slot,
-  // e.g. "B2 · #42–43"; a multi-disc release shows its slot range.
-  if (disc.locationLabel) {
-    coverWrap.appendChild(el('span', 'card-number', disc.locationLabel));
+  // e.g. "B2 · #42–43"; a multi-disc release shows its slot range. On the
+  // wishlist nothing has a slot, so the same corner carries the shelf's verdict
+  // instead — and a record already in the books wears it as a stamp across the
+  // cover rather than a tag, because "put this one back" is the single most
+  // useful thing the page can say in a shop.
+  const tag = disc.locationLabel || shelfTag(disc);
+  if (tag) {
+    coverWrap.appendChild(el('span', 'card-number', tag));
+  }
+  if (disc._shelf && disc._shelf.status === 'owned') {
+    // aria-hidden: the same words are already in the tag above, which is inside
+    // the button and read out with it. This is the visual half.
+    const stamp = el('span', 'card-stamp', 'Own it');
+    stamp.setAttribute('aria-hidden', 'true');
+    coverWrap.appendChild(stamp);
   }
 
   // Body
@@ -506,8 +524,10 @@ function buildRow(disc) {
 
   // Shelf location, in the mono "accession number" voice used everywhere else.
   // Spelled out rather than a dash: a screen reader reads this row as one
-  // string, and "em dash" in the middle of it means nothing.
-  row.appendChild(el('span', 'row-loc', disc.locationLabel || 'Uncataloged'));
+  // string, and "em dash" in the middle of it means nothing. A wishlist row has
+  // no location to print, so this column becomes the verdict column — which is
+  // what makes the list view the one to take to a shop.
+  row.appendChild(el('span', 'row-loc', disc.locationLabel || shelfTag(disc) || (disc._shelf ? 'Wanted' : 'Uncataloged')));
 
   const text = el('div', 'row-text');
   text.appendChild(el('span', 'row-artist', disc.artist));
