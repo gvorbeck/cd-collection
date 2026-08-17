@@ -7,6 +7,11 @@
    that list or turning it into a print sheet.
    ============================================================ */
 
+// Side effect only, and first: installs the global error handlers as it
+// evaluates. This page builds its whole `dom` object at module scope (below),
+// outside any try, so a renamed id throws before a single line of init() runs —
+// there is no other net under it. See errors.js.
+import './errors.js';
 import { escapeHtml, registerServiceWorker } from './collection.js';
 import { coerceLabel, takeLabelDraft } from './labelDraft.js';
 import { hideWithoutLosingFocus } from './util.js';

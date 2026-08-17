@@ -327,24 +327,38 @@ entry point with `<script type="module">` and the browser follows the imports
 from there. There is no global namespace: everything crosses a module boundary
 by being imported by name.
 
+The table is roughly in dependency order, and that order is real: **the import
+graph is a DAG, and `test/imports.test.mjs` fails the build if a cycle appears.**
+Worth keeping, because a cycle here doesn't break at build time — there is no
+build — it breaks at load time, as `Cannot access 'x' before initialization`
+pointing at a line that is perfectly correct on its own. If that test ever
+fails, the fix is to turn one edge around rather than work around it: move the
+shared value down into a leaf both sides can read (that's what `store.js` is),
+or let the lower module take a callback instead of importing the higher one
+(that's what `render.js`'s `setCardOpener` is).
+
 | Module            | What it is                                                      |
 |-------------------|-----------------------------------------------------------------|
-| `collection.js`   | Shared data layer: `CONFIG`, sheet fetch, CSV parsing, disc model, `escapeHtml`. Imported by all three pages. |
-| `musicbrainz.js`  | Shared MusicBrainz primitives: the site-wide 1/sec throttle, Lucene escaping, the two-step release-group lookup (identify the release, then read a tracklist off it), scoring for both steps, and duration formatting. |
-| `app.js`          | **Entry point for `index.html`.** Wiring only — reads the URL, loads the sheet, binds the event listeners, and hands off. |
-| `stats.js`        | **Entry point for `stats.html`.** Counts the collection three ways and draws the bar charts. |
-| `labels.js`       | **Entry point for `labels.html`.** The label list, the form, the print sheet, and the JSON export/import. |
-| `labelDraft.js`   | The collection → labels handoff: the draft "Make label" parks in `sessionStorage`, and the one definition of what counts as a label — which the labels page's import reuses to vet a file. |
-| `config.js`       | Grid-page tunables: timings, thresholds, sheet column names, the placeholder palette. |
+| `errors.js`       | The last-resort error reporter: global `error` and `unhandledrejection` handlers, installed by being imported first on every page. |
 | `util.js`         | Tiny shared helpers — element lookup, reduced-motion check, hex test, CSS-variable read, the accent folding both sides of the search use, a focus-safe way to hide a control, and the `localStorage` wrapper. |
+| `config.js`       | Grid-page tunables: timings, thresholds, sheet column names, the placeholder palette. |
+| `musicbrainz.js`  | Shared MusicBrainz primitives: the site-wide 1/sec throttle, Lucene escaping, the two-step release-group lookup (identify the release, then read a tracklist off it), scoring for both steps, and duration formatting. |
+| `labelDraft.js`   | The collection → labels handoff: the draft "Make label" parks in `sessionStorage`, and the one definition of what counts as a label — which the labels page's import reuses to vet a file. |
+| `discs.js`        | The four things browsing a collection needs that don't need a browser: parse the search box into terms, decide whether one disc answers the filters, order a list of them, escape a CSV cell. Imports nothing, so the tests can load it. |
+| `collection.js`   | Shared data layer: `CONFIG`, sheet fetch, CSV parsing, disc model, `escapeHtml`. Imported by every page. |
+| `dom.js`          | The one cache of grid-page element references. |
+| `store.js`        | The discs and the current filter state, as data and nothing else. Separate from `state.js` so the modules below can read them without importing the ones above back. |
+| `url.js`          | The URL as state: reading it on load, writing it on change. |
 | `color.js`        | Per-artist accent colors, hex/RGB math, contrast, dominant-color sampling from cover art. |
 | `art.js`          | Cover-art and tracklist resolution: MusicBrainz lookups, the Cover Art Archive, and the caches over both. |
 | `cover.js`        | The generated placeholder cover — canvas, drawn per disc when no art exists. |
-| `dom.js`          | The one cache of grid-page element references. |
 | `render.js`       | Everything that writes to the grid: cards, rows, pills, the tag cloud, the stats card, screen-reader announcements. |
-| `detail.js`       | The disc dialog — opening, populating, and closing it. |
-| `state.js`        | The grid's state and the operations on it: filter, sort, view, shuffle, export. |
-| `url.js`          | The URL as state: reading it on load, writing it on change, and Back/Forward. |
+| `controls.js`     | The other direction: pushing `state` back out to the search box, the sort select, the pills and the view toggle, after a deep link or a Back/Forward. |
+| `state.js`        | Acting on the collection: filter, sort, view, shuffle, export. |
+| `detail.js`       | The disc dialog — opening, populating, and closing it, and its history entry. |
+| `app.js`          | **Entry point for `index.html`.** Wiring only — reads the URL, loads the sheet, binds the event listeners, and hands off. |
+| `stats.js`        | **Entry point for `stats.html`.** Counts the collection three ways and draws the bar charts. |
+| `labels.js`       | **Entry point for `labels.html`.** The label list, the form, the print sheet, and the JSON export/import. |
 
 ### The labels page's two layers
 
@@ -397,9 +411,16 @@ layout and fallbacks can be exercised without touching the real collection.
 
 ### Tests
 
-The pure MusicBrainz helpers — Lucene escaping, release and release-group
-scoring, date precision, tracklist flattening, duration formatting — have unit
-tests. There is nothing to install:
+Six files, and nothing to install:
+
+| File                     | What it pins                                                |
+|--------------------------|-------------------------------------------------------------|
+| `musicbrainz.test.mjs`   | Lucene escaping, release and release-group scoring, date precision, tracklist flattening, duration formatting. |
+| `collection.test.mjs`    | The sheet cells the parser *reads* rather than copies — barcodes above all, since anything it lets through is sent to MusicBrainz as an identifier. Plus a check that each page's `selected` sort option matches its `DEFAULT_SORT`. |
+| `discs.test.mjs`         | Search-term parsing, the filter predicate, every sort mode, and CSV escaping — including the leading `=+-@` defusal that keeps an exported cell from opening as a live formula. |
+| `owned.test.mjs`         | Matching a wishlist row against the shelf: name normalization, barcode equivalence across UPC/EAN padding, and the guards that stop a blank cell matching everything. |
+| `imports.test.mjs`       | That the module graph is acyclic. See the note above the module table. |
+| `nav.test.mjs`           | That the site nav — copy-pasted into every page — still says the same thing on all of them: same labels, same order, same destinations, one current-page marker, no page left unlinked. |
 
 ```sh
 node --test 'test/*.test.mjs'

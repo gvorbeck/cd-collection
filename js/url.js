@@ -15,12 +15,17 @@
      phone that makes the system back gesture do the obvious thing,
      which is otherwise the roughest edge on the whole site. That
      push is made by detail.js, which owns the dialog's lifecycle.
+
+   Reading and writing the address bar is all this file does. It
+   answers questions about the URL and it fills `state` in from one;
+   it never re-renders, opens a dialog, or touches a control. The
+   handler that reacts to a Back/Forward — which does all three — is
+   in app.js, where the rest of the event wiring is, and it uses
+   stateSignature() below to decide whether the grid needs redrawing.
    ============================================================ */
 import { usingSample } from './collection.js';
 import { dom } from './dom.js';
-import { layoutTagCloud } from './render.js';
-import { openDetail, closeDetailForHistory } from './detail.js';
-import { DISCS, DEFAULT_SORT, DEFAULT_VIEW, VIEWS, state, applyFilters, syncViewControls } from './state.js';
+import { DISCS, DEFAULT_SORT, DEFAULT_VIEW, VIEWS, state } from './store.js';
 
 
 // The hash prefix for a disc deep link: "#disc-<slug>".
@@ -91,26 +96,13 @@ export function readStateFromUrl({ sortFallback = DEFAULT_SORT } = {}) {
   state.view = VIEWS.includes(view) ? view : DEFAULT_VIEW;
 }
 
-// Push the current state back out to the controls, so what's on screen always
-// matches what's in the URL (after a deep link, or a Back/Forward).
-export function syncControlsToState() {
-  dom.search.value = state.search;
-  dom.sort.value = state.sort;
-  document.querySelectorAll('.pill').forEach((pill) => {
-    const set = pill.dataset.filterType === 'genre' ? state.genres : state.tags;
-    pill.setAttribute('aria-pressed', String(set.has(pill.dataset.filterValue)));
-  });
-  // Pressed pills are wider (the ✓) and are never hidden, so both inputs to the
-  // cloud's one-line fit just changed.
-  layoutTagCloud();
-  syncViewControls();
-}
-
 /**
- * A comparable summary of everything that changes what the grid shows. Used to
- * tell "the filters moved" apart from "only the disc in the hash moved".
+ * A comparable summary of everything that changes what the grid shows. Used by
+ * app.js's popstate handler to tell "the filters moved" apart from "only the
+ * disc in the hash moved" — take it before readStateFromUrl() and again after,
+ * and compare.
  */
-function stateSignature() {
+export function stateSignature() {
   return JSON.stringify([
     state.search,
     [...state.genres].sort(),
@@ -118,32 +110,4 @@ function stateSignature() {
     state.sort,
     state.view,
   ]);
-}
-
-/**
- * Bring the page in line with the URL after a Back/Forward. Handles both
- * halves — the filter state and whether a disc dialog should be showing.
- */
-export function onPopState() {
-  const before = stateSignature();
-  readStateFromUrl();
-
-  // Opening and closing a disc are history entries too, and they move only the
-  // hash — the grid behind the dialog is unchanged. A re-render would reorder
-  // and re-reveal every card for nothing, in full view behind a dialog the user
-  // is in the middle of dismissing. Only touch the grid when the grid's own
-  // inputs actually changed.
-  if (stateSignature() !== before) {
-    syncControlsToState();
-    applyFilters({ announceResults: false });
-  }
-
-  const disc = discBySlug(discSlugFromHash());
-  if (disc) {
-    // The entry we landed on names a disc: show it (re-pointing the dialog in
-    // place if it's already open). No push — this entry already exists.
-    openDetail(disc, { pushUrl: false });
-  } else if (dom.detail.open) {
-    closeDetailForHistory();
-  }
 }

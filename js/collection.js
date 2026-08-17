@@ -45,6 +45,12 @@ export const CONFIG = {
                        which is how half the rows were jotted down
        NOUN            what one row is called on screen, singular and
                        plural, for the counts and the announcements
+       DEFAULT_SORT    the page's `selected` <option>. Has to live per
+                       source, because url.js omits the sort param when
+                       it equals the default and readStateFromUrl puts
+                       it back — one shared default would mean the
+                       wishlist writes a link that reopens in a
+                       different order than it was shared in
 
      A page picks one with `data-source` on <body>; see activeSource().
      scripts/snapshot.js walks every entry here and writes each one's
@@ -63,12 +69,17 @@ export const CONFIG = {
       SNAPSHOT_URL: 'data/collection.csv',
       TITLE_FALLBACK: 'Self-Titled',
       NOUN: ['disc', 'discs'],
+      // A shelf you browse: a different spread every visit is the point.
+      DEFAULT_SORT: 'random',
     },
     wishlist: {
       CSV_URL: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSV9mf7fFJZ25gUb2PUNWqO6y6f5KUJDApmgiiYMZ0fiFr6FELE6IC-6tbvSOj31jDZ82tazs1jdUuR/pub?gid=1921230268&single=true&output=csv',
       SNAPSHOT_URL: 'data/wishlist.csv',
       TITLE_FALLBACK: 'Any release',
       NOUN: ['record', 'records'],
+      // A list you read down, not a shelf you browse; see the note above
+      // wishlist.html's <select>.
+      DEFAULT_SORT: 'artist',
     },
   },
 
@@ -124,6 +135,15 @@ export function activeSource() {
 /** The SOURCES entry for a name (defaulting to the collection's). */
 export function sourceConfig(name = activeSource()) {
   return CONFIG.SOURCES[name] || CONFIG.SOURCES[DEFAULT_SOURCE];
+}
+
+/**
+ * The sort mode a page starts in, and the one url.js leaves out of the link.
+ * Read once at module scope by store.js — a page's source is fixed in its
+ * markup, so there's nothing to re-read later.
+ */
+export function defaultSort(name = activeSource()) {
+  return sourceConfig(name).DEFAULT_SORT;
 }
 
 /**
@@ -368,6 +388,122 @@ export function loadedFrom(name = activeSource()) {
 /** Record a source discovered elsewhere — the service worker's cached copy. */
 export function noteDataSource(source, name = activeSource()) {
   dataSourceByName.set(name, source);
+}
+
+
+/* ----------------------------------------------------------
+   What the worker said about the copy it served
+   ----------------------------------------------------------
+   These four lived in app.js and stats.js as a hand-synced pair, with a comment
+   in each asking the next editor to change both. They drifted anyway — app.js
+   was given the URL-keyed map when the wishlist arrived and stats.js was not,
+   and a cached wishlist then reported the collection's figures as saved — so
+   they are here now, which is where that comment said they belonged.
+
+   This is the shared data layer and a status line is page copy, which is the
+   objection the comment raised against moving them. It is answered by keeping
+   only the part that is *about the data* here — which sheet the worker
+   answered from cache, and when — and leaving each page the sentence it builds
+   out of that. dataSourceNotice takes the one word the two pages legitimately
+   disagree on rather than pretending they agree; refreshDataNotice is genuinely
+   different on each page and stays there.
+   ---------------------------------------------------------- */
+
+/* What the service worker said about each sheet request it served from cache,
+   keyed by the URL it was asked for.
+
+   Keyed, not single, because both pages read two sheets: the grid page loads
+   the wishlist plus the shelf to check it against, and the stats page loads the
+   collection it counts plus the wishlist that gives the tag cloud its second
+   tone. They go stale independently, and a lone value here had a cached
+   wishlist telling the page that the *collection* figures came off a saved
+   copy, over numbers that were live.
+
+   Held rather than acted on: the message lands while load() is still fetching,
+   and load() records its own source when the parse resolves, so anything
+   applied before then is overwritten a moment later. */
+const staleSheetReports = new Map();
+
+/** The worker's word about a given sheet — the page's own by default — or null. */
+export function staleReportForPage(name = activeSource()) {
+  return staleSheetReports.get(sourceConfig(name).CSV_URL) || null;
+}
+
+/**
+ * Start listening for the worker's word that it answered the sheet request out
+ * of its own cache.
+ *
+ * A cached CSV is byte-identical to a live one from this side: the fetch
+ * succeeds, the parse succeeds, and nothing about the rows says they were
+ * downloaded three weeks ago. Only the worker knows, and it says so with a
+ * { type: 'sheet-stale' } message (see sw.js). Call before load(), because the
+ * message arrives during load()'s own fetch rather than after it.
+ */
+export function listenForStaleSheet() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    const data = event.data;
+    if (!data || data.type !== 'sheet-stale') return;
+    // cachedAt is an ISO string stamped when the copy was stored, or null from
+    // a worker old enough to predate the stamp. Both are usable answers.
+    // A worker that predates the `url` field reports for whichever sheet this
+    // page is built around, which is what it meant back when there was one.
+    const key = typeof data.url === 'string' ? data.url : sourceConfig().CSV_URL;
+    staleSheetReports.set(key, {
+      cachedAt: typeof data.cachedAt === 'string' ? data.cachedAt : null,
+    });
+  });
+
+  // A ServiceWorkerContainer's message queue starts disabled and is only
+  // enabled by onmessage, startMessages(), or the window's load event. We used
+  // addEventListener and pages run this from DOMContentLoaded, which is earlier
+  // than load — so without this the worker's message can still be sitting in
+  // the queue when init() reads the reports, and the notice names the wrong
+  // source. No-op if the queue is already going.
+  navigator.serviceWorker.startMessages();
+}
+
+/**
+ * " (12 Aug 2026)" for a stamped cache entry, "" for one written before sw.js
+ * started stamping them. The notice stands either way; the date is what makes
+ * it possible to judge whether last week's shelf additions are in there.
+ */
+export function savedOn(name = activeSource()) {
+  const report = staleReportForPage(name);
+  const at = report && report.cachedAt ? new Date(report.cachedAt) : null;
+  if (!at || Number.isNaN(at.getTime())) return '';
+  return ` (${at.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })})`;
+}
+
+/**
+ * The line to show when the rows on screen didn't come from the live sheet.
+ *
+ * Two of the four DATA_SOURCES need no line at all: `sheet` is the ordinary
+ * answer, and `sample` is a dev switch someone asked for on purpose. The other
+ * two both mean "the sheet didn't answer", but they are different copies and
+ * are worded as different copies — one is this browser's own last-known-good,
+ * the other is the snapshot committed with the site.
+ *
+ * Neither line says the *sheet* is out of date, and neither may: Google's
+ * published CSV can trail the spreadsheet behind it all on its own, and nothing
+ * on this side can see that. All we honestly know is which copy we read.
+ *
+ * `verb` is the one licensed difference between the two pages — the grid is
+ * *showing* the saved copy where the stats page *counted from* it, because that
+ * is what each did with the rows. A parameter rather than two functions, so the
+ * rest of the sentence cannot drift the way it did before.
+ */
+export function dataSourceNotice(verb, name = activeSource()) {
+  const source = loadedFrom(name);
+  if (source !== DATA_SOURCES.CACHE && source !== DATA_SOURCES.SNAPSHOT) return '';
+  const copy = source === DATA_SOURCES.CACHE
+    ? `the copy saved on this device${savedOn(name)}`
+    : 'the copy published with the site';
+  // Only offer the retry when there's a connection to make it over. Offline
+  // it's advice to reload straight back into the same fallback, which is how a
+  // status line stops being worth reading.
+  const retry = navigator.onLine === false ? '' : ' Reload to try again.';
+  return `Could not reach the sheet — ${verb} ${copy}.${retry}`;
 }
 
 /**

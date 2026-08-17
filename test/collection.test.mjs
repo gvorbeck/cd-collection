@@ -26,8 +26,13 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-import { parseBarcode } from '../js/collection.js';
+import { parseBarcode, CONFIG } from '../js/collection.js';
+
+const repoFile = (name) =>
+  readFileSync(fileURLToPath(new URL(`../${name}`, import.meta.url)), 'utf8');
 
 
 describe('parseBarcode', () => {
@@ -80,5 +85,43 @@ describe('parseBarcode', () => {
     // in, and barcodeQuery in musicbrainz.js is built to ask for it both ways.
     // Rejecting it here would put that recovery out of reach.
     assert.equal(parseBarcode('75678264429'), '75678264429');
+  });
+});
+
+
+/* Two files have to agree about how a page opens: the <select> in the markup,
+   and SOURCES[…].DEFAULT_SORT here. url.js leaves the sort out of the URL when
+   it equals the default and readStateFromUrl puts it back on the way in, so a
+   disagreement isn't a cosmetic mismatch — it silently rewrites the order of
+   every link the page produces. That's how it got missed the first time: the
+   wishlist shipped with `artist` selected against one shared 'random', and
+   picking Random there wrote a link that reopened sorted by artist.
+
+   Regex rather than a DOM parser because the alternative is a dependency, and
+   this repo's whole premise is not having any. It's pinned to the one <select>
+   whose id is `sort`, so it can't drift onto some other control. */
+describe('the sort default matches the markup', () => {
+  const PAGES = { collection: 'index.html', wishlist: 'wishlist.html' };
+
+  const selectedSort = (html) => {
+    const select = html.match(/<select[^>]*\bid="sort"[^>]*>([\s\S]*?)<\/select>/);
+    assert.ok(select, 'no <select id="sort"> in the page');
+    const options = [...select[1].matchAll(/<option\s+value="([^"]*)"([^>]*)>/g)];
+    assert.ok(options.length, 'the sort <select> has no options');
+    const chosen = options.filter(([, , attrs]) => /\bselected\b/.test(attrs));
+    assert.equal(chosen.length, 1, 'exactly one option should be marked selected');
+    return chosen[0][1];
+  };
+
+  for (const [source, page] of Object.entries(PAGES)) {
+    it(`${page} opens on SOURCES.${source}.DEFAULT_SORT`, () => {
+      assert.equal(selectedSort(repoFile(page)), CONFIG.SOURCES[source].DEFAULT_SORT);
+    });
+  }
+
+  it('covers every source', () => {
+    // Adding a tab to SOURCES without a page to read it is fine; adding one
+    // with a page and forgetting this list is what this catches.
+    assert.deepEqual(Object.keys(CONFIG.SOURCES).sort(), Object.keys(PAGES).sort());
   });
 });

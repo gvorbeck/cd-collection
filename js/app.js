@@ -7,6 +7,7 @@
 
    The modules it pulls together, roughly in dependency order:
 
+     errors.js      the global error reporter (imported first, on purpose)
      collection.js  the sheet: fetch, parse, disc objects (shared)
      musicbrainz.js the MB web service + its 1/sec throttle (shared)
      config.js      presentation settings
@@ -15,15 +16,29 @@
      cover.js       generated placeholder covers
      art.js         cover-art and tracklist lookup, cached
      dom.js         the element cache
-     render.js      stats card, pills, the grid itself
-     detail.js      the disc dialog and its history entry
-     state.js       the discs, the filters, sort/view/export
+     store.js       the discs and the current filter state, as data
      url.js         filter state and deep links in the address bar
+     render.js      stats card, pills, the grid itself
+     controls.js    pushing that state back out to the widgets
+     state.js       acting on it: filter, sort, view, export, shuffle
+     detail.js      the disc dialog and its history entry
+
+   That list is a real order — the graph has no cycles in it, and
+   test/imports.test.mjs fails the build if one appears. Which is
+   less pedantic than it sounds: a cycle here doesn't break at build
+   time, it breaks at load time, as a temporal-dead-zone error
+   pointing at a line with nothing wrong on it.
    ============================================================ */
+// First, and deliberately so: errors.js installs the global error and
+// unhandled-rejection handlers as it evaluates, and a module's imports are
+// evaluated before the module's own body. Registering from inside init() would
+// be too late to catch a throw from any module below this line. See errors.js.
+import { reportFatal } from './errors.js';
 import { CONFIG } from './config.js';
 import {
   load, loadedFrom, noteDataSource, DATA_SOURCES, registerServiceWorker,
-  activeSource, sourceConfig, noun,
+  activeSource, noun,
+  staleReportForPage, listenForStaleSheet, dataSourceNotice,
 } from './collection.js';
 import { markOwnership } from './owned.js';
 import { wireShopCheck, staleWishlistNote } from './shop.js';
@@ -31,19 +46,61 @@ import { $, isHex6, cssVar } from './util.js';
 import { hexToRgb, setPaperRgb } from './color.js';
 import { repaintPlaceholders } from './cover.js';
 import { dom, cacheDom } from './dom.js';
-import { announce, renderStats, renderPills, layoutTagCloud, enableDragScroll, repointCardImages } from './render.js';
-import { openDetail, dismissDetail, onDetailClosed, makeLabelForCurrentDisc } from './detail.js';
+import { announce, renderStats, renderPills, layoutTagCloud, enableDragScroll, repointCardImages, setCardOpener } from './render.js';
+import { openDetail, dismissDetail, onDetailClosed, closeDetailForHistory, makeLabelForCurrentDisc } from './detail.js';
+import { DISCS, state } from './store.js';
+import { syncControlsToState, syncViewControls } from './controls.js';
 import {
-  DISCS, state, applyFilters, togglePill, clearAllFilters,
-  setView, syncViewControls, exportCurrentCsv, shuffle,
+  applyFilters, togglePill, clearAllFilters,
+  setView, exportCurrentCsv, shuffle,
 } from './state.js';
 import {
-  discSlugFromHash, discBySlug, syncUrl, readStateFromUrl,
-  syncControlsToState, onPopState,
+  discSlugFromHash, discBySlug, syncUrl, readStateFromUrl, stateSignature,
 } from './url.js';
 
 
+/**
+ * Bring the page in line with the URL after a Back/Forward. Handles both
+ * halves — the filter state and whether a disc dialog should be showing.
+ *
+ * Here rather than in url.js because it is the one thing in that area that
+ * isn't about the address bar: it re-renders the grid, resets the controls and
+ * opens or closes the dialog. Doing all that from url.js meant url.js imported
+ * render.js, detail.js and state.js, which is three of the four edges that made
+ * those modules a cycle.
+ */
+function onPopState() {
+  const before = stateSignature();
+  readStateFromUrl();
+
+  // Opening and closing a disc are history entries too, and they move only the
+  // hash — the grid behind the dialog is unchanged. A re-render would reorder
+  // and re-reveal every card for nothing, in full view behind a dialog the user
+  // is in the middle of dismissing. Only touch the grid when the grid's own
+  // inputs actually changed.
+  if (stateSignature() !== before) {
+    syncControlsToState();
+    applyFilters({ announceResults: false });
+  }
+
+  const disc = discBySlug(discSlugFromHash());
+  if (disc) {
+    // The entry we landed on names a disc: show it (re-pointing the dialog in
+    // place if it's already open). No push — this history entry already exists.
+    openDetail(disc, { pushUrl: false });
+  } else if (dom.detail.open) {
+    closeDetailForHistory();
+  }
+}
+
+
 function wireEvents() {
+  // What a click on a card means. render.js builds the cards and attaches the
+  // listener, but it is deliberately not told what opening one does — see
+  // setCardOpener there. Registered before anything can be clicked, and before
+  // the first render, since shuffle goes through the same door.
+  setCardOpener(openDetail);
+
   // Search (debounced lightly so typing feels smooth).
   let searchTimer;
   dom.search.addEventListener('input', (e) => {
@@ -137,90 +194,15 @@ function hydrateThemeConstants() {
 
 /* ----------------------------------------------------------
    Where these discs came from
+   ----------------------------------------------------------
+   The machinery — which sheet the worker answered out of its cache, when that
+   copy was saved, and the sentence describing it — lives in collection.js now,
+   shared with stats.js. It used to be duplicated across the two files behind a
+   comment asking the next editor to change both copies, and they drifted anyway.
+
+   What stays here is the half that really is this page's own: where the notice
+   goes, and how it gets announced.
    ---------------------------------------------------------- */
-
-// What the service worker said about each sheet request it served from cache,
-// keyed by the URL it was asked for — this page may fetch two (its own tab, and
-// on the wishlist the shelf it checks against), and they can go stale
-// separately. Held rather than acted on: the message lands while load() is still
-// fetching, and load() records its own source when the parse resolves, so
-// anything applied before then is overwritten a moment later.
-const staleSheetReports = new Map();
-
-// The worker's word about the sheet THIS page is built around, or null.
-function staleReportForPage() {
-  return staleSheetReports.get(sourceConfig().CSV_URL) || null;
-}
-
-/**
- * Start listening for the worker's word that it answered the sheet request out
- * of its own cache.
- *
- * A cached CSV is byte-identical to a live one from this side: the fetch
- * succeeds, the parse succeeds, and nothing about the discs says they were
- * downloaded three weeks ago. Only the worker knows, and it says so with a
- * { type: 'sheet-stale' } message (see sw.js). Called before load(), because
- * the message arrives during load()'s own fetch rather than after it.
- */
-function listenForStaleSheet() {
-  if (!('serviceWorker' in navigator)) return;
-  navigator.serviceWorker.addEventListener('message', (event) => {
-    const data = event.data;
-    if (!data || data.type !== 'sheet-stale') return;
-    // cachedAt is an ISO string stamped when the copy was stored, or null from
-    // a worker old enough to predate the stamp. Both are usable answers.
-    // A worker that predates the `url` field reports for whichever sheet this
-    // page is built around, which is what it meant back when there was one.
-    const key = typeof data.url === 'string' ? data.url : sourceConfig().CSV_URL;
-    staleSheetReports.set(key, {
-      cachedAt: typeof data.cachedAt === 'string' ? data.cachedAt : null,
-    });
-  });
-
-  // A ServiceWorkerContainer's message queue starts disabled and is only
-  // enabled by onmessage, startMessages(), or the window's load event. We used
-  // addEventListener and we run from DOMContentLoaded, which is earlier than
-  // load — so without this the worker's message can still be sitting in the
-  // queue when init() reads staleSheetReports, and the notice reports the wrong
-  // source. No-op if the queue is already going.
-  navigator.serviceWorker.startMessages();
-}
-
-/**
- * The line to show when the discs on screen didn't come from the live sheet.
- *
- * Two of the four DATA_SOURCES need no line at all: `sheet` is the ordinary
- * answer, and `sample` is a dev switch someone asked for on purpose. The other
- * two both mean "the sheet didn't answer", but they are different copies and
- * are worded as different copies — one is this browser's own last-known-good,
- * the other is the snapshot committed with the site.
- *
- * Neither line says the *sheet* is out of date, and neither may: Google's
- * published CSV can trail the spreadsheet behind it all on its own, and nothing
- * on this side can see that. All we honestly know is which copy we read.
- */
-function dataSourceNotice() {
-  const source = loadedFrom();
-  if (source !== DATA_SOURCES.CACHE && source !== DATA_SOURCES.SNAPSHOT) return '';
-  const copy = source === DATA_SOURCES.CACHE
-    ? `the copy saved on this device${savedOn()}`
-    : 'the copy published with the site';
-  // Only offer the retry when there's a connection to make it over. Offline
-  // it's advice to reload straight back into the same fallback, which is how a
-  // status line stops being worth reading.
-  const retry = navigator.onLine === false ? '' : ' Reload to try again.';
-  return `Could not reach the sheet — showing ${copy}.${retry}`;
-}
-
-// " (12 Aug 2026)" for a stamped cache entry, "" for one written before sw.js
-// started stamping them. The notice stands either way; the date is what makes
-// it possible to judge whether last week's shelf additions are in there.
-function savedOn() {
-  const report = staleReportForPage();
-  const at = report && report.cachedAt ? new Date(report.cachedAt) : null;
-  if (!at || Number.isNaN(at.getTime())) return '';
-  return ` (${at.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })})`;
-}
 
 /**
  * Put that line in #stale-notice, or take it back out. Returns it so the caller
@@ -238,7 +220,9 @@ function refreshDataNotice() {
   // still carrying the loading line or the error, and a note about which copy
   // we read would only crowd the more urgent thing the page is already saying.
   if (!loadedFrom()) return '';
-  const notice = dataSourceNotice();
+  // "showing" — this page is displaying the saved copy. stats.js passes
+  // "counted from" for the same sentence; see dataSourceNotice in collection.js.
+  const notice = dataSourceNotice('showing');
   // Looked up rather than assumed: markup is cached and revalidated separately
   // from the module that reads it, and a null dereference here would be caught
   // by init()'s catch and report a failed load for a collection that loaded
@@ -253,20 +237,45 @@ function refreshDataNotice() {
 
 
 async function init() {
+  // Outside both try blocks below, and safe there: cacheDom() only ever calls
+  // getElementById, which answers null rather than throwing, and activeSource()
+  // reads a dataset attribute off <body>. Neither can fail, and the catches
+  // need what they produce — dom.stateMsg to write into, and the page name to
+  // write about.
   cacheDom();
-  hydrateThemeConstants();
-  // The URL wins — an explicit link beats anything the browser remembers. But
-  // a URL with no ?sort is silent rather than opinionated, so a select the
-  // browser restored across a reload stands in as the fallback.
-  readStateFromUrl({ sortFallback: dom.sort.value });
-  dom.sort.value = state.sort;
-  syncViewControls();
-  dom.search.value = state.search;
-  wireEvents();
-  registerServiceWorker();
-  listenForStaleSheet();
-
   const page = activeSource();
+
+  /* Wiring.
+
+     Every line here is synchronous DOM work against the 26 ids dom.js just
+     looked up, and the failure mode is a null dereference: rename an id in the
+     markup without renaming it in dom.js — or add a page that hasn't got one of
+     them — and `dom.something.addEventListener` throws.
+
+     It needs a catch of its own because init() is async and nothing awaits it,
+     so before this existed such a throw became an unhandled rejection: no error
+     state, no console entry anyone was watching, and a page left sitting on
+     "Loading the collection…" for good. It gets a different message from the
+     load below because it is a different failure — the sheet is not implicated
+     and "try again later" would be false comfort. */
+  try {
+    hydrateThemeConstants();
+    // The URL wins — an explicit link beats anything the browser remembers. But
+    // a URL with no ?sort is silent rather than opinionated, so a select the
+    // browser restored across a reload stands in as the fallback.
+    readStateFromUrl({ sortFallback: dom.sort.value });
+    dom.sort.value = state.sort;
+    syncViewControls();
+    dom.search.value = state.search;
+    wireEvents();
+    registerServiceWorker();
+    listenForStaleSheet();
+  } catch (err) {
+    console.error(`Failed to start up ${page}:`, err);
+    reportFatal('This page did not start up correctly. Reloading may help.');
+    return;
+  }
+
   const wantsShelfCheck = page === 'wishlist';
 
   try {
@@ -400,10 +409,17 @@ async function init() {
   } catch (err) {
     console.error(`Failed to load ${page}:`, err);
     const message = `Could not load the ${page === 'wishlist' ? 'wishlist' : 'collection'}. Please try again later.`;
-    dom.stateMsg.hidden = false;
-    dom.stateMsg.classList.add('is-error');
-    dom.stateMsg.textContent = message;
-    announce(message);
+    // Guarded, because this catch is also what runs when the throw above *was*
+    // a missing #state-msg. Writing the report into the element whose absence
+    // caused the report is how a handled error becomes an unhandled one.
+    if (dom.stateMsg) {
+      dom.stateMsg.hidden = false;
+      dom.stateMsg.classList.add('is-error');
+      dom.stateMsg.textContent = message;
+      announce(message);
+    } else {
+      reportFatal(message);
+    }
   }
 }
 
