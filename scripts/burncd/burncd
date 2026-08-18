@@ -84,6 +84,13 @@ free_bytes() { df -k "$1" 2>/dev/null | awk 'NR == 2 { print $4 * 1024; exit }';
 
 file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
 
+# Quiet match on a pipe. Not `grep -q`: that exits at the first match and closes
+# the pipe, and under `set -o pipefail` the SIGPIPE that kills the writer fails
+# the whole test — so a capability that is present reads as absent, depending on
+# whether the writer happened to finish first. Reading to EOF is the difference
+# between a check that works and one that lies.
+qgrep() { grep "$@" >/dev/null; }
+
 # Env values reach arithmetic contexts, so reject junk before it becomes a
 # confusing shell error mid-burn.
 numeric() {
@@ -173,14 +180,14 @@ run_check() {
   # Dither is not ffmpeg's default; confirm the filter accepts our request,
   # otherwise hi-res sources get truncated to 16-bit instead of dithered.
   if command -v ffmpeg >/dev/null; then
-    if ffmpeg -hide_banner -h filter=aresample 2>/dev/null | grep -q dither_method; then
+    if ffmpeg -hide_banner -h filter=aresample 2>/dev/null | qgrep dither_method; then
       ck ok "dither support" "triangular dither available"
     else
       ck warn "dither support" "no dither_method; 24-bit sources will truncate"
     fi
 
     # --level measures with ebur128 and applies the result with volume.
-    if ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' ebur128 '; then
+    if ffmpeg -hide_banner -filters 2>/dev/null | qgrep ' ebur128 '; then
       ck ok "loudness" "ebur128 present — --level can measure"
     else
       ck warn "loudness" "no ebur128 filter; --level unavailable"
@@ -193,8 +200,8 @@ run_check() {
 
     # CD-Text is written from a cue sheet, so this build needs both options.
     helptext=$(cdrecord -help 2>&1 || true)
-    if printf '%s' "$helptext" | grep -q 'cuefile' \
-       && printf '%s' "$helptext" | grep -q '\-text'; then
+    if printf '%s' "$helptext" | qgrep 'cuefile' \
+       && printf '%s' "$helptext" | qgrep '\-text'; then
       ck ok "cue + CD-Text" "cdrecord supports cuefile= and -text"
     else
       ck warn "cue + CD-Text" "this build lacks cuefile=/-text; use --no-cdtext"
@@ -218,7 +225,7 @@ run_check() {
       # The drive itself has to be willing to write CD-Text. Most are; the
       # cheap bus-powered ones are worth confirming before you buy discs.
       caps=$(cdrecord -prcap dev="$DEV" 2>/dev/null || true)
-      if printf '%s' "$caps" | grep -qi 'CD-Text'; then
+      if printf '%s' "$caps" | qgrep -i 'CD-Text'; then
         ck ok "drive CD-Text" \
           "$(printf '%s' "$caps" | grep -i 'CD-Text' | head -1 | sed 's/^ *//' | cut -c1-46)"
       else
@@ -227,7 +234,7 @@ run_check() {
 
       # --dummy rehearses a burn with the write laser off. Not every drive
       # can do it, and the ones that can't say so here rather than mid-burn.
-      if printf '%s' "$caps" | grep -qi 'test writing'; then
+      if printf '%s' "$caps" | qgrep -i 'test writing'; then
         ck ok "drive --dummy" "$(printf '%s' "$caps" | grep -i 'test writing' | head -1 | sed 's/^ *//' | cut -c1-46)"
       else
         ck warn "drive --dummy" "drive does not advertise test writing; --dummy may fail"
@@ -241,7 +248,7 @@ run_check() {
     dstat=$(drutil status 2>/dev/null || true)
     if [ -z "$dstat" ]; then
       ck warn "media" "no optical drive visible to drutil"
-    elif printf '%s' "$dstat" | grep -qi 'no media'; then
+    elif printf '%s' "$dstat" | qgrep -i 'no media'; then
       ck warn "media" "drive found, no disc inserted"
     else
       mtype=$(printf '%s' "$dstat" | awk -F: '/Type:/ { gsub(/^ +/, "", $2); print $2; exit }')
@@ -1220,7 +1227,7 @@ verify_disc() {  # verify_disc <disc-number> <expected-track-count>
     if [ "$CDTEXT" -eq 1 ] && [ -n "$ALBUM" ]; then
       # Best effort: -J asks for information only. If the field does not come
       # back that is not proof it is missing, so this never fails the disc.
-      if cdda2wav dev="$DEV" -J -v titles 2>&1 | grep -qF "$ALBUM"; then
+      if cdda2wav dev="$DEV" -J -v titles 2>&1 | qgrep -F "$ALBUM"; then
         printf '    \033[32m✓\033[0m CD-Text — album title reads back\n'
       else
         printf '    \033[33m!\033[0m CD-Text — could not read it back; check on a player\n'

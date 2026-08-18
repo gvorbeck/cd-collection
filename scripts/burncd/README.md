@@ -49,6 +49,7 @@ line for each:
   ✓  ffmpeg               ffmpeg version 8.1.2
   ✓  ffprobe              present
   ✓  dither support       triangular dither available
+  ✓  loudness             ebur128 present — --level can measure
   ✓  cdrecord             Cdrecord 3.02a09
   ✓  cue + CD-Text        cdrecord supports cuefile= and -text
   ✓  cdda2wav             present — --verify can read discs back
