@@ -1,0 +1,363 @@
+# burncd
+
+Burn a folder of music to an audio CD from the command line. No playlists, no
+dragging files into Music.app, no thinking about disc formats.
+
+```bash
+burncd ~/Music/Nonagon\ Infinity
+```
+
+That's the whole thing. It reads the folder, works out the track order, shows
+you the plan, asks once, and burns — gapless, with CD-Text.
+
+---
+
+## Setup on a new machine
+
+Two dependencies:
+
+```bash
+brew install ffmpeg cdrtools
+```
+
+Then put the script on your PATH:
+
+```bash
+ln -s ~/Sites/cd-collection/scripts/burncd/burncd /usr/local/bin/burncd
+```
+
+Adjust that path if the repo lives somewhere else. Then confirm the machine is
+actually ready:
+
+```bash
+burncd --check
+```
+
+You also need a USB optical drive — no Mac has had a built-in burner in years.
+
+---
+
+## Run this first: `--check`
+
+`--check` is the thing to run on the burn machine before you spend a disc. It
+looks at the parts that vary from machine to machine and prints a pass/warn/fail
+line for each:
+
+```
+  burncd health check
+
+  ✓  ffmpeg               ffmpeg version 8.1.2
+  ✓  ffprobe              present
+  ✓  dither support       triangular dither available
+  ✓  cdrecord             Cdrecord 3.02a09
+  ✓  cue + CD-Text        cdrecord supports cuefile= and -text
+  ✓  cdda2wav             present — --verify can read discs back
+  ✓  drive                cdrecord can open dev=IOCompactDiscServices
+  ✓  drive CD-Text        Does write CD-Text
+  ✓  drive --dummy        Does support test writing
+  ✓  media                blank CD-R ready
+  ✓  scratch space        54.1 GB free in /var/folders/...
+  ✓  terminal             UTF-8 locale, progress bar will render
+
+  Ready to burn.
+```
+
+It exits non-zero if anything is a hard failure, so it works in a script too.
+Warnings are usually fine — "no disc inserted" just means you haven't put one in
+yet.
+
+### The three rehearsals, in order
+
+They do different things and none of them replaces another:
+
+| | Touches the audio | Touches the drive | Uses a disc |
+| --- | --- | --- | --- |
+| `--check` | no | yes — opens it, reads its capabilities and the media | no |
+| `--demo` | yes — converts, builds the real image and cue | no | no |
+| `--dummy` | yes | yes — a complete burn with the write laser off | no, the blank survives |
+
+So: `--check` proves the hardware and tooling are there. `--demo` proves the
+*output* is right — it prints the generated cue sheet so you can read the CD-Text
+before anyone burns it. `--dummy` proves the drive actually accepts that cue
+sheet and CD-Text, by doing the entire burn for real minus the laser.
+
+```bash
+burncd --check
+burncd --demo  ~/Music/Album
+burncd --dummy ~/Music/Album
+burncd         ~/Music/Album
+```
+
+`--dummy` leaves the disc in the drive rather than ejecting it, so the real burn
+is the next command with no shuffling. Not every drive supports test writing;
+`--check` says whether yours advertises it.
+
+### `--verify`
+
+After the burn, reads the disc back and reports whether it is sound:
+
+```
+  ✓ Disc 1 of 1 written
+  Verifying disc 1...
+    ✓ table of contents — 12 tracks
+    ✓ full read — every sector came back
+    ✓ CD-Text — album title reads back
+  ✓ Disc 1 verified
+```
+
+It deliberately does **not** compare the disc byte-for-byte against the image.
+Every drive reads audio back at a small fixed sample offset from where it wrote
+it, so an exact compare reports a mismatch on a perfectly good disc — which is
+the same false alarm this flag exists to settle. It checks the things that
+actually go wrong instead: the table of contents, whether every sector can be
+read back without error, and whether the CD-Text survived.
+
+The full read needs `cdda2wav` (it comes with cdrtools). Without it you still get
+the TOC check, and `--check` says so. Verification roughly doubles the time per
+disc, which is why it is opt-in. If any disc fails, burncd exits non-zero and
+names it in the summary.
+
+---
+
+## Usage
+
+| Command | What it does |
+| --- | --- |
+| `burncd --check` | Verify this machine can burn. Run first on a new setup. |
+| `burncd DIR` | Burn the folder |
+| `burncd -n DIR` | Dry run — print the plan, burn nothing |
+| `burncd --demo DIR` | Convert for real, show the cue sheet, simulate the burn |
+| `burncd --dummy DIR` | Rehearse the burn on the drive with the laser off |
+| `burncd --verify DIR` | Burn, then read the disc back and check it |
+| `burncd --split-long DIR` | Allow cutting a track that's longer than a disc |
+| `burncd --no-cdtext DIR` | Burn without CD-Text (fallback if the drive balks) |
+| `burncd --from-disc 3 DIR` | Resume a multi-disc job at disc 3 |
+| `burncd --help` | Usage |
+
+`-n` is worth using the first time on any album. It costs nothing and shows you
+exactly what would land on which disc.
+
+### Environment overrides
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `BURNCD_SPEED` | `8` | Burn speed. Lower is safer on cheap media. |
+| `BURNCD_DEV` | `IOCompactDiscServices` | cdrecord device. See troubleshooting. |
+| `BURNCD_SECONDS` | `4797` | Disc capacity. 4797 = 79:57, see below. |
+| `BURNCD_MINUTES` | — | Same thing in whole minutes, if you prefer. |
+
+### Why 79:57 and not 80:00
+
+A blank sold as "80 minute / 700 MB" holds **79:57** — 359,849 sectors at 75 per
+second. The 80 on the packaging is rounding. Track lengths are rounded *up* when
+read, so aiming at the true figure is safe rather than optimistic.
+
+If you use 90-minute blanks, `BURNCD_MINUTES=89`. Overburning past the rated
+capacity is not attempted.
+
+```bash
+BURNCD_SPEED=4 burncd ~/Music/Album
+```
+
+---
+
+## What it handles for you
+
+**Any format.** aiff, flac, mp3, ogg, opus, m4a, wav, ape — anything ffmpeg
+reads. Mixed formats in one folder is fine. Everything is converted to
+16-bit/44.1kHz stereo, which is what a CD actually stores. Hi-res sources get
+**triangular dither** on the way down to 16-bit — ffmpeg does not dither by
+default, it truncates, so this is set explicitly.
+
+**Track order from metadata, not filenames.** It reads the embedded track
+number tag, so files named `aaa-random.mp3` and `zzz-whatever.flac` still come
+out in album order. Multi-disc source folders sort by disc number first. If some
+files have no track tag, those fall back to a natural filename sort and the plan
+tells you it did that — check the order before confirming.
+
+**CD-Text.** Album title, album artist, and per-track titles and artists are
+written into the disc's lead-in, so a car stereo or CD player that supports
+CD-Text shows names instead of "Track 01". This comes from the same tags used for
+ordering, so if the files are tagged you get it for free. CD-Text lives in a small
+area of the lead-in; if an album's metadata is too big for it, per-track artists
+are dropped automatically and you're told. `--no-cdtext` turns it off entirely.
+
+**No gaps between tracks.** Each disc is assembled as one continuous
+sector-aligned image and written disc-at-once, with track boundaries as index
+marks rather than separate writes. Albums that segue between tracks stay
+seamless. This is the default, not a flag.
+
+**Splitting across discs.** Anything that won't fit on one disc is split across
+as many as it needs — two, five, however many. The split is *balanced*, so a
+128-minute set becomes 60 + 68 rather than 79 + 49, and album order is always
+preserved. It ejects each disc, asks for the next, and continues.
+
+A CD also cannot hold more than **99 tracks** regardless of runtime, so a
+105-track folder splits even if it's only nine minutes long. The plan tells you
+which limit caused the split.
+
+**Tracks longer than a whole disc.** A 90-minute live set or DJ mix is one file
+that cannot fit on any CD. By default burncd refuses and tells you. Pass
+`--split-long` and it cuts the track into equal parts across discs — a 95-minute
+file becomes two 47:30 parts rather than 79:57 plus a 15-minute stub. The parts
+are labelled `Title (part 1/2)` in the plan and in CD-Text. The cut is sample-
+exact and contiguous: nothing is lost or duplicated, but the music does stop at
+the disc change, because that is what a disc change is.
+
+**Not running out of room.** Before converting each disc it checks that the temp
+filesystem can hold the image — roughly 10 MB per minute of audio, about 800 MB
+for a full disc — and stops with a clear message rather than dying at 90%. Set
+`TMPDIR` to a roomier volume if your boot disk is tight.
+
+---
+
+## What it looks like
+
+### The plan
+
+Printed before anything is burned, and the only thing `-n` does:
+
+```
+  Nonagon Infinity — King Gizzard
+  12 tracks, 41:38, ordered by embedded track numbers
+  CD-Text: on — disc and track names written to the lead-in
+
+    1. Robot Stop                                             3:30
+    2. Big Fig Wasp                                           3:10
+    ...
+   12. Road Train                                             4:12
+                                                             41:38
+  ███████████████████████·······················  41:38 of 79:57
+```
+
+The bar under each disc is that disc filling up. Each block is real time on the
+disc and the shade steps between tracks, so you can see at a glance both how full
+the disc is and where the tracks divide it — which is the thing you actually want
+to look at on a multi-disc split, where every disc gets its own listing and its
+own bar.
+
+### Burning
+
+```
+             █
+       █████████████        Burning disc 1 of 2
+     █████████████████
+   █████████████████████    ███████████████░░░░░░░░░░░  58%
+   ████████     ████████    track 3 of 4
+  ████████       ████████   128 of 220 MB at 8.0x
+   ████████     ████████    buffer 97%   ETA 0:02
+   █████████████████████
+     █████████████████      ▰▰▰▱
+       █████████████
+             █
+```
+
+That's a disc filling in from the hub outward, which is the direction a CD is
+actually written. Only the shape survives being pasted into a README — in a real
+terminal the same cells are colored: the unwritten outer area is dim grey, the
+leading edge is a bright white ring, and everything behind it is teal. At 58% the
+ring above would be sitting a little past the middle. The fill is area-
+proportional rather than radial, so the ring visibly slows as it nears the rim,
+which is also what a real burn does.
+
+The pips are tracks: filled ones are written, the bright one is in progress.
+
+In a terminal narrower than 62 columns it falls back to a compact four-line
+readout, and when output is piped to a file it prints plain one-line-per-track
+progress instead of redrawing anything.
+
+### When it's done
+
+```
+  ✓ Disc 2 of 2 written
+
+  Nonagon Infinity
+  2 discs of 2 · 78:10 of audio · 6:41 elapsed
+
+  disc 1   ██████████████████████████····················  46:12 of 79:57
+  disc 2   ██████████████████····························  31:58 of 79:57
+```
+
+Same bars as the plan, so you can see what actually landed on each disc without
+scrolling back up. `--from-disc` reruns show only the discs they burned.
+
+Run `burncd --demo` on any folder to see all of this without a disc in the drive.
+
+---
+
+## Troubleshooting
+
+**`cdrecord not found`** — `brew install cdrtools`.
+
+**cdrecord can't find the drive.** List what it sees:
+
+```bash
+cdrecord -scanbus
+```
+
+Then pass the device explicitly:
+
+```bash
+BURNCD_DEV=/dev/disk4 burncd ~/Music/Album
+```
+
+This is the one thing that occasionally needs adjusting on a new machine.
+Once you know the right value, put it in your shell profile and forget it.
+
+**The burn failed and mentioned CD-Text or the cue sheet.** Some drives and some
+cdrecord builds don't handle it. `burncd --check` says which of the two is the
+problem. Either way:
+
+```bash
+burncd --no-cdtext ~/Music/Album
+```
+
+That falls back to burning without names in the lead-in. Everything else —
+gapless, ordering, splitting — is unchanged. To find out which it is without
+spending discs, run the same album with `--dummy` twice, once each way.
+
+**A disc failed partway through a multi-disc job.** Don't restart from disc 1:
+
+```bash
+burncd --from-disc 3 ~/Music/Album
+```
+
+The split is deterministic, so disc 3 contains the same tracks it would have the
+first time.
+
+**Track order looks wrong.** The files are probably missing track number tags.
+The dry run says `ordered by filename` when that happens. Fix the tags in a
+tagger, or rename the files so a natural sort gives the right order.
+
+**"longer than a disc"** — one file is longer than 79:57. Use `--split-long` to
+cut it across discs, or split the file yourself first if you want to choose where
+the break lands.
+
+**Music.app said the burn failed but the disc plays fine.** That's Music.app's
+post-burn *verification* read, not the burn. Cheap bus-powered USB drives are
+often worse at reading a disc than at writing one, and some report an error while
+closing the session even when the audio is intact. burncd reports cdrecord's own
+exit status and prints its actual output, which tells you something real instead
+of a generic dialog. `--verify` settles it either way: it re-reads the finished
+disc and tells you whether the audio and the CD-Text are actually there.
+
+If it does fail for real, drop the speed:
+
+```bash
+BURNCD_SPEED=4 burncd ~/Music/Album
+```
+
+Bus-powered USB drives are also prone to browning out near the end of a burn.
+If failures cluster at the end, use a powered hub or the drive's second USB leg.
+
+---
+
+## Notes
+
+Burn speed defaults to 8x rather than maximum, which generally gives lower error
+rates on cheap media. Verbatim AZO is the reliable blank these days — Taiyo Yuden
+no longer manufactures, so anything sold under that name is a different factory.
+
+Keep the purchased lossless files as the real archive. CD-R dye degrades in a way
+pressed discs don't, so treat the burned disc as the playback copy, not the
+master.

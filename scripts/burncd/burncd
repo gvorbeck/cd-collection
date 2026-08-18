@@ -1,0 +1,974 @@
+#!/usr/bin/env bash
+#
+# burncd — burn a directory of audio files to an audio CD.
+#
+#   burncd --check                 check this machine is ready to burn
+#   burncd ~/Music/Album           burn it
+#   burncd -n ~/Music/Album        dry run: show the plan, burn nothing
+#   burncd --dummy ~/Music/Album   rehearse the burn with the laser off
+#   burncd --verify ~/Music/Album  read the disc back afterwards and check it
+#   burncd --split-long ~/Music/X  cut tracks longer than a disc into parts
+#   burncd --no-cdtext ~/Music/X   burn without CD-Text (fallback path)
+#   burncd --from-disc 3 ~/Music/X resume a multi-disc job at disc 3
+#   burncd --demo ~/Music/Album    build everything and simulate the burn
+#
+# Takes aiff, flac, mp3, ogg, wav, m4a, opus — anything ffmpeg reads.
+# Track order comes from embedded metadata, not filenames. Audio is converted
+# to 16-bit/44.1kHz stereo and written disc-at-once, so there are no gaps
+# between tracks. Album, artist and track titles are written as CD-Text. Sets
+# too long for one disc are split across as many as it takes, balanced so the
+# last disc is not a stub.
+#
+# Env overrides:
+#   BURNCD_SPEED   burn speed (default 8)
+#   BURNCD_DEV     cdrecord device (default IOCompactDiscServices)
+#   BURNCD_SECONDS disc capacity in seconds (default 4797 = 79:57, a real 80min blank)
+#   BURNCD_MINUTES same, in whole minutes, if you prefer
+
+set -euo pipefail
+
+SPEED="${BURNCD_SPEED:-8}"
+DEV="${BURNCD_DEV:-IOCompactDiscServices}"
+DRY_RUN=0
+DEMO=0
+CHECK=0
+SPLIT_LONG=0
+CDTEXT=1
+DUMMY=0
+VERIFY=0
+FROM=1
+
+BAR_WIDTH=42
+STRIP_WIDTH=46
+DISC_ROWS=11           # the burning-disc animation, in terminal cells
+DISC_COLS=23           # ~2x rows, because cells are about twice as tall as wide
+MAX_TRACKS=99          # Red Book hard limit: a CD cannot hold more than 99 tracks.
+SECTOR=2352            # bytes per CD audio sector: 588 stereo 16-bit samples
+BYTES_PER_SEC=176400   # 44100 Hz * 2 channels * 2 bytes
+CDTEXT_BUDGET=3800     # rough byte ceiling for CD-Text packs in the lead-in
+
+die() { printf '\nburncd: %s\n' "$1" >&2; exit 1; }
+
+usage() {
+  awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
+  exit "${1:-0}"
+}
+
+# Seconds -> M:SS
+mmss() { printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
+
+# Sectors -> MM:SS:FF, the addressing a cue sheet uses (75 frames per second).
+msf() { printf '%02d:%02d:%02d' $(( $1 / 4500 )) $(( $1 % 4500 / 75 )) $(( $1 % 75 )); }
+
+human() { awk -v b="$1" 'BEGIN { printf "%.1f GB", b / 1073741824 }'; }
+
+# Free space, in bytes, on the filesystem holding $1.
+free_bytes() { df -k "$1" 2>/dev/null | awk 'NR == 2 { print $4 * 1024; exit }'; }
+
+# Env values reach arithmetic contexts, so reject junk before it becomes a
+# confusing shell error mid-burn.
+numeric() {
+  case "$2" in ''|*[!0-9]*) die "$1 must be a whole number, got: $2" ;; esac
+}
+numeric BURNCD_SPEED "$SPEED"
+
+# A blank sold as "80 minute" / 700 MB actually holds 79:57 — 359,849 sectors
+# at 75 per second. 80:00 is rounding on the packaging, not real capacity.
+# Track lengths are rounded up when read, so aiming at the true figure is safe.
+if [ -n "${BURNCD_SECONDS:-}" ]; then
+  numeric BURNCD_SECONDS "$BURNCD_SECONDS"; CAPACITY=$BURNCD_SECONDS
+elif [ -n "${BURNCD_MINUTES:-}" ]; then
+  numeric BURNCD_MINUTES "$BURNCD_MINUTES"; CAPACITY=$(( BURNCD_MINUTES * 60 ))
+else
+  CAPACITY=4797
+fi
+
+DISC_BYTES=$(( CAPACITY * BYTES_PER_SEC ))
+
+# ---------------------------------------------------------------- arguments --
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run)   DRY_RUN=1 ;;
+    --demo)         DEMO=1 ;;
+    --check)        CHECK=1 ;;
+    --split-long)   SPLIT_LONG=1 ;;
+    --no-cdtext)    CDTEXT=0 ;;
+    --dummy)        DUMMY=1 ;;
+    --verify)       VERIFY=1 ;;
+    --from-disc)    shift; FROM="${1:-}"
+                    case "$FROM" in ''|*[!0-9]*|0) die "--from-disc needs a disc number" ;; esac ;;
+    -h|--help)      usage 0 ;;
+    -*)             die "unknown option: $1" ;;
+    *)              [ -z "${DIR:-}" ] || die "only one directory at a time"; DIR="$1" ;;
+  esac
+  shift
+done
+
+# ------------------------------------------------------------- health check --
+
+CHECK_FAIL=0
+CHECK_WARN=0
+
+ck() {   # ck <ok|warn|fail> <label> <detail>
+  case "$1" in
+    ok)   printf '  \033[32m✓\033[0m  %-20s %s\n' "$2" "$3" ;;
+    warn) printf '  \033[33m!\033[0m  %-20s %s\n' "$2" "$3"; CHECK_WARN=1 ;;
+    fail) printf '  \033[31m✗\033[0m  %-20s %s\n' "$2" "$3"; CHECK_FAIL=1 ;;
+  esac
+}
+
+run_check() {
+  local dstat mtype blank tmpdir avail need caps helptext
+
+  printf '\n  \033[1mburncd health check\033[0m\n\n'
+
+  # --- converters -----------------------------------------------------------
+  if command -v ffmpeg >/dev/null; then
+    ck ok "ffmpeg" "$(ffmpeg -version 2>/dev/null | head -1 | cut -d' ' -f1-3)"
+  else
+    ck fail "ffmpeg" "missing — brew install ffmpeg"
+  fi
+  if command -v ffprobe >/dev/null; then
+    ck ok "ffprobe" "present"
+  else
+    ck fail "ffprobe" "missing — brew install ffmpeg"
+  fi
+
+  # Dither is not ffmpeg's default; confirm the filter accepts our request,
+  # otherwise hi-res sources get truncated to 16-bit instead of dithered.
+  if command -v ffmpeg >/dev/null; then
+    if ffmpeg -hide_banner -h filter=aresample 2>/dev/null | grep -q dither_method; then
+      ck ok "dither support" "triangular dither available"
+    else
+      ck warn "dither support" "no dither_method; 24-bit sources will truncate"
+    fi
+  fi
+
+  # --- burner ---------------------------------------------------------------
+  if command -v cdrecord >/dev/null; then
+    ck ok "cdrecord" "$(cdrecord -version 2>/dev/null | head -1 | cut -c1-40)"
+
+    # CD-Text is written from a cue sheet, so this build needs both options.
+    helptext=$(cdrecord -help 2>&1 || true)
+    if printf '%s' "$helptext" | grep -q 'cuefile' \
+       && printf '%s' "$helptext" | grep -q '\-text'; then
+      ck ok "cue + CD-Text" "cdrecord supports cuefile= and -text"
+    else
+      ck warn "cue + CD-Text" "this build lacks cuefile=/-text; use --no-cdtext"
+    fi
+  else
+    ck fail "cdrecord" "missing — brew install cdrtools"
+  fi
+
+  # Only --verify needs this, so its absence is not a failure.
+  if command -v cdda2wav >/dev/null; then
+    ck ok "cdda2wav" "present — --verify can read discs back"
+  else
+    ck warn "cdda2wav" "missing; --verify will check the TOC only"
+  fi
+
+  # --- drive ----------------------------------------------------------------
+  if command -v cdrecord >/dev/null; then
+    if cdrecord -checkdrive dev="$DEV" >/dev/null 2>&1; then
+      ck ok "drive" "cdrecord can open dev=$DEV"
+
+      # The drive itself has to be willing to write CD-Text. Most are; the
+      # cheap bus-powered ones are worth confirming before you buy discs.
+      caps=$(cdrecord -prcap dev="$DEV" 2>/dev/null || true)
+      if printf '%s' "$caps" | grep -qi 'CD-Text'; then
+        ck ok "drive CD-Text" \
+          "$(printf '%s' "$caps" | grep -i 'CD-Text' | head -1 | sed 's/^ *//' | cut -c1-46)"
+      else
+        ck warn "drive CD-Text" "drive does not advertise CD-Text; try one disc first"
+      fi
+
+      # --dummy rehearses a burn with the write laser off. Not every drive
+      # can do it, and the ones that can't say so here rather than mid-burn.
+      if printf '%s' "$caps" | grep -qi 'test writing'; then
+        ck ok "drive --dummy" "$(printf '%s' "$caps" | grep -i 'test writing' | head -1 | sed 's/^ *//' | cut -c1-46)"
+      else
+        ck warn "drive --dummy" "drive does not advertise test writing; --dummy may fail"
+      fi
+    else
+      ck fail "drive" "cannot open dev=$DEV — see 'cdrecord -scanbus'"
+    fi
+  fi
+
+  if command -v drutil >/dev/null; then
+    dstat=$(drutil status 2>/dev/null || true)
+    if [ -z "$dstat" ]; then
+      ck warn "media" "no optical drive visible to drutil"
+    elif printf '%s' "$dstat" | grep -qi 'no media'; then
+      ck warn "media" "drive found, no disc inserted"
+    else
+      mtype=$(printf '%s' "$dstat" | awk -F: '/Type:/ { gsub(/^ +/, "", $2); print $2; exit }')
+      blank=$(printf '%s' "$dstat" | grep -ci 'blank' || true)
+      if [ "$blank" -gt 0 ]; then
+        ck ok "media" "blank ${mtype:-disc} ready"
+      else
+        ck warn "media" "${mtype:-disc} present but not blank"
+      fi
+    fi
+  fi
+
+  # --- scratch space --------------------------------------------------------
+  tmpdir="${TMPDIR:-/tmp}"
+  avail=$(free_bytes "$tmpdir" || echo 0)
+  need=$(( DISC_BYTES + 104857600 ))     # one full disc of PCM plus headroom
+  if [ "${avail:-0}" -ge "$need" ]; then
+    ck ok "scratch space" "$(human "$avail") free in $tmpdir"
+  else
+    ck fail "scratch space" "need $(human "$need"), have $(human "${avail:-0}") in $tmpdir"
+  fi
+
+  # --- display --------------------------------------------------------------
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf8*|*UTF8*) ck ok "terminal" "UTF-8 locale, progress bar will render" ;;
+    *) ck warn "terminal" "non-UTF-8 locale; bar characters may look wrong" ;;
+  esac
+
+  printf '\n'
+  if [ "$CHECK_FAIL" -eq 1 ]; then
+    printf '  \033[31mNot ready to burn.\033[0m Fix the ✗ items above.\n\n'
+    return 1
+  elif [ "$CHECK_WARN" -eq 1 ]; then
+    printf '  \033[33mMostly ready.\033[0m Warnings above are usually fine.\n\n'
+  else
+    printf '  \033[32mReady to burn.\033[0m\n\n'
+  fi
+  return 0
+}
+
+if [ "$CHECK" -eq 1 ]; then
+  run_check || exit 1
+  exit 0
+fi
+
+# ------------------------------------------------------------- requirements --
+
+[ -n "${DIR:-}" ] || usage 1
+[ -d "$DIR" ] || die "not a directory: $DIR"
+
+command -v ffmpeg  >/dev/null || die "ffmpeg not found. brew install ffmpeg"
+command -v ffprobe >/dev/null || die "ffprobe not found. brew install ffmpeg"
+if [ "$DRY_RUN" -eq 0 ] && [ "$DEMO" -eq 0 ]; then
+  command -v cdrecord >/dev/null || die "cdrecord not found. brew install cdrtools"
+fi
+
+# ------------------------------------------------------------ read metadata --
+
+FILES=(); DURS=(); TITLES=(); ARTISTS=(); TRKNOS=(); DISCNOS=()
+ALBUM=""; ALBUM_ARTIST=""; UNTAGGED=0
+
+printf 'Reading %s\n' "$DIR" >&2
+
+while IFS= read -r f; do
+  # One ffprobe call per file for duration and the tags we sort and label by.
+  dur=""; trk=""; disc=""; title=""; album=""; artist=""; aartist=""
+  while IFS='=' read -r key val; do
+    case "$key" in
+      duration)                         dur="$val" ;;
+      TAG:track|TAG:tracknumber)        trk="$val" ;;
+      TAG:disc|TAG:discnumber)          disc="$val" ;;
+      TAG:title)                        title="$val" ;;
+      TAG:album)                        album="$val" ;;
+      TAG:artist)                       artist="$val" ;;
+      TAG:album_artist|TAG:albumartist) aartist="$val" ;;
+    esac
+  done < <(ffprobe -v error -show_entries \
+      'format=duration:format_tags=track,tracknumber,disc,discnumber,title,album,artist,album_artist,albumartist' \
+      -of default=nw=1 "$f" 2>/dev/null || true)
+
+  [ -n "$dur" ] && [ "$dur" != "N/A" ] || die "cannot read audio from $(basename "$f")"
+
+  # Tags are often "3/12" — keep the part before the slash. Missing track
+  # numbers sort last, so tagged files keep their album order regardless.
+  trk="${trk%%/*}";  case "$trk"  in ''|*[!0-9]*) trk=9999;  UNTAGGED=1 ;; esac
+  disc="${disc%%/*}"; case "$disc" in ''|*[!0-9]*) disc=1 ;; esac
+
+  FILES+=("$f")
+  # Round up, never down: underestimating runtime is how a burn dies at 99%.
+  DURS+=("$(awk -v d="$dur" 'BEGIN { printf "%d", (d == int(d) ? d : int(d) + 1) }')")
+  TITLES+=("${title:-$(basename "$f")}")
+  ARTISTS+=("$artist")
+  TRKNOS+=("$trk")
+  DISCNOS+=("$disc")
+  [ -z "$ALBUM" ] && ALBUM="$album"
+  [ -z "$ALBUM_ARTIST" ] && ALBUM_ARTIST="${aartist:-$artist}"
+done < <(
+  find "$DIR" -maxdepth 1 -type f \
+    \( -iname '*.aif' -o -iname '*.aiff' -o -iname '*.flac' -o -iname '*.mp3' \
+    -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav'  -o -iname '*.m4a' \
+    -o -iname '*.wma' -o -iname '*.ape'  -o -iname '*.alac' \) | LC_ALL=C sort
+)
+
+[ ${#FILES[@]} -gt 0 ] || die "no audio files in $DIR"
+
+# ------------------------------------------------------------------ ordering --
+
+# Sort by disc, then track number, then filename. Files without track tags all
+# share key 9999 and fall back to a natural filename sort among themselves.
+ORDER=()
+while IFS= read -r idx; do
+  ORDER+=("$idx")
+done < <(
+  for i in $(seq 0 $(( ${#FILES[@]} - 1 ))); do
+    printf '%04d\t%04d\t%s\t%d\n' \
+      "${DISCNOS[$i]}" "${TRKNOS[$i]}" "$(basename "${FILES[$i]}")" "$i"
+  done | LC_ALL=C sort -t"$(printf '\t')" -k1,1n -k2,2n -k3,3V | cut -f4
+)
+
+if [ "$UNTAGGED" -eq 1 ]; then
+  ORDER_NOTE="filename (some files have no track number)"
+else
+  ORDER_NOTE="embedded track numbers"
+fi
+
+# ------------------------------------------------------- playlist expansion --
+
+# Flatten into play order, cutting any track that cannot fit on one disc into
+# equal parts. P_OFF/P_LEN are empty for whole files and set for slices, which
+# is what tells the converter to seek. Everything downstream reads P_* only.
+P_FILE=(); P_DUR=(); P_TITLE=(); P_ARTIST=(); P_OFF=(); P_LEN=()
+SPLIT_NOTE=""
+
+for k in "${ORDER[@]}"; do
+  if [ "${DURS[$k]}" -le "$CAPACITY" ]; then
+    P_FILE+=("${FILES[$k]}"); P_DUR+=("${DURS[$k]}")
+    P_TITLE+=("${TITLES[$k]}"); P_ARTIST+=("${ARTISTS[$k]}")
+    P_OFF+=(""); P_LEN+=("")
+    continue
+  fi
+
+  if [ "$SPLIT_LONG" -eq 0 ]; then
+    die "\"${TITLES[$k]}\" is $(mmss "${DURS[$k]}"), longer than a $(mmss "$CAPACITY") disc.
+  Pass --split-long to cut it into equal parts across discs."
+  fi
+
+  # Equal parts, so the tail is not a few-second stub.
+  parts=$(( (DURS[k] + CAPACITY - 1) / CAPACITY ))
+  plen=$(( (DURS[k] + parts - 1) / parts ))
+  for p in $(seq 0 $(( parts - 1 ))); do
+    off=$(( p * plen ))
+    len=$plen
+    [ $(( off + len )) -gt "${DURS[$k]}" ] && len=$(( DURS[k] - off ))
+    P_FILE+=("${FILES[$k]}"); P_DUR+=("$len")
+    P_TITLE+=("${TITLES[$k]} (part $(( p + 1 ))/$parts)")
+    P_ARTIST+=("${ARTISTS[$k]}")
+    P_OFF+=("$off"); P_LEN+=("$len")
+  done
+  SPLIT_NOTE="split $parts ways"
+done
+
+N=${#P_FILE[@]}
+
+# -------------------------------------------------------------- disc layout --
+
+# Greedy fill: how many discs does a given per-disc capacity need?
+discs_needed() {
+  local cap=$1 count=1 cur=0 ntrk=0 i d
+  for i in $(seq 0 $(( N - 1 ))); do
+    d=${P_DUR[$i]}
+    [ "$d" -le "$cap" ] || { echo 0; return; }   # single track too long
+    if [ $((cur + d)) -gt "$cap" ] || [ "$ntrk" -ge "$MAX_TRACKS" ]; then
+      count=$((count + 1)); cur=$d; ntrk=1
+    else
+      cur=$((cur + d)); ntrk=$((ntrk + 1))
+    fi
+  done
+  echo "$count"
+}
+
+TOTAL=0
+for i in $(seq 0 $(( N - 1 ))); do TOTAL=$(( TOTAL + P_DUR[i] )); done
+
+NEEDED=$(discs_needed "$CAPACITY")
+[ "$NEEDED" -gt 0 ] || die "a track is longer than a $(mmss "$CAPACITY") disc; pass --split-long"
+
+# Using the fewest discs, find the smallest capacity that still fits in that
+# many. This balances the discs instead of cramming disc 1 and leaving a stub.
+LO=0; for i in $(seq 0 $(( N - 1 ))); do [ "${P_DUR[$i]}" -gt "$LO" ] && LO=${P_DUR[$i]}; done
+HI=$CAPACITY
+while [ "$LO" -lt "$HI" ]; do
+  MID=$(( (LO + HI) / 2 ))
+  R=$(discs_needed "$MID")
+  if [ "$R" -gt 0 ] && [ "$R" -le "$NEEDED" ]; then HI=$MID; else LO=$((MID + 1)); fi
+done
+BALANCED=$LO
+
+# Assign tracks to discs at the balanced capacity, preserving album order.
+# Must use the same rule as discs_needed() or the plan and the layout diverge.
+DISC_OF=(); cur=0; ntrk=0; disc=1
+for i in $(seq 0 $(( N - 1 ))); do
+  if [ $((cur + P_DUR[i])) -gt "$BALANCED" ] || [ "$ntrk" -ge "$MAX_TRACKS" ]; then
+    disc=$((disc + 1)); cur=${P_DUR[$i]}; ntrk=1
+  else
+    cur=$((cur + P_DUR[i])); ntrk=$((ntrk + 1))
+  fi
+  DISC_OF+=("$disc")
+done
+NDISCS=$disc
+
+# ----------------------------------------------------------------- the plan --
+
+printf '\n'
+if [ -n "$ALBUM" ]; then
+  if [ -n "$ALBUM_ARTIST" ]; then
+    printf '  \033[1m%s\033[0m — %s\n' "$ALBUM" "$ALBUM_ARTIST"
+  else
+    printf '  \033[1m%s\033[0m\n' "$ALBUM"
+  fi
+fi
+printf '  %d tracks, %s, ordered by %s\n' "$N" "$(mmss "$TOTAL")" "$ORDER_NOTE"
+if [ "$CDTEXT" -eq 1 ]; then
+  printf '  CD-Text: on — disc and track names written to the lead-in\n'
+else
+  printf '  CD-Text: off (--no-cdtext)\n'
+fi
+[ -n "$SPLIT_NOTE" ] && printf '  A track was longer than one disc and was %s\n' "$SPLIT_NOTE"
+
+if [ "$NDISCS" -gt 1 ]; then
+  # Say which limit was hit — runtime and the 99-track ceiling are very
+  # different problems, and "too long" is wrong when the album is 9 minutes.
+  if [ "$N" -gt "$MAX_TRACKS" ] && [ "$TOTAL" -gt "$CAPACITY" ]; then
+    why="too long and over $MAX_TRACKS tracks"
+  elif [ "$N" -gt "$MAX_TRACKS" ]; then
+    why="over the $MAX_TRACKS track limit of a CD"
+  else
+    why="too long for one disc"
+  fi
+  printf '  Splitting across %d discs — %s\n' "$NDISCS" "$why"
+fi
+printf '\n'
+
+# One segment per track, sized by its share of a whole disc, with the unused
+# tail left as dots. Makes "disc 2 is only two-thirds full" obvious at a glance,
+# which is the moment to reorder the folder rather than after burning it.
+strip() {  # strip <disc-number>
+  local d=$1 i cum=0 prev=0 cell n=0 out="" shade last=""
+  # Four steps of one teal, so adjacent tracks separate without becoming confetti.
+  local SHADES=(45 44 37 36)
+  for i in $(seq 0 $(( N - 1 ))); do
+    [ "${DISC_OF[$i]}" -eq "$d" ] || continue
+    cum=$(( cum + P_DUR[i] ))
+    # Round from the cumulative total, so rounding error cannot accumulate
+    # and no track can push the strip past its width.
+    cell=$(( cum * STRIP_WIDTH / CAPACITY ))
+    [ "$cell" -gt "$STRIP_WIDTH" ] && cell=$STRIP_WIDTH
+    shade="\033[38;5;${SHADES[$(( n % 4 ))]}m"
+    [ "$shade" != "$last" ] && { out="$out$shade"; last=$shade; }
+    while [ "$prev" -lt "$cell" ]; do out="$out█"; prev=$(( prev + 1 )); done
+    n=$(( n + 1 ))
+  done
+  out="$out\033[2m"
+  while [ "$prev" -lt "$STRIP_WIDTH" ]; do out="$out·"; prev=$(( prev + 1 )); done
+  out="$out\033[0m"
+  printf '  %b  %s of %s\n' "$out" "$(mmss "$cum")" "$(mmss "$CAPACITY")"
+}
+
+for d in $(seq 1 "$NDISCS"); do
+  dtot=0; num=0
+  [ "$NDISCS" -gt 1 ] && printf '  \033[1mDisc %d\033[0m\n' "$d"
+  for i in $(seq 0 $(( N - 1 ))); do
+    [ "${DISC_OF[$i]}" -eq "$d" ] || continue
+    num=$((num + 1)); dtot=$((dtot + P_DUR[i]))
+    printf '   %2d. %-52.52s %6s\n' "$num" "${P_TITLE[$i]}" "$(mmss "${P_DUR[$i]}")"
+  done
+  printf '       %*s %6s\n' 52 "" "$(mmss "$dtot")"
+  strip "$d"
+  printf '\n'
+done
+
+[ "$DRY_RUN" -eq 1 ] && exit 0
+
+# ------------------------------------------------------------- progress bar --
+
+# A real CD is written from the centre outwards, so the progress display is a
+# disc filling from the hub to the rim. THRESH holds, for every terminal cell,
+# the percentage at which that cell lights up — computed once here, because
+# doing trigonometry per cell per frame in bash would be far too slow.
+#
+# The threshold goes by AREA, not radius: data on a CD is spread over the
+# surface, so a track at the rim covers more ground per millimetre than one
+# near the hub. Filling by radius would race ahead and then stall.
+THRESH=()
+disc_geometry() {
+  while IFS= read -r v; do THRESH+=("$v"); done < <(
+    awk -v rows="$DISC_ROWS" -v cols="$DISC_COLS" 'BEGIN {
+      cy = (rows - 1) / 2; cx = (cols - 1) / 2
+      rin = 0.30                                  # the hole in the middle
+      for (r = 0; r < rows; r++) for (c = 0; c < cols; c++) {
+        ny = (r - cy) / cy; nx = (c - cx) / cx
+        rad = sqrt(nx * nx + ny * ny)
+        if (rad > 1.0) { print 999; continue }    # outside the disc
+        if (rad < rin) { print 998; continue }    # the hub
+        f = (rad * rad - rin * rin) / (1 - rin * rin)
+        p = int(f * 100 + 0.5)
+        print (p < 0 ? 0 : (p > 100 ? 100 : p))
+      }
+    }'
+  )
+}
+
+# One row of the disc at a given percentage. Colour escapes are only emitted
+# when the colour actually changes, which keeps a frame down to a handful of
+# escapes instead of one per cell.
+disc_row() {  # disc_row <row> <pct>
+  local r=$1 pct=$2 c t out="" want last=""
+  for (( c = 0; c < DISC_COLS; c++ )); do
+    t=${THRESH[$(( r * DISC_COLS + c ))]}
+    if [ "$t" -ge 998 ]; then
+      [ -n "$last" ] && { out="$out\033[0m"; last=""; }
+      out="$out "
+      continue
+    fi
+    if [ "$t" -gt "$pct" ]; then      want='\033[38;5;236m'   # not yet written
+    elif [ $(( pct - t )) -le 6 ]; then want='\033[38;5;231m' # the write head
+    else                               want='\033[38;5;44m'   # burned
+    fi
+    [ "$want" != "$last" ] && { out="$out$want"; last=$want; }
+    out="$out█"
+  done
+  printf '%s\033[0m' "$out"
+}
+
+# Parses cdrecord's progress output and redraws the display in place.
+# cdrecord emits carriage-return-delimited lines like:
+#   Track 03:  12 of  45 MB written (fifo 100%) [buf  98%]  8.0x.
+render() {
+  local disc_no=$1 disc_of=$2 ntracks=$3 total_mb=$4
+  local chunk trk mb_done buf spd bar pips
+  local base_mb=0 last_trk=1 done_mb=0 pct=0 eta="--:--" plain_trk=0
+  local start elapsed i filled tty=0 cols lines barw discmode=0 r info
+
+  [ -t 1 ] && tty=1
+  # The disc needs room beside it for the readout; below that, fall back to
+  # the compact four-line display rather than wrapping into a mess.
+  cols=$(tput cols 2>/dev/null || echo 80)
+  if [ "$tty" -eq 1 ] && [ "$cols" -ge 62 ] && [ ${#THRESH[@]} -gt 0 ]; then
+    discmode=1; lines=$DISC_ROWS; barw=26
+  else
+    discmode=0; lines=4; barw=$BAR_WIDTH
+  fi
+
+  start=$(date +%s)
+  if [ "$tty" -eq 1 ]; then
+    printf '\033[?25l'                       # hide cursor
+    for (( i = 0; i < lines; i++ )); do printf '\n'; done
+  fi
+
+  while IFS= read -r -d $'\r' chunk || [ -n "$chunk" ]; do
+    [[ "$chunk" =~ Track[[:space:]]+0*([0-9]+):[[:space:]]+([0-9]+)[[:space:]]+of[[:space:]]+([0-9]+)[[:space:]]+MB ]] || continue
+    trk="${BASH_REMATCH[1]}"; mb_done="${BASH_REMATCH[2]}"
+
+    # cdrecord counts MB per track; accumulate finished tracks for a disc total.
+    if [ "$trk" -ne "$last_trk" ]; then
+      base_mb=$done_mb; last_trk=$trk
+    fi
+    done_mb=$((base_mb + mb_done))
+
+    buf="--"; spd="--"
+    [[ "$chunk" =~ buf[[:space:]]+([0-9]+)% ]] && buf="${BASH_REMATCH[1]}"
+    [[ "$chunk" =~ ([0-9]+\.[0-9]+)x ]]       && spd="${BASH_REMATCH[1]}"
+
+    [ "$total_mb" -gt 0 ] && pct=$(( done_mb * 100 / total_mb ))
+    [ "$pct" -gt 100 ] && pct=100
+
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$pct" -ge 3 ] && [ "$elapsed" -gt 0 ]; then
+      eta=$(mmss $(( elapsed * (100 - pct) / pct )))
+    fi
+
+    filled=$(( pct * barw / 100 ))
+    bar=""
+    for ((i = 0; i < barw; i++)); do
+      if [ "$i" -lt "$filled" ]; then bar="$bar█"; else bar="$bar░"; fi
+    done
+
+    pips=""
+    if [ "$ntracks" -le 48 ]; then
+      for ((i = 1; i <= ntracks; i++)); do
+        if   [ "$i" -lt "$trk" ]; then pips="$pips\033[32m▰\033[0m"
+        elif [ "$i" -eq "$trk" ]; then pips="$pips\033[1;36m▰\033[0m"
+        else pips="$pips\033[2m▱\033[0m"; fi
+      done
+    fi
+
+    if [ "$tty" -eq 0 ]; then
+      # Piped or logged: one line per track instead of redraw escapes.
+      [ "$trk" -ne "$plain_trk" ] && {
+        printf '  disc %d/%d track %d/%d\n' "$disc_no" "$disc_of" "$trk" "$ntracks"
+        plain_trk=$trk
+      }
+      continue
+    fi
+
+    printf '\033[%dA\r' "$lines"
+
+    if [ "$discmode" -eq 0 ]; then
+      printf '\033[K  \033[1mBurning disc %d of %d\033[0m\n' "$disc_no" "$disc_of"
+      printf '\033[K  \033[36m%s\033[0m %3d%%\n' "$bar" "$pct"
+      printf '\033[K  track %d/%d · %d/%d MB · %sx · buf %s%% · ETA %s\n' \
+        "$trk" "$ntracks" "$done_mb" "$total_mb" "$spd" "$buf" "$eta"
+      printf '\033[K  %b\n' "$pips"
+      continue
+    fi
+
+    # The disc on the left, the readout beside it. Rows the readout does not
+    # use are still printed so the block keeps a constant height.
+    for (( r = 0; r < DISC_ROWS; r++ )); do
+      case $r in
+        1) info=$(printf '\033[1mBurning disc %d of %d\033[0m' "$disc_no" "$disc_of") ;;
+        3) info=$(printf '\033[38;5;44m%s\033[0m %3d%%' "$bar" "$pct") ;;
+        4) info=$(printf 'track %d of %d' "$trk" "$ntracks") ;;
+        5) info=$(printf '%d of %d MB at %sx' "$done_mb" "$total_mb" "$spd") ;;
+        6) info=$(printf 'buffer %s%%   ETA %s' "$buf" "$eta") ;;
+        8) info=$pips ;;
+        *) info="" ;;
+      esac
+      printf '\033[K  %b   %b\n' "$(disc_row "$r" "$pct")" "$info"
+    done
+  done
+
+  [ "$tty" -eq 1 ] && printf '\033[?25h'      # show cursor
+  return 0
+}
+
+# Stands in for cdrecord under --demo so the display can be previewed dry.
+# Sizes itself like a real disc rather than from the sample files.
+fake_cdrecord() {
+  local ntracks=$1 mb_per=$2 t mb
+  for ((t = 1; t <= ntracks; t++)); do
+    for ((mb = 0; mb <= mb_per; mb += 2)); do
+      printf 'Track %02d: %4d of %4d MB written (fifo 100%%) [buf  97%%]  8.0x.\r' \
+        "$t" "$mb" "$mb_per"
+      sleep 0.03
+    done
+    printf 'Track %02d: %4d of %4d MB written (fifo 100%%) [buf  97%%]  8.0x.\r' \
+      "$t" "$mb_per" "$mb_per"
+  done
+  printf '\n'
+}
+
+# -------------------------------------------------------------- image + cue --
+
+# Little-endian 32-bit integer as printf escapes, for the WAV header fields.
+le32() {
+  local v=$1
+  printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+    $(( v & 255 )) $(( (v >> 8) & 255 )) $(( (v >> 16) & 255 )) $(( (v >> 24) & 255 ))
+}
+
+# A canonical 44-byte PCM WAV header. The two size fields are patched in
+# afterwards, once the real data length is known, so the image can be written
+# in a single streaming pass instead of being assembled twice.
+wav_header() {
+  printf 'RIFF'
+  printf "$(le32 0)"
+  printf 'WAVEfmt '
+  printf "$(le32 16)"
+  printf '\x01\x00\x02\x00'                        # PCM, 2 channels
+  printf "$(le32 44100)"
+  printf "$(le32 "$BYTES_PER_SEC")"
+  printf '\x04\x00\x10\x00'                        # block align 4, 16 bits
+  printf 'data'
+  printf "$(le32 0)"
+}
+
+# Patch a little-endian 32-bit value into an existing file at a byte offset.
+patch_le32() {  # file offset value
+  printf "$(le32 "$3")" \
+    | dd of="$1" bs=1 seek="$2" conv=notrunc status=none 2>/dev/null
+}
+
+# CD-Text fields are plain text in the lead-in. Quotes and control characters
+# break the cue parser, and very long strings overflow the packs.
+cue_text() {
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177"\\' | cut -c1-120
+}
+
+file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
+
+# --------------------------------------------------------------- verifying --
+
+# Reads the finished disc back and reports whether it is sound.
+#
+# Deliberately NOT a byte-for-byte comparison against the image. Every drive
+# reads audio at a small fixed sample offset from where it wrote it, so an
+# exact compare fails on a perfectly good disc — which is the same false alarm
+# this flag exists to settle. What it checks instead is what actually goes
+# wrong: the table of contents, whether every sector can be read back, and
+# whether the CD-Text survived.
+verify_disc() {  # verify_disc <disc-number> <expected-track-count>
+  local d=$1 want=$2 toc got rc bad=0
+
+  printf '  Verifying disc %d...\n' "$d"
+
+  toc=$(cdrecord -toc dev="$DEV" 2>&1 || true)
+  got=$(printf '%s\n' "$toc" | grep -c '^track:[[:space:]]*[0-9]' || true)
+  if [ "$got" -eq "$want" ]; then
+    printf '    \033[32m✓\033[0m table of contents — %d tracks\n' "$got"
+  else
+    printf '    \033[31m✗\033[0m table of contents — expected %d tracks, disc reports %d\n' \
+      "$want" "$got"
+    bad=1
+  fi
+
+  if command -v cdda2wav >/dev/null; then
+    # Stream every track to nowhere. We do not want the audio; we want to know
+    # whether the drive can get through the disc without a read error, which is
+    # exactly what a player has to do.
+    set +e
+    cdda2wav dev="$DEV" -q -t "1+$want" -output-format raw - \
+      > /dev/null 2> "$WORK/verify-$d.log"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      printf '    \033[32m✓\033[0m full read — every sector came back\n'
+    else
+      printf '    \033[31m✗\033[0m full read failed (exit %d):\n' "$rc"
+      tail -6 "$WORK/verify-$d.log" | sed 's/^/        /'
+      bad=1
+    fi
+
+    if [ "$CDTEXT" -eq 1 ] && [ -n "$ALBUM" ]; then
+      # Best effort: -J asks for information only. If the field does not come
+      # back that is not proof it is missing, so this never fails the disc.
+      if cdda2wav dev="$DEV" -J -v titles 2>&1 | grep -qF "$ALBUM"; then
+        printf '    \033[32m✓\033[0m CD-Text — album title reads back\n'
+      else
+        printf '    \033[33m!\033[0m CD-Text — could not read it back; check on a player\n'
+      fi
+    fi
+  else
+    printf '    \033[33m!\033[0m cdda2wav not installed — TOC checked, sectors not read\n'
+  fi
+
+  return "$bad"
+}
+
+# ---------------------------------------------------------------- burn loop --
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/burncd.XXXXXX")
+STARTED=$(date +%s)
+
+# Only emit the show-cursor escape to a real terminal, so piped output and log
+# files stay clean.
+cleanup() { rm -rf "$WORK"; [ -t 1 ] && printf '\033[?25h'; return 0; }
+trap cleanup EXIT
+trap 'cleanup; printf "\n"; exit 130' INT
+
+# Only worth the awk call if there is a terminal to draw on.
+[ -t 1 ] && disc_geometry
+
+if [ "$DUMMY" -eq 1 ]; then
+  printf '  \033[1mTest burn\033[0m — the laser stays off and nothing is written.\n'
+  printf '  The disc is not ejected, so you can burn it for real straight after.\n\n'
+fi
+
+if [ "$FROM" -gt 1 ]; then
+  [ "$FROM" -le "$NDISCS" ] || die "--from-disc $FROM but this job is only $NDISCS discs"
+  printf '  Resuming at disc %d of %d, skipping %d already burned.\n\n' \
+    "$FROM" "$NDISCS" "$((FROM - 1))"
+fi
+
+for d in $(seq "$FROM" "$NDISCS"); do
+  # Gather this disc's tracks in play order.
+  IDX=()
+  for i in $(seq 0 $(( N - 1 ))); do
+    [ "${DISC_OF[$i]}" -eq "$d" ] && IDX+=("$i")
+  done
+
+  # Uncompressed audio is roughly 10 MB per minute; a full disc is ~800 MB.
+  # Check before spending minutes converting into a filesystem that cannot
+  # hold the result.
+  need=0
+  for i in "${IDX[@]}"; do need=$(( need + P_DUR[i] * BYTES_PER_SEC )); done
+  need=$(( need + 10485760 ))
+  avail=$(free_bytes "$WORK" || echo 0)
+  if [ "${avail:-0}" -lt "$need" ]; then
+    die "disc $d needs $(human "$need") of temp space, only $(human "${avail:-0}") free
+  in ${TMPDIR:-/tmp}. Free some space or set TMPDIR to a bigger volume."
+  fi
+
+  if [ "$NDISCS" -gt 1 ]; then
+    printf '  Insert a blank CD-R for disc %d of %d, then press Enter (Ctrl-C to stop) ' \
+      "$d" "$NDISCS"
+  else
+    printf '  Insert a blank CD-R and press Enter (Ctrl-C to stop) '
+  fi
+  # Without this guard, a closed stdin makes the loop exit silently partway
+  # through a multi-disc job, which looks exactly like a successful finish.
+  read -r _ || die "stdin closed — burncd needs a terminal to confirm each disc"
+
+  IMAGE="$WORK/disc$d.wav"
+  CUE="$WORK/disc$d.cue"
+
+  printf '  Converting to 16-bit/44.1kHz...\n'
+
+  # One continuous image rather than a file per track. Two reasons: cdrecord
+  # only writes CD-Text from a cue sheet, and a cue sheet must point at a
+  # single file; and a single image is genuinely gapless, because track
+  # boundaries become index marks in one stream rather than separate writes.
+  wav_header > "$IMAGE"
+  HDR=44
+  STARTS=(); n=0
+
+  for i in "${IDX[@]}"; do
+    n=$((n + 1))
+    # Track boundaries must land on sector boundaries, so record where this
+    # track begins before appending it.
+    STARTS+=( $(( ($(file_size "$IMAGE") - HDR) / SECTOR )) )
+
+    # ffmpeg does NOT dither by default (dither_method=0), so a 24-bit source
+    # would be truncated to 16-bit. Triangular dither is the safe default.
+    # Raw s16le out, appended straight onto the image.
+    if [ -n "${P_OFF[$i]}" ]; then
+      ffmpeg -nostdin -v error -ss "${P_OFF[$i]}" -i "${P_FILE[$i]}" \
+        -t "${P_LEN[$i]}" -map a:0 \
+        -af 'aresample=out_sample_fmt=s16:dither_method=triangular' \
+        -ar 44100 -ac 2 -c:a pcm_s16le -f s16le - >> "$IMAGE"
+    else
+      ffmpeg -nostdin -v error -i "${P_FILE[$i]}" -map a:0 \
+        -af 'aresample=out_sample_fmt=s16:dither_method=triangular' \
+        -ar 44100 -ac 2 -c:a pcm_s16le -f s16le - >> "$IMAGE"
+    fi
+
+    # Pad out to a whole sector so the next track starts aligned. Same job
+    # cdrecord's -pad used to do, moved here where the offsets are computed.
+    rem=$(( ($(file_size "$IMAGE") - HDR) % SECTOR ))
+    if [ "$rem" -ne 0 ]; then
+      dd if=/dev/zero bs=1 count=$(( SECTOR - rem )) status=none >> "$IMAGE" 2>/dev/null
+    fi
+  done
+
+  DATA=$(( $(file_size "$IMAGE") - HDR ))
+  patch_le32 "$IMAGE" 4  $(( DATA + 36 ))
+  patch_le32 "$IMAGE" 40 "$DATA"
+
+  # --- cue sheet ------------------------------------------------------------
+  {
+    if [ "$CDTEXT" -eq 1 ]; then
+      [ -n "$ALBUM_ARTIST" ] && printf 'PERFORMER "%s"\n' "$(cue_text "$ALBUM_ARTIST")"
+      [ -n "$ALBUM" ]        && printf 'TITLE "%s"\n'     "$(cue_text "$ALBUM")"
+    fi
+    printf 'FILE "%s" WAVE\n' "$(basename "$IMAGE")"
+    n=0
+    for i in "${IDX[@]}"; do
+      n=$((n + 1))
+      printf '  TRACK %02d AUDIO\n' "$n"
+      if [ "$CDTEXT" -eq 1 ]; then
+        printf '    TITLE "%s"\n' "$(cue_text "${P_TITLE[$i]}")"
+        [ -n "${P_ARTIST[$i]}" ] && printf '    PERFORMER "%s"\n' "$(cue_text "${P_ARTIST[$i]}")"
+      fi
+      printf '    INDEX 01 %s\n' "$(msf "${STARTS[$((n - 1))]}")"
+    done
+  } > "$CUE"
+
+  # CD-Text lives in the lead-in, which is small. If the metadata is enormous
+  # the drive rejects the whole burn, so shed per-track artists first.
+  if [ "$CDTEXT" -eq 1 ] && [ "$(file_size "$CUE")" -gt "$CDTEXT_BUDGET" ]; then
+    printf '  \033[33m!\033[0m CD-Text too large for the lead-in; dropping per-track artists\n'
+    grep -v '^    PERFORMER' "$CUE" > "$CUE.trim" && mv "$CUE.trim" "$CUE"
+  fi
+
+  total_mb=$(( DATA / 1048576 ))
+
+  if [ "$DEMO" -eq 1 ]; then
+    # The image and cue above are real. This is the part worth eyeballing
+    # before trusting a disc to it.
+    printf '\n  \033[1mGenerated cue sheet\033[0m (image %d MB)\n' "$total_mb"
+    sed 's/^/    /' "$CUE" | head -24
+    printf '\n'
+  fi
+
+  set +e
+  if [ "$DEMO" -eq 1 ]; then
+    demo_per=55
+    fake_cdrecord "${#IDX[@]}" "$demo_per" \
+      | render "$d" "$NDISCS" "${#IDX[@]}" $(( demo_per * ${#IDX[@]} ))
+    rc=0
+  else
+    # -dao: disc-at-once, required for CD-Text and for zero gaps.
+    # -text: write CD-Text from the cue sheet's TITLE/PERFORMER lines.
+    # -dummy: run the whole thing with the write laser off.
+    # -eject: pop the disc when done, which also cues the next one — but not
+    #         when we still have to read it back, or when this was a rehearsal.
+    OPTS=(-v -dao)
+    [ "$CDTEXT" -eq 1 ] && OPTS+=(-text)
+    [ "$DUMMY"  -eq 1 ] && OPTS+=(-dummy)
+    [ "$VERIFY" -eq 0 ] && [ "$DUMMY" -eq 0 ] && OPTS+=(-eject)
+
+    # tee keeps the real output: render() drops every line it cannot parse,
+    # which would otherwise hide the reason a burn failed.
+    ( cd "$WORK" && cdrecord "${OPTS[@]}" \
+        dev="$DEV" speed="$SPEED" driveropts=burnfree \
+        cuefile="$(basename "$CUE")" 2>&1 ) \
+      | tee "$WORK/cdrecord-$d.log" \
+      | render "$d" "$NDISCS" "${#IDX[@]}" "$total_mb"
+    rc=${PIPESTATUS[0]}
+  fi
+  set -e
+
+  if [ "$rc" -ne 0 ]; then
+    if [ -s "$WORK/cdrecord-$d.log" ]; then
+      printf '\n  cdrecord said:\n' >&2
+      tr '\r' '\n' < "$WORK/cdrecord-$d.log" \
+        | grep -v 'MB written' | grep -v '^[[:space:]]*$' \
+        | tail -15 | sed 's/^/    /' >&2 || true
+    fi
+    die "cdrecord failed on disc $d (exit $rc).
+  Drive not found?          cdrecord -scanbus   then set BURNCD_DEV.
+  Choked on CD-Text or cue? retry with --no-cdtext.
+  Either way, burncd --check reports what this machine supports."
+  fi
+
+  rm -f "$IMAGE"
+
+  if [ "$DUMMY" -eq 1 ]; then
+    printf '  \033[32m✓\033[0m Disc %d of %d rehearsed — nothing written, disc still blank\n\n' \
+      "$d" "$NDISCS"
+    continue
+  fi
+
+  printf '  \033[32m✓\033[0m Disc %d of %d written\n' "$d" "$NDISCS"
+
+  if [ "$VERIFY" -eq 1 ] && [ "$DEMO" -eq 0 ]; then
+    if verify_disc "$d" "${#IDX[@]}"; then
+      printf '  \033[32m✓\033[0m Disc %d verified\n' "$d"
+    else
+      VERIFY_FAILED="${VERIFY_FAILED:-}$d "
+      printf '  \033[31m✗\033[0m Disc %d did not verify — see above\n' "$d"
+    fi
+    # We suppressed cdrecord's own eject to keep the disc readable; do it now
+    # so a multi-disc job still cues the next one the same way.
+    cdrecord -eject dev="$DEV" >/dev/null 2>&1 || true
+  fi
+  printf '\n'
+done
+
+# ------------------------------------------------------------------ summary --
+
+BURNED=$((NDISCS - FROM + 1))
+ELAPSED=$(( $(date +%s) - STARTED ))
+
+if [ "$DUMMY" -eq 1 ]; then
+  printf '  \033[1mRehearsal complete\033[0m — %d disc%s, %s elapsed.\n' \
+    "$BURNED" "$([ "$BURNED" -eq 1 ] || echo s)" "$(mmss "$ELAPSED")"
+  printf '  Every step ran except the laser. Drop --dummy to burn for real.\n\n'
+else
+  printf '  \033[1m%s\033[0m\n' "${ALBUM:-Done}"
+  printf '  %d disc%s of %d · %s of audio · %s elapsed\n\n' \
+    "$BURNED" "$([ "$BURNED" -eq 1 ] || echo s)" "$NDISCS" \
+    "$(mmss "$TOTAL")" "$(mmss "$ELAPSED")"
+  for d in $(seq "$FROM" "$NDISCS"); do
+    printf '  disc %d ' "$d"
+    strip "$d"
+  done
+  printf '\n'
+  if [ -n "${VERIFY_FAILED:-}" ]; then
+    printf '  \033[31mDiscs that did not verify: %s\033[0m\n\n' "$VERIFY_FAILED"
+    exit 1
+  fi
+fi

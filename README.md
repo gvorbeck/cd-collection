@@ -16,6 +16,20 @@ Three pages. Two read the sheet; the third is a print tool that doesn't:
 | `stats.html`  | Breakdowns by decade, genre, artist, and shelf.                    |
 | `labels.html` | Printable jewel-case inserts, typed by hand or sent over from a disc, kept in this browser. |
 
+### Also in here: `burncd`
+
+Not part of the site. [`scripts/burncd/`](scripts/burncd/README.md) is a
+command-line tool for the other half of this hobby — turning a folder of
+purchased music into an actual CD-R:
+
+```bash
+burncd ~/Music/Nonagon\ Infinity
+```
+
+Gapless, CD-Text, track order from tags rather than filenames, splits long sets
+across discs. Run `burncd --check` first on the machine with the burner attached.
+Full docs: [scripts/burncd/README.md](scripts/burncd/README.md).
+
 ## How it works
 
 - **Data** lives in a Google Sheet, published to the web as CSV. The page
@@ -314,6 +328,7 @@ to the shelf, in order, dated.
 | `scripts/make-icons.js` | Regenerates `icons/` — Node stdlib only, run by hand.             |
 | `scripts/snapshot.js`   | Regenerates `data/collection.csv` — likewise Node stdlib, run by hand. |
 | `scripts/check-shell-assets.js` | Checks `SHELL_ASSETS` in `sw.js` against the files actually in the tree. |
+| `scripts/burncd/`       | **[burncd](scripts/burncd/README.md)** — CLI that burns a folder of music to an audio CD. Nothing to do with the site; see below. |
 | `test/`                 | Unit tests for the pure helpers. See below.                       |
 | `.github/workflows/`    | Checks every push to `main` and every pull request; publishes `main` to Pages. See below. |
 | `sample.csv`            | Dummy data for local development (see below).                     |
