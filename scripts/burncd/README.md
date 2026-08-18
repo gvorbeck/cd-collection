@@ -129,6 +129,8 @@ names it in the summary.
 | `burncd --demo DIR` | Convert for real, show the cue sheet, simulate the burn |
 | `burncd --dummy DIR` | Rehearse the burn on the drive with the laser off |
 | `burncd --verify DIR` | Burn, then read the disc back and check it |
+| `burncd --edit DIR` | Reorder, rename and retag on screen before burning |
+| `burncd --level DIR` | Bring a quiet album up to normal CD loudness |
 | `burncd --split-long DIR` | Allow cutting a track that's longer than a disc |
 | `burncd --no-cdtext DIR` | Burn without CD-Text (fallback if the drive balks) |
 | `burncd --from-disc 3 DIR` | Resume a multi-disc job at disc 3 |
@@ -145,6 +147,9 @@ exactly what would land on which disc.
 | `BURNCD_DEV` | `IOCompactDiscServices` | cdrecord device. See troubleshooting. |
 | `BURNCD_SECONDS` | `4797` | Disc capacity. 4797 = 79:57, see below. |
 | `BURNCD_MINUTES` | — | Same thing in whole minutes, if you prefer. |
+| `BURNCD_LEVEL` | `off` | `album`, `track` or `off` — leveling without the flag. |
+| `BURNCD_LUFS` | `-11` | Loudness target. See leveling below. |
+| `BURNCD_PEAK` | `-1` | True-peak ceiling in dBTP. |
 
 ### Why 79:57 and not 80:00
 

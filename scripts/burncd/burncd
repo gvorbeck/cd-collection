@@ -7,6 +7,8 @@
 #   burncd -n ~/Music/Album        dry run: show the plan, burn nothing
 #   burncd --dummy ~/Music/Album   rehearse the burn with the laser off
 #   burncd --verify ~/Music/Album  read the disc back afterwards and check it
+#   burncd --edit ~/Music/Album    reorder, rename and retag before burning
+#   burncd --level ~/Music/Album   raise a quiet album to normal CD loudness
 #   burncd --split-long ~/Music/X  cut tracks longer than a disc into parts
 #   burncd --no-cdtext ~/Music/X   burn without CD-Text (fallback path)
 #   burncd --from-disc 3 ~/Music/X resume a multi-disc job at disc 3
@@ -24,6 +26,9 @@
 #   BURNCD_DEV     cdrecord device (default IOCompactDiscServices)
 #   BURNCD_SECONDS disc capacity in seconds (default 4797 = 79:57, a real 80min blank)
 #   BURNCD_MINUTES same, in whole minutes, if you prefer
+#   BURNCD_LEVEL   album | track | off — default for --level (default off)
+#   BURNCD_LUFS    loudness target in LUFS (default -11, typical for a CD)
+#   BURNCD_PEAK    true-peak ceiling in dBTP (default -1)
 
 set -euo pipefail
 
@@ -36,7 +41,19 @@ SPLIT_LONG=0
 CDTEXT=1
 DUMMY=0
 VERIFY=0
+EDIT=0
 FROM=1
+
+# Loudness matching. "album" applies one gain to the whole job so the relative
+# levels the mastering engineer chose survive; "track" levels each track on its
+# own, which is only right for a compilation of unrelated masters.
+LEVEL="${BURNCD_LEVEL:-off}"
+# -11 LUFS is about where a normal commercial CD sits. Chasing much louder than
+# that needs compression, which this deliberately will not do.
+LUFS_TARGET="${BURNCD_LUFS:--11}"
+# Leave a dB of true-peak headroom: inter-sample peaks can exceed the highest
+# sample, and some DACs clip reconstructing them even when the PCM is legal.
+PEAK_CEIL="${BURNCD_PEAK:--1}"
 
 BAR_WIDTH=42
 STRIP_WIDTH=46
@@ -65,6 +82,8 @@ human() { awk -v b="$1" 'BEGIN { printf "%.1f GB", b / 1073741824 }'; }
 # Free space, in bytes, on the filesystem holding $1.
 free_bytes() { df -k "$1" 2>/dev/null | awk 'NR == 2 { print $4 * 1024; exit }'; }
 
+file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
+
 # Env values reach arithmetic contexts, so reject junk before it becomes a
 # confusing shell error mid-burn.
 numeric() {
@@ -85,6 +104,19 @@ fi
 
 DISC_BYTES=$(( CAPACITY * BYTES_PER_SEC ))
 
+case "$LEVEL" in
+  album|track|off) ;;
+  *) die "--level must be album, track or off, got: $LEVEL" ;;
+esac
+
+# Signed decimals, so numeric() is the wrong check for these two.
+for pair in "BURNCD_LUFS=$LUFS_TARGET" "BURNCD_PEAK=$PEAK_CEIL"; do
+  case "${pair#*=}" in
+    -[0-9]*|[0-9]*) ;;
+    *) die "${pair%%=*} must be a number in dB, got: ${pair#*=}" ;;
+  esac
+done
+
 # ---------------------------------------------------------------- arguments --
 
 while [ $# -gt 0 ]; do
@@ -96,6 +128,9 @@ while [ $# -gt 0 ]; do
     --no-cdtext)    CDTEXT=0 ;;
     --dummy)        DUMMY=1 ;;
     --verify)       VERIFY=1 ;;
+    --edit|-e)      EDIT=1 ;;
+    --level)        LEVEL=album ;;
+    --level=*)      LEVEL="${1#--level=}" ;;
     --from-disc)    shift; FROM="${1:-}"
                     case "$FROM" in ''|*[!0-9]*|0) die "--from-disc needs a disc number" ;; esac ;;
     -h|--help)      usage 0 ;;
@@ -142,6 +177,13 @@ run_check() {
       ck ok "dither support" "triangular dither available"
     else
       ck warn "dither support" "no dither_method; 24-bit sources will truncate"
+    fi
+
+    # --level measures with ebur128 and applies the result with volume.
+    if ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' ebur128 '; then
+      ck ok "loudness" "ebur128 present — --level can measure"
+    else
+      ck warn "loudness" "no ebur128 filter; --level unavailable"
     fi
   fi
 
@@ -259,13 +301,13 @@ fi
 # ------------------------------------------------------------ read metadata --
 
 FILES=(); DURS=(); TITLES=(); ARTISTS=(); TRKNOS=(); DISCNOS=()
-ALBUM=""; ALBUM_ARTIST=""; UNTAGGED=0
+ALBUM=""; ALBUM_ARTIST=""; YEAR=""; UNTAGGED=0
 
 printf 'Reading %s\n' "$DIR" >&2
 
 while IFS= read -r f; do
   # One ffprobe call per file for duration and the tags we sort and label by.
-  dur=""; trk=""; disc=""; title=""; album=""; artist=""; aartist=""
+  dur=""; trk=""; disc=""; title=""; album=""; artist=""; aartist=""; year=""
   while IFS='=' read -r key val; do
     case "$key" in
       duration)                         dur="$val" ;;
@@ -275,9 +317,10 @@ while IFS= read -r f; do
       TAG:album)                        album="$val" ;;
       TAG:artist)                       artist="$val" ;;
       TAG:album_artist|TAG:albumartist) aartist="$val" ;;
+      TAG:date|TAG:year|TAG:originalyear) [ -z "$year" ] && year="$val" ;;
     esac
   done < <(ffprobe -v error -show_entries \
-      'format=duration:format_tags=track,tracknumber,disc,discnumber,title,album,artist,album_artist,albumartist' \
+      'format=duration:format_tags=track,tracknumber,disc,discnumber,title,album,artist,album_artist,albumartist,date,year,originalyear' \
       -of default=nw=1 "$f" 2>/dev/null || true)
 
   [ -n "$dur" ] && [ "$dur" != "N/A" ] || die "cannot read audio from $(basename "$f")"
@@ -296,6 +339,8 @@ while IFS= read -r f; do
   DISCNOS+=("$disc")
   [ -z "$ALBUM" ] && ALBUM="$album"
   [ -z "$ALBUM_ARTIST" ] && ALBUM_ARTIST="${aartist:-$artist}"
+  # Dates are often full ISO stamps; the year is the only part anyone labels with.
+  [ -z "$YEAR" ] && YEAR="${year%%-*}"
 done < <(
   find "$DIR" -maxdepth 1 -type f \
     \( -iname '*.aif' -o -iname '*.aiff' -o -iname '*.flac' -o -iname '*.mp3' \
@@ -319,49 +364,179 @@ done < <(
   done | LC_ALL=C sort -t"$(printf '\t')" -k1,1n -k2,2n -k3,3V | cut -f4
 )
 
+ORDER_ORIG=("${ORDER[@]}")
+
 if [ "$UNTAGGED" -eq 1 ]; then
   ORDER_NOTE="filename (some files have no track number)"
 else
   ORDER_NOTE="embedded track numbers"
 fi
 
+# ------------------------------------------------------------ loudness pass --
+
+# Measuring means decoding everything an extra time, so results are cached by
+# path+size+mtime. Re-burning the same album, or changing the order, is free.
+LEVEL_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/burncd/levels.tsv"
+
+hash_str() {
+  if   command -v md5    >/dev/null 2>&1; then printf '%s' "$1" | md5 -q
+  elif command -v md5sum >/dev/null 2>&1; then printf '%s' "$1" | md5sum | cut -d' ' -f1
+  else printf '%s' "$1" | cksum | tr -d ' '
+  fi
+}
+
+# EBU R128 integrated loudness and true peak, as "<LUFS><TAB><dBTP>".
+# Digital silence reads as -inf, which is not a number anything downstream can
+# use, so it is clamped to a value low enough to contribute no energy.
+measure_file() {  # measure_file <path>
+  ffmpeg -nostdin -nostats -i "$1" -map a:0 -af ebur128=peak=true -f null - 2>&1 \
+    | awk '
+        /^ *I: /    { lufs = $2 }
+        /^ *Peak: / { peak = $2 }
+        END {
+          if (lufs !~ /^-?[0-9.]+$/) lufs = -70
+          if (peak !~ /^-?[0-9.]+$/) peak = -70
+          printf "%s\t%s\n", lufs, peak
+        }'
+}
+
+LUFS_OF=(); PEAK_OF=(); TRACK_GAIN=()
+
+measure_all() {
+  local i f key hit line lufs peak n=0 total=${#FILES[@]} fresh=0
+
+  # The cache is an optimisation, never a requirement. If the directory cannot
+  # be created or written — read-only home, sandbox, odd permissions — measure
+  # every time and say nothing about it.
+  if mkdir -p "$(dirname "$LEVEL_CACHE")" 2>/dev/null &&
+     { [ -f "$LEVEL_CACHE" ] || : > "$LEVEL_CACHE"; } 2>/dev/null; then
+    :
+  else
+    LEVEL_CACHE=/dev/null
+  fi
+
+  for i in $(seq 0 $(( total - 1 ))); do
+    f=${FILES[$i]}
+    n=$(( n + 1 ))
+    key=$(hash_str "$f:$(file_size "$f"):$(stat -f%m "$f" 2>/dev/null || stat -c%Y "$f")")
+
+    hit=$(grep -m1 "^$key	" "$LEVEL_CACHE" 2>/dev/null || true)
+    if [ -n "$hit" ]; then
+      lufs=$(printf '%s' "$hit" | cut -f2); peak=$(printf '%s' "$hit" | cut -f3)
+    else
+      [ "$fresh" -eq 0 ] && printf '  Measuring loudness (first time for these files)\n' >&2
+      fresh=1
+      printf '\r\033[K    %d of %d — %.40s' "$n" "$total" "$(basename "$f")" >&2
+      line=$(measure_file "$f")
+      lufs=$(printf '%s' "$line" | cut -f1); peak=$(printf '%s' "$line" | cut -f2)
+      printf '%s\t%s\t%s\n' "$key" "$lufs" "$peak" >> "$LEVEL_CACHE" 2>/dev/null || true
+    fi
+
+    LUFS_OF+=("$lufs"); PEAK_OF+=("$peak")
+  done
+  [ "$fresh" -eq 1 ] && printf '\r\033[K' >&2
+
+  # Per-track gains are order-independent, so they are settled here once.
+  # Unlike album mode this may attenuate: matching unrelated masters to each
+  # other is the entire point, and that means bringing the loud ones down.
+  for i in $(seq 0 $(( total - 1 ))); do
+    TRACK_GAIN+=( "$(awk -v l="${LUFS_OF[$i]}" -v p="${PEAK_OF[$i]}" \
+      -v t="$LUFS_TARGET" -v c="$PEAK_CEIL" 'BEGIN {
+        gl = t - l; gh = c - p
+        printf "%.1f", (gl < gh ? gl : gh)
+      }')" )
+  done
+  return 0
+}
+
+# One gain for everything in the current playlist. Energy-weighted by duration,
+# which is how album gain has always been computed — averaging the dB figures
+# would let a short quiet intro drag the whole record up.
+ALBUM_GAIN=0.0
+ALBUM_BOUND=""
+compute_album_gain() {
+  local i out
+  out=$(
+    for i in $(seq 0 $(( N - 1 ))); do
+      printf '%s\t%s\t%s\n' "${P_DUR[$i]}" "${LUFS_OF[${P_SRC[$i]}]}" "${PEAK_OF[${P_SRC[$i]}]}"
+    done | awk -v t="$LUFS_TARGET" -v c="$PEAK_CEIL" '
+        { e += $1 * (10 ^ ($2 / 10)); d += $1; if (NR == 1 || $3 > pk) pk = $3 }
+        END {
+          if (d == 0 || e <= 0) { print "0.0\t"; exit }
+          lufs = 10 * log(e / d) / log(10)
+          gl = t - lufs           # how far under the target the album sits
+          gh = c - pk             # how much room is left before clipping
+          g  = (gl < gh ? gl : gh)
+          # Album mode only ever boosts. Turning a loud record down is not what
+          # "this disc plays quiet" asks for, and cutting to hit a loudness
+          # target would need a limiter, which would change the sound.
+          if (g < 0) g = 0
+          printf "%.1f\t%s\n", g, (gl < gh ? "loudness" : "peak")
+        }'
+  )
+  ALBUM_GAIN=$(printf '%s' "$out" | cut -f1)
+  ALBUM_BOUND=$(printf '%s' "$out" | cut -f2)
+}
+
+# The gain to apply to one playlist entry, as a bare dB number.
+gain_for() {  # gain_for <playlist-index>
+  case "$LEVEL" in
+    album) printf '%s' "$ALBUM_GAIN" ;;
+    track) printf '%s' "${TRACK_GAIN[${P_SRC[$1]}]}" ;;
+    *)     printf '0.0' ;;
+  esac
+}
+
+[ "$LEVEL" != off ] && measure_all
+
 # ------------------------------------------------------- playlist expansion --
 
 # Flatten into play order, cutting any track that cannot fit on one disc into
 # equal parts. P_OFF/P_LEN are empty for whole files and set for slices, which
-# is what tells the converter to seek. Everything downstream reads P_* only.
-P_FILE=(); P_DUR=(); P_TITLE=(); P_ARTIST=(); P_OFF=(); P_LEN=()
+# is what tells the converter to seek. P_SRC points back at the source file, so
+# a measured loudness can be found again after slicing and reordering.
+# Everything downstream reads P_* only.
+P_FILE=(); P_DUR=(); P_TITLE=(); P_ARTIST=(); P_OFF=(); P_LEN=(); P_SRC=()
 SPLIT_NOTE=""
 
-for k in "${ORDER[@]}"; do
-  if [ "${DURS[$k]}" -le "$CAPACITY" ]; then
-    P_FILE+=("${FILES[$k]}"); P_DUR+=("${DURS[$k]}")
-    P_TITLE+=("${TITLES[$k]}"); P_ARTIST+=("${ARTISTS[$k]}")
-    P_OFF+=(""); P_LEN+=("")
-    continue
-  fi
+# Rebuilt from scratch on every call, because --edit changes ORDER and the
+# whole layout has to be derived again from the new order.
+build_playlist() {
+  local k parts plen p off len
+  P_FILE=(); P_DUR=(); P_TITLE=(); P_ARTIST=(); P_OFF=(); P_LEN=(); P_SRC=()
+  SPLIT_NOTE=""
 
-  if [ "$SPLIT_LONG" -eq 0 ]; then
-    die "\"${TITLES[$k]}\" is $(mmss "${DURS[$k]}"), longer than a $(mmss "$CAPACITY") disc.
+  for k in "${ORDER[@]}"; do
+    if [ "${DURS[$k]}" -le "$CAPACITY" ]; then
+      P_FILE+=("${FILES[$k]}"); P_DUR+=("${DURS[$k]}")
+      P_TITLE+=("${TITLES[$k]}"); P_ARTIST+=("${ARTISTS[$k]}")
+      P_OFF+=(""); P_LEN+=(""); P_SRC+=("$k")
+      continue
+    fi
+
+    if [ "$SPLIT_LONG" -eq 0 ]; then
+      die "\"${TITLES[$k]}\" is $(mmss "${DURS[$k]}"), longer than a $(mmss "$CAPACITY") disc.
   Pass --split-long to cut it into equal parts across discs."
-  fi
+    fi
 
-  # Equal parts, so the tail is not a few-second stub.
-  parts=$(( (DURS[k] + CAPACITY - 1) / CAPACITY ))
-  plen=$(( (DURS[k] + parts - 1) / parts ))
-  for p in $(seq 0 $(( parts - 1 ))); do
-    off=$(( p * plen ))
-    len=$plen
-    [ $(( off + len )) -gt "${DURS[$k]}" ] && len=$(( DURS[k] - off ))
-    P_FILE+=("${FILES[$k]}"); P_DUR+=("$len")
-    P_TITLE+=("${TITLES[$k]} (part $(( p + 1 ))/$parts)")
-    P_ARTIST+=("${ARTISTS[$k]}")
-    P_OFF+=("$off"); P_LEN+=("$len")
+    # Equal parts, so the tail is not a few-second stub.
+    parts=$(( (DURS[k] + CAPACITY - 1) / CAPACITY ))
+    plen=$(( (DURS[k] + parts - 1) / parts ))
+    for p in $(seq 0 $(( parts - 1 ))); do
+      off=$(( p * plen ))
+      len=$plen
+      [ $(( off + len )) -gt "${DURS[$k]}" ] && len=$(( DURS[k] - off ))
+      P_FILE+=("${FILES[$k]}"); P_DUR+=("$len")
+      P_TITLE+=("${TITLES[$k]} (part $(( p + 1 ))/$parts)")
+      P_ARTIST+=("${ARTISTS[$k]}")
+      P_OFF+=("$off"); P_LEN+=("$len"); P_SRC+=("$k")
+    done
+    SPLIT_NOTE="split $parts ways"
   done
-  SPLIT_NOTE="split $parts ways"
-done
 
-N=${#P_FILE[@]}
+  N=${#P_FILE[@]}
+  [ "$N" -gt 0 ] || die "no tracks left to burn"
+}
 
 # -------------------------------------------------------------- disc layout --
 
@@ -380,67 +555,103 @@ discs_needed() {
   echo "$count"
 }
 
-TOTAL=0
-for i in $(seq 0 $(( N - 1 ))); do TOTAL=$(( TOTAL + P_DUR[i] )); done
+TOTAL=0; NDISCS=1; DISC_OF=()
 
-NEEDED=$(discs_needed "$CAPACITY")
-[ "$NEEDED" -gt 0 ] || die "a track is longer than a $(mmss "$CAPACITY") disc; pass --split-long"
+layout_discs() {
+  local i LO HI MID R NEEDED cur ntrk disc
 
-# Using the fewest discs, find the smallest capacity that still fits in that
-# many. This balances the discs instead of cramming disc 1 and leaving a stub.
-LO=0; for i in $(seq 0 $(( N - 1 ))); do [ "${P_DUR[$i]}" -gt "$LO" ] && LO=${P_DUR[$i]}; done
-HI=$CAPACITY
-while [ "$LO" -lt "$HI" ]; do
-  MID=$(( (LO + HI) / 2 ))
-  R=$(discs_needed "$MID")
-  if [ "$R" -gt 0 ] && [ "$R" -le "$NEEDED" ]; then HI=$MID; else LO=$((MID + 1)); fi
-done
-BALANCED=$LO
+  TOTAL=0
+  for i in $(seq 0 $(( N - 1 ))); do TOTAL=$(( TOTAL + P_DUR[i] )); done
 
-# Assign tracks to discs at the balanced capacity, preserving album order.
-# Must use the same rule as discs_needed() or the plan and the layout diverge.
-DISC_OF=(); cur=0; ntrk=0; disc=1
-for i in $(seq 0 $(( N - 1 ))); do
-  if [ $((cur + P_DUR[i])) -gt "$BALANCED" ] || [ "$ntrk" -ge "$MAX_TRACKS" ]; then
-    disc=$((disc + 1)); cur=${P_DUR[$i]}; ntrk=1
-  else
-    cur=$((cur + P_DUR[i])); ntrk=$((ntrk + 1))
-  fi
-  DISC_OF+=("$disc")
-done
-NDISCS=$disc
+  NEEDED=$(discs_needed "$CAPACITY")
+  [ "$NEEDED" -gt 0 ] || die "a track is longer than a $(mmss "$CAPACITY") disc; pass --split-long"
+
+  # Using the fewest discs, find the smallest capacity that still fits in that
+  # many. This balances the discs instead of cramming disc 1 and leaving a stub.
+  LO=0
+  for i in $(seq 0 $(( N - 1 ))); do [ "${P_DUR[$i]}" -gt "$LO" ] && LO=${P_DUR[$i]}; done
+  HI=$CAPACITY
+  while [ "$LO" -lt "$HI" ]; do
+    MID=$(( (LO + HI) / 2 ))
+    R=$(discs_needed "$MID")
+    if [ "$R" -gt 0 ] && [ "$R" -le "$NEEDED" ]; then HI=$MID; else LO=$((MID + 1)); fi
+  done
+  BALANCED=$LO
+
+  # Assign tracks to discs at the balanced capacity, preserving album order.
+  # Must use the same rule as discs_needed() or the plan and the layout diverge.
+  DISC_OF=(); cur=0; ntrk=0; disc=1
+  for i in $(seq 0 $(( N - 1 ))); do
+    if [ $((cur + P_DUR[i])) -gt "$BALANCED" ] || [ "$ntrk" -ge "$MAX_TRACKS" ]; then
+      disc=$((disc + 1)); cur=${P_DUR[$i]}; ntrk=1
+    else
+      cur=$((cur + P_DUR[i])); ntrk=$((ntrk + 1))
+    fi
+    DISC_OF+=("$disc")
+  done
+  NDISCS=$disc
+}
+
+# Everything after this point derives from ORDER, so a reorder is just a
+# rebuild of these three.
+replan() { build_playlist; layout_discs; [ "$LEVEL" = album ] && compute_album_gain; return 0; }
+replan
 
 # ----------------------------------------------------------------- the plan --
 
-printf '\n'
-if [ -n "$ALBUM" ]; then
-  if [ -n "$ALBUM_ARTIST" ]; then
-    printf '  \033[1m%s\033[0m — %s\n' "$ALBUM" "$ALBUM_ARTIST"
-  else
-    printf '  \033[1m%s\033[0m\n' "$ALBUM"
+plan_header() {
+  local why
+  if [ -n "$ALBUM" ]; then
+    if [ -n "$ALBUM_ARTIST" ]; then
+      printf '  \033[1m%s\033[0m — %s' "$ALBUM" "$ALBUM_ARTIST"
+    else
+      printf '  \033[1m%s\033[0m' "$ALBUM"
+    fi
+    [ -n "$YEAR" ] && printf ' \033[2m(%s)\033[0m' "$YEAR"
+    printf '\n'
   fi
-fi
-printf '  %d tracks, %s, ordered by %s\n' "$N" "$(mmss "$TOTAL")" "$ORDER_NOTE"
-if [ "$CDTEXT" -eq 1 ]; then
-  printf '  CD-Text: on — disc and track names written to the lead-in\n'
-else
-  printf '  CD-Text: off (--no-cdtext)\n'
-fi
-[ -n "$SPLIT_NOTE" ] && printf '  A track was longer than one disc and was %s\n' "$SPLIT_NOTE"
+  printf '  %d tracks, %s, ordered by %s\n' "$N" "$(mmss "$TOTAL")" "$ORDER_NOTE"
+  if [ "$CDTEXT" -eq 1 ]; then
+    printf '  CD-Text: on — disc and track names written to the lead-in\n'
+  else
+    printf '  CD-Text: off (--no-cdtext)\n'
+  fi
+  level_note
+  [ -n "$SPLIT_NOTE" ] && printf '  A track was longer than one disc and was %s\n' "$SPLIT_NOTE"
 
-if [ "$NDISCS" -gt 1 ]; then
-  # Say which limit was hit — runtime and the 99-track ceiling are very
-  # different problems, and "too long" is wrong when the album is 9 minutes.
-  if [ "$N" -gt "$MAX_TRACKS" ] && [ "$TOTAL" -gt "$CAPACITY" ]; then
-    why="too long and over $MAX_TRACKS tracks"
-  elif [ "$N" -gt "$MAX_TRACKS" ]; then
-    why="over the $MAX_TRACKS track limit of a CD"
-  else
-    why="too long for one disc"
+  if [ "$NDISCS" -gt 1 ]; then
+    # Say which limit was hit — runtime and the 99-track ceiling are very
+    # different problems, and "too long" is wrong when the album is 9 minutes.
+    if [ "$N" -gt "$MAX_TRACKS" ] && [ "$TOTAL" -gt "$CAPACITY" ]; then
+      why="too long and over $MAX_TRACKS tracks"
+    elif [ "$N" -gt "$MAX_TRACKS" ]; then
+      why="over the $MAX_TRACKS track limit of a CD"
+    else
+      why="too long for one disc"
+    fi
+    printf '  Splitting across %d discs — %s\n' "$NDISCS" "$why"
   fi
-  printf '  Splitting across %d discs — %s\n' "$NDISCS" "$why"
-fi
-printf '\n'
+  return 0
+}
+
+# What the loudness pass decided, and — just as important — why it stopped
+# where it did, so a disc that stays quiet is explained rather than mysterious.
+level_note() {
+  case "$LEVEL" in
+    off) return 0 ;;
+    track)
+      printf '  Level: each track matched to %s LUFS\n' "$LUFS_TARGET" ;;
+    album)
+      if [ "$ALBUM_GAIN" = "0.0" ]; then
+        printf '  Level: already at CD loudness, no change\n'
+      elif [ "$ALBUM_BOUND" = peak ]; then
+        printf '  Level: +%s dB — all the headroom there is before clipping\n' "$ALBUM_GAIN"
+      else
+        printf '  Level: +%s dB to reach %s LUFS\n' "$ALBUM_GAIN" "$LUFS_TARGET"
+      fi ;;
+  esac
+  return 0
+}
 
 # One segment per track, sized by its share of a whole disc, with the unused
 # tail left as dots. Makes "disc 2 is only two-thirds full" obvious at a glance,
@@ -467,18 +678,294 @@ strip() {  # strip <disc-number>
   printf '  %b  %s of %s\n' "$out" "$(mmss "$cum")" "$(mmss "$CAPACITY")"
 }
 
-for d in $(seq 1 "$NDISCS"); do
-  dtot=0; num=0
-  [ "$NDISCS" -gt 1 ] && printf '  \033[1mDisc %d\033[0m\n' "$d"
-  for i in $(seq 0 $(( N - 1 ))); do
-    [ "${DISC_OF[$i]}" -eq "$d" ] || continue
-    num=$((num + 1)); dtot=$((dtot + P_DUR[i]))
-    printf '   %2d. %-52.52s %6s\n' "$num" "${P_TITLE[$i]}" "$(mmss "${P_DUR[$i]}")"
-  done
-  printf '       %*s %6s\n' 52 "" "$(mmss "$dtot")"
-  strip "$d"
+# ---------------------------------------------------------------- edit screen --
+
+# A small full-screen editor for the things you only notice are wrong once you
+# see them laid out: the order, the names, and whether a disc is half empty.
+#
+# It edits ORDER and the source-level TITLES/ARTISTS rather than the flattened
+# playlist, so a track that had to be split across discs stays one row and one
+# name. replan() re-derives the split after every change, which is what makes
+# the disc boundaries move under the cursor as you reorder.
+
+tui_block()  { stty -echo -icanon min 1 time 0 2>/dev/null || true; }
+tui_cooked() { stty echo icanon 2>/dev/null || true; }
+
+# Every read here blocks. bash 3.2 has no sub-second read timeout, and the
+# obvious alternative — flipping the terminal between blocking and polling
+# around each keystroke — is worse than useless: stty flushes input that has
+# already arrived, so a fast escape sequence loses bytes and arrow keys go
+# missing. Staying in one mode means the three bytes of an arrow key are
+# always read together. The cost is that a bare ESC waits for another key,
+# which is why ESC is not bound to anything.
+KEY=""
+read_key() {
+  local k c
+  KEY=""
+  IFS= read -rsn1 k 2>/dev/null || return 1
+  # read discards its delimiter, so Return comes back as an empty string
+  # rather than as a newline. Reading exactly one byte makes that unambiguous.
+  [ -z "$k" ] && { KEY=$'\n'; return 0; }
+  if [ "$k" = $'\033' ]; then
+    IFS= read -rsn1 c 2>/dev/null || c=""
+    k="$k$c"
+    # CSI and SS3 sequences run until the first letter or tilde.
+    if [ "$c" = "[" ] || [ "$c" = "O" ]; then
+      while :; do
+        IFS= read -rsn1 c 2>/dev/null || break
+        [ -z "$c" ] && break
+        k="$k$c"
+        case "$c" in [A-Za-z~]) break ;; esac
+      done
+    fi
+  fi
+  KEY="$k"
+  return 0
+}
+
+# Ask for one value on the bottom line. Cooked mode, so backspace and paste
+# behave the way they do everywhere else. Empty input keeps what was there.
+#
+# The prompt is drawn on the terminal directly rather than on stdout: callers
+# capture this function's stdout to get the new value, and anything printed
+# there would end up inside the value.
+tui_prompt() {  # tui_prompt <label> <current>
+  local reply
+  tui_cooked
+  printf '\033[?25h\r\033[K  \033[1m%s\033[0m \033[2m[%s]\033[0m ' "$1" "${2:-empty}" > /dev/tty
+  IFS= read -r reply || reply=""
+  printf '\033[?25l' > /dev/tty
+  tui_block
+  [ -n "$reply" ] && printf '%s' "$reply" || printf '%s' "$2"
+}
+
+fit() { printf '%-*.*s' "$2" "$2" "$1"; }
+
+TUI_ROWS=0
+tui_draw() {  # tui_draw <cursor> <top> <status>
+  local cur=$1 top=$2 status=$3 rows i k row d lastd=0 mark line vis
+  rows=$(tput lines 2>/dev/null || echo 24)
+  vis=$(( rows - 12 )); [ "$vis" -lt 4 ] && vis=4
+  TUI_ROWS=$vis
+
+  printf '\033[H\033[2J'
+  printf '  \033[1mburncd\033[0m \033[2m— %d track%s, %s, %d disc%s\033[0m\n\n' \
+    "${#ORDER[@]}" "$([ ${#ORDER[@]} -eq 1 ] || echo s)" \
+    "$(mmss "$TOTAL")" "$NDISCS" "$([ "$NDISCS" -eq 1 ] || echo s)"
+
+  # The three disc-level fields, selectable as cursor rows -3, -2, -1.
+  tui_field() {  # tui_field <slot> <label> <value>
+    if [ "$cur" -eq "$1" ]; then
+      printf '  \033[7m %-7s %s \033[0m\n' "$2" "${3:-—}"
+    else
+      printf '   \033[2m%-7s\033[0m %s\n' "$2" "${3:-—}"
+    fi
+  }
+  tui_field 0 Album  "$ALBUM"
+  tui_field 1 Artist "$ALBUM_ARTIST"
+  tui_field 2 Year   "$YEAR"
   printf '\n'
-done
+
+  for k in $(seq "$top" $(( top + vis - 1 ))); do
+    [ "$k" -lt "${#ORDER[@]}" ] || break
+    row=$(( k + 3 ))
+    i=${ORDER[$k]}
+    d=$(tui_disc_of "$k")
+    if [ "$d" != "$lastd" ]; then
+      printf '   \033[2m── disc %s ──\033[0m\n' "$d"
+      lastd=$d
+    fi
+    mark=" "; [ "$cur" -eq "$row" ] && mark="▸"
+    line=$(printf '%s %2d  %s  %s %6s' "$mark" $(( k + 1 )) \
+      "$(fit "${TITLES[$i]}" 34)" "$(fit "${ARTISTS[$i]}" 20)" "$(mmss "${DURS[$i]}")")
+    if [ "$cur" -eq "$row" ]; then
+      printf ' \033[7m%s\033[0m\n' "$line"
+    else
+      printf ' %s\n' "$line"
+    fi
+  done
+
+  [ $(( top + vis )) -lt "${#ORDER[@]}" ] && printf '   \033[2m  … %d more\033[0m\n' \
+    $(( ${#ORDER[@]} - top - vis ))
+
+  printf '\n'
+  # The strip for whichever disc the cursor is sitting on, so the effect of a
+  # reorder on disc fullness is visible while you are doing it.
+  if [ "$cur" -ge 3 ]; then
+    printf '  \033[2mdisc %s\033[0m' "$(tui_disc_of $(( cur - 3 )))"
+    strip "$(tui_disc_of $(( cur - 3 )))"
+  else
+    printf '\n'
+  fi
+
+  printf '\n  \033[2m↑↓ select   ⇧↑↓ or J/K reorder   ⏎ rename   a artist   x drop'
+  printf '\n  u undo   r reset   b burn   q quit\033[0m\n'
+  [ -n "$status" ] && printf '\n  %b\n' "$status"
+  return 0
+}
+
+# Which disc a source track lands on: the disc of its first playlist entry.
+tui_disc_of() {  # tui_disc_of <order-index>
+  local k=$1 i
+  for i in $(seq 0 $(( N - 1 ))); do
+    [ "${P_SRC[$i]}" -eq "${ORDER[$k]}" ] && { printf '%s' "${DISC_OF[$i]}"; return 0; }
+  done
+  printf '1'
+}
+
+DROPPED=()
+tui_edit() {
+  local cur=3 top=0 status="" n k tmp saved_stty
+
+  [ -t 0 ] && [ -t 1 ] || die "--edit needs a terminal"
+
+  saved_stty=$(stty -g 2>/dev/null || true)
+  # Alternate screen, so quitting leaves the scrollback exactly as it was.
+  printf '\033[?1049h\033[?25l'
+  tui_block
+  # shellcheck disable=SC2064
+  trap "stty $saved_stty 2>/dev/null; printf '\033[?25h\033[?1049l'; exit 130" INT
+
+  while :; do
+    n=${#ORDER[@]}
+    [ "$cur" -lt 3 ] || [ "$cur" -lt $(( n + 3 )) ] || cur=$(( n + 2 ))
+    [ "$cur" -ge 0 ] || cur=0
+    # Keep the cursor inside the viewport.
+    if [ "$cur" -ge 3 ]; then
+      k=$(( cur - 3 ))
+      [ "$k" -lt "$top" ] && top=$k
+      [ "$k" -ge $(( top + TUI_ROWS )) ] && [ "$TUI_ROWS" -gt 0 ] && top=$(( k - TUI_ROWS + 1 ))
+    fi
+    [ "$top" -lt 0 ] && top=0
+
+    tui_draw "$cur" "$top" "$status"
+    status=""
+    read_key || break
+
+    case "$KEY" in
+      $'\033[A'|k)      cur=$(( cur - 1 )) ;;
+      $'\033[B'|j)      cur=$(( cur + 1 )) ;;
+      $'\033[1;2A'|K)   tui_move "$cur" -1 && cur=$(( cur - 1 )) ;;
+      $'\033[1;2B'|J)   tui_move "$cur"  1 && cur=$(( cur + 1 )) ;;
+      $'\033[5~')       cur=$(( cur - TUI_ROWS )) ;;
+      $'\033[6~')       cur=$(( cur + TUI_ROWS )) ;;
+      $'\n'|$'\r')      tui_rename "$cur" ;;
+      a|A)              tui_artist "$cur" ;;
+      x|d)              tui_drop "$cur" && status="\033[2mdropped — u to undo\033[0m" ;;
+      u|U)              tui_undo && status="\033[2mrestored\033[0m" ;;
+      r|R)              ORDER=("${ORDER_ORIG[@]}"); DROPPED=(); replan
+                        status="\033[2mback to the original order\033[0m" ;;
+      b|B|$' ')         break ;;
+      q|Q)              stty "$saved_stty" 2>/dev/null || true
+                        printf '\033[?25h\033[?1049l'
+                        trap - INT
+                        die "cancelled" ;;
+    esac
+  done
+
+  stty "$saved_stty" 2>/dev/null || true
+  printf '\033[?25h\033[?1049l'
+  trap - INT
+  return 0
+}
+
+# Swap a track with its neighbour. Returns nonzero when the move is impossible,
+# so the caller knows not to move the cursor with it.
+tui_move() {  # tui_move <cursor> <delta>
+  local cur=$1 delta=$2 k j tmp
+  [ "$cur" -ge 3 ] || return 1
+  k=$(( cur - 3 )); j=$(( k + delta ))
+  [ "$j" -ge 0 ] && [ "$j" -lt "${#ORDER[@]}" ] || return 1
+  tmp=${ORDER[$k]}; ORDER[$k]=${ORDER[$j]}; ORDER[$j]=$tmp
+  replan
+  return 0
+}
+
+tui_rename() {  # tui_rename <cursor>
+  local cur=$1 i
+  case "$cur" in
+    0) ALBUM=$(tui_prompt "Album" "$ALBUM") ;;
+    1) ALBUM_ARTIST=$(tui_prompt "Artist" "$ALBUM_ARTIST") ;;
+    2) YEAR=$(tui_prompt "Year" "$YEAR") ;;
+    *) i=${ORDER[$(( cur - 3 ))]}
+       TITLES[$i]=$(tui_prompt "Title" "${TITLES[$i]}")
+       replan ;;
+  esac
+  return 0
+}
+
+tui_artist() {  # tui_artist <cursor>
+  local cur=$1 i
+  if [ "$cur" -lt 3 ]; then
+    ALBUM_ARTIST=$(tui_prompt "Artist" "$ALBUM_ARTIST")
+  else
+    i=${ORDER[$(( cur - 3 ))]}
+    ARTISTS[$i]=$(tui_prompt "Track artist" "${ARTISTS[$i]}")
+    replan
+  fi
+  return 0
+}
+
+# Dropping keeps the removed entry and its position, so undo puts it back
+# where it was rather than on the end.
+tui_drop() {  # tui_drop <cursor>
+  local cur=$1 k j
+  local -a rest; rest=()
+  [ "$cur" -ge 3 ] || return 1
+  [ "${#ORDER[@]}" -gt 1 ] || return 1
+  k=$(( cur - 3 ))
+  DROPPED+=("$k:${ORDER[$k]}")
+  for j in $(seq 0 $(( ${#ORDER[@]} - 1 ))); do
+    [ "$j" -eq "$k" ] || rest+=("${ORDER[$j]}")
+  done
+  ORDER=("${rest[@]}")
+  replan
+  return 0
+}
+
+tui_undo() {
+  local last k i j placed=0
+  local -a out; out=()
+  [ "${#DROPPED[@]}" -gt 0 ] || return 1
+  last=${DROPPED[$(( ${#DROPPED[@]} - 1 ))]}
+  k=${last%%:*}; i=${last#*:}
+  for j in $(seq 0 $(( ${#ORDER[@]} - 1 ))); do
+    [ "$j" -eq "$k" ] && { out+=("$i"); placed=1; }
+    out+=("${ORDER[$j]}")
+  done
+  [ "$placed" -eq 1 ] || out+=("$i")
+  ORDER=("${out[@]}")
+  unset "DROPPED[$(( ${#DROPPED[@]} - 1 ))]"
+  DROPPED=(${DROPPED[@]+"${DROPPED[@]}"})
+  replan
+  return 0
+}
+
+show_plan() {
+  local d dtot num i
+  printf '\n'
+  plan_header
+  printf '\n'
+  for d in $(seq 1 "$NDISCS"); do
+    dtot=0; num=0
+    [ "$NDISCS" -gt 1 ] && printf '  \033[1mDisc %d\033[0m\n' "$d"
+    for i in $(seq 0 $(( N - 1 ))); do
+      [ "${DISC_OF[$i]}" -eq "$d" ] || continue
+      num=$((num + 1)); dtot=$((dtot + P_DUR[i]))
+      printf '   %2d. %-52.52s %6s\n' "$num" "${P_TITLE[$i]}" "$(mmss "${P_DUR[$i]}")"
+    done
+    printf '       %*s %6s\n' 52 "" "$(mmss "$dtot")"
+    strip "$d"
+    printf '\n'
+  done
+  return 0
+}
+
+[ "$EDIT" -eq 1 ] && tui_edit
+
+# The plan is printed even after the edit screen: the alternate screen is gone
+# by now, so this is the copy that stays in the scrollback next to the burn.
+show_plan
 
 [ "$DRY_RUN" -eq 1 ] && exit 0
 
@@ -688,8 +1175,6 @@ cue_text() {
   printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177"\\' | cut -c1-120
 }
 
-file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
-
 # --------------------------------------------------------------- verifying --
 
 # Reads the finished disc back and reports whether it is sound.
@@ -824,14 +1309,24 @@ for d in $(seq "$FROM" "$NDISCS"); do
     # ffmpeg does NOT dither by default (dither_method=0), so a 24-bit source
     # would be truncated to 16-bit. Triangular dither is the safe default.
     # Raw s16le out, appended straight onto the image.
+    #
+    # Any level change goes in ahead of the dither and in floating point, so
+    # the gain is applied once, at full precision, and quantisation happens
+    # exactly once at the end. It is a plain gain — no compression, no
+    # limiting — which is why it can only go as loud as the headroom allows.
+    g=$(gain_for "$i")
+    if [ "$g" = "0.0" ]; then
+      FILTER='aresample=out_sample_fmt=s16:dither_method=triangular'
+    else
+      FILTER="aformat=sample_fmts=fltp,volume=${g}dB,aresample=out_sample_fmt=s16:dither_method=triangular"
+    fi
+
     if [ -n "${P_OFF[$i]}" ]; then
       ffmpeg -nostdin -v error -ss "${P_OFF[$i]}" -i "${P_FILE[$i]}" \
-        -t "${P_LEN[$i]}" -map a:0 \
-        -af 'aresample=out_sample_fmt=s16:dither_method=triangular' \
+        -t "${P_LEN[$i]}" -map a:0 -af "$FILTER" \
         -ar 44100 -ac 2 -c:a pcm_s16le -f s16le - >> "$IMAGE"
     else
-      ffmpeg -nostdin -v error -i "${P_FILE[$i]}" -map a:0 \
-        -af 'aresample=out_sample_fmt=s16:dither_method=triangular' \
+      ffmpeg -nostdin -v error -i "${P_FILE[$i]}" -map a:0 -af "$FILTER" \
         -ar 44100 -ac 2 -c:a pcm_s16le -f s16le - >> "$IMAGE"
     fi
 
@@ -849,6 +1344,9 @@ for d in $(seq "$FROM" "$NDISCS"); do
 
   # --- cue sheet ------------------------------------------------------------
   {
+    # CD-Text has no year field, so the date can only be a cue comment. Some
+    # rippers and players read REM DATE; a CD player's display never will.
+    [ -n "$YEAR" ] && printf 'REM DATE %s\n' "$(cue_text "$YEAR")"
     if [ "$CDTEXT" -eq 1 ]; then
       [ -n "$ALBUM_ARTIST" ] && printf 'PERFORMER "%s"\n' "$(cue_text "$ALBUM_ARTIST")"
       [ -n "$ALBUM" ]        && printf 'TITLE "%s"\n'     "$(cue_text "$ALBUM")"
