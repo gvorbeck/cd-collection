@@ -216,6 +216,136 @@ for a full disc — and stops with a clear message rather than dying at 90%. Set
 
 ---
 
+## Changing the plan first: `--edit`
+
+Tags are often wrong, and the wrong ones are burned into the lead-in permanently.
+`--edit` puts the plan on screen and lets you fix it before anything is written:
+
+```
+  burncd — 6 tracks, 1:23, 1 disc
+
+   Album   Nonagon Infinity
+   Artist  King Gizzard
+   Year    2016
+
+   ── disc 1 ──
+ ▸  1  Robot Stop                          King Gizzard           0:12
+    2  Big Fig Wasp                        King Gizzard           0:10
+    3  Gamma Knife                         King Gizzard           0:14
+    4  People-Vultures                     King Gizzard           0:11
+    5  Mr Beat                             King Gizzard           0:16
+    6  Evil Death Roll                     King Gizzard           0:20
+
+  disc 1  ··············································  1:23 of 79:57
+
+  ↑↓ select   ⇧↑↓ or J/K reorder   ⏎ rename   a artist   x drop
+  u undo   r reset   b burn   q quit
+```
+
+| Key | What it does |
+| --- | --- |
+| `↑` `↓` or `k` `j` | Move the selection. It runs through the three header fields and then the tracks. |
+| `⇧↑` `⇧↓` or `K` `J` | Move the selected track up or down in the running order. |
+| `⏎` | Rename whatever is selected — album, artist, year, or a track title. |
+| `a` | Edit the artist of the selected track, for compilations with a different name per track. |
+| `x` or `d` | Drop the selected track from the burn. The file is untouched. |
+| `u` | Undo the last drop, back into the position it came from. |
+| `r` | Reset everything to the original tags and order. |
+| `b` or `space` | Accept the plan and burn. |
+| `q` | Quit without burning. |
+| `PgUp` `PgDn` | Page through a long track list. |
+
+Nothing here touches your files. Edits apply to this burn only — to the CD-Text
+in the lead-in and to the cue sheet — and they are gone when the command exits.
+
+The disc layout is recomputed after every change, so on a multi-disc set the
+`── disc N ──` separators and the capacity bar move as you reorder or drop
+tracks; you can see a disc boundary land somewhere better in real time.
+
+The screen draws on the terminal's alternate buffer, so when it closes your
+scrollback is exactly as it was. The plan is then printed normally, which is the
+copy that stays on screen next to the burn.
+
+Year is worth setting even though no CD player will ever show it — CD-Text has no
+year field. It is written to the cue sheet as `REM DATE`, which some ripping
+software reads back when the disc is later imported.
+
+---
+
+## Loudness: `--level`
+
+Some albums are mastered quiet and play noticeably softer than everything else in
+the changer. `--level` measures the album and raises it:
+
+```
+  Nonagon Infinity — King Gizzard (2016)
+  6 tracks, 1:23, ordered by embedded track numbers
+  CD-Text: on — disc and track names written to the lead-in
+  Level: +33.4 dB to reach -11 LUFS
+```
+
+**It only ever applies gain — a single volume change.** No compression, no
+limiting, no normalization per track by default. It cannot make a record sound
+squashed, because it has no mechanism to; the dynamics that come out are exactly
+the ones that went in, moved up as a whole.
+
+The gain is whichever is smaller of two numbers:
+
+- how much is needed to hit the loudness target (`-11` LUFS, about where a
+  typical commercial CD sits), and
+- how much headroom there is before the loudest true peak reaches the ceiling
+  (`-1` dBTP).
+
+So a quiet record gets the full boost, and a record that is already loud gets
+whatever fits under the ceiling — often nothing:
+
+```
+  Level: already at CD loudness, no change
+```
+
+When the peak is what stops it rather than the target, the plan says so, because
+that is the case where you don't get all the way to the target:
+
+```
+  Level: +41.1 dB — all the headroom there is before clipping
+```
+
+The ceiling is `-1` dBTP rather than `0` on purpose. **True** peak is not the
+highest sample: reconstructing the waveform between samples can overshoot them,
+and a signal that measures 0 dBFS in the file can clip a player's DAC anyway. A
+dB of margin costs nothing audible and avoids that.
+
+### Album gain vs track gain
+
+`--level` is album mode: **one gain across the whole disc**. Quiet interludes stay
+quiet relative to the loud tracks, because that relationship is a decision someone
+made and it is not burncd's to overrule. Album mode also never turns anything
+*down*.
+
+`--level=track` measures and levels each track independently. That is right for a
+mixtape of unrelated masters, where the tracks have no relationship to preserve,
+and wrong for an album. It does attenuate — matching a set means bringing the loud
+ones down as well as the quiet ones up.
+
+```bash
+burncd --level ~/Music/QuietAlbum       # one gain for the record
+burncd --level=track ~/Music/Mixtape    # every track to the same loudness
+BURNCD_LUFS=-14 burncd --level ~/Music/Album   # quieter target
+BURNCD_LEVEL=album burncd ~/Music/Album        # on by default, no flag
+```
+
+Measuring reads every file end to end — roughly as long as converting them — so
+the first run on an album is slower and says so. Results are cached under
+`~/.cache/burncd`, keyed by path, size and mtime, so re-runs and the eventual real
+burn are instant. If that directory can't be written, it measures every time and
+doesn't complain about it.
+
+Gain is applied in floating point and quantized to 16-bit once, at the end of the
+chain, with the same triangular dither as everything else. `--check` reports
+whether your ffmpeg has the `ebur128` filter this needs.
+
+---
+
 ## What it looks like
 
 ### The plan
