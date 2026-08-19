@@ -268,6 +268,12 @@ followed by a repaint, so holding an arrow key down does not strobe. Building a
 frame costs no subprocesses at all, which is what keeps that redraw under a
 frame's worth of time on a folder of any size.
 
+The number of tracks shown is whatever the window has room for, counted rather
+than guessed — the disc rules on a multi-disc split take rows too, and a frame
+one line taller than the window scrolls the panel's own header away where no
+later redraw can reach it. Below 19 rows there is no room for a panel at all, so
+a very short window falls through to the static plan the same way a pipe does.
+
 **`b` is what starts the burn** — or `space`, whichever your hand finds first.
 Nothing is written, converted, or asked of the drive until then, so there is no
 cost to opening the screen, looking, and leaving with `q`.
@@ -289,9 +295,9 @@ Nothing here touches your files. Edits apply to this burn only — to the CD-Tex
 in the lead-in and to the cue sheet — and they are gone when the command exits.
 
 The editor needs a terminal and something to decide, so `-n` and any piped or
-redirected run skip it and print the static plan instead. After you press `b`,
-that same static plan is printed to the scrollback, so the burn log has the
-final running order sitting above it.
+redirected run skip it and print the static plan instead. Pressing `b` does not
+close the editor so much as turn the page: the screen stays where it is and the
+burn happens on it. See [one screen, start to finish](#one-screen-start-to-finish).
 
 The disc layout is recomputed after every change, so on a multi-disc set the
 `━━ DISC N` separators and the meter move as you reorder or drop tracks; you can
@@ -299,9 +305,8 @@ see a disc boundary land somewhere better in real time. The meter always shows
 the disc the cursor is on, with a minute scale under it, so "where does this
 disc end?" and "how full is it?" are the same glance.
 
-The screen draws on the terminal's alternate buffer, so when it closes your
-scrollback is exactly as it was. The plan is then printed normally, which is the
-copy that stays on screen next to the burn.
+The screen draws on the terminal's alternate buffer, so nothing above it moves
+and none of it is in your scrollback afterwards.
 
 Year is worth setting even though no CD player will ever show it — CD-Text has no
 year field. It is written to the cue sheet as `REM DATE`, which some ripping
@@ -389,8 +394,8 @@ whether your ffmpeg has the `ebur128` filter this needs.
 
 What a normal run opens with. It is the editor described above — arrow around
 it, fix what's wrong, `b` when it's right — and this is the plain-text copy of
-the same thing, which is what `-n` prints and what lands in the scrollback next
-to the burn once the editor closes:
+the same thing, which is what `-n` prints and what lands in your scrollback once
+the job is over:
 
 ```
   Nonagon Infinity — King Gizzard
@@ -402,7 +407,7 @@ to the burn once the editor closes:
     ...
    12. Road Train                                             4:12
                                                              41:38
-                                                          41:38 / 79:57
+  DISC 1                                                  41:38 / 79:57
   ▐▓▓▓▎▓▓▓▊▓▓▌▓▓▓▏▓▓▓▊▓▓▓▎▓▓▌▓▓▓▓▏▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
    0               20               40               60             80
 ```
@@ -439,26 +444,68 @@ part of the meter rather than as the end of it.
 The scale underneath is spaced from the disc's capacity — every 20 minutes on a
 Red Book disc, closer together on the short ones `BURNCD_MINUTES` can ask for.
 
+### One screen, start to finish
+
+Pressing `b` does not drop you back to the shell. The alternate screen the
+editor opened is held for the whole job, and every step after it is drawn over
+the last one from the same home position: waiting for a disc, converting it,
+writing it, and the disc-by-disc report at the end are four states of one
+instrument, not four messages stacked up a scrolling terminal.
+
+Every stage has the same shape — the badge and what is happening now across the
+top, the album under it, the stage's own body, then whatever has already happened,
+and last of all the keys you can press:
+
+```
+   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ INSERT · DISC 2 OF 2
+
+    ALBUM    John Denver's Greatest Hits
+
+  DISC 2                                                  72:35 / 79:57
+  ▐▓▓▓▌▓▓▓▓▉▓▊▓▋▓▌▓▓▓▉▓▓▓▓▎▓▓▓▋▓▓▊▓▓▉▓▓▓▓▓▓▓▓▓▓▉▓▓▓▊▓▓▓▊▓▓▓▊▓▓▓▊░░░░░░▌
+   0               20               40               60             80
+
+  INSERT a blank CD-R for disc 2 of 2
+
+  ✓ Disc 1 of 2 written
+
+   ⏎  BURN    Q  CANCEL
+```
+
+The meter is the one you approved in the plan, for the disc about to be written,
+so the thing going into the drive is on screen while you feed it. Underneath it
+is the running log — discs finished, verify results, anything the drive had to
+say. Those lines used to print wherever the cursor happened to be, over the top
+of whatever was being drawn at the time; now they join the frame they belong to
+and it is redrawn around them. If the log outgrows the window, the oldest lines
+scroll out of the panel rather than pushing its header off the top of the screen.
+
+Converting is the same frame with the capacity meter filling as each track is
+encoded, so the wait before the laser looks like the wait during it.
+
 ### Burning
 
 ```
    BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ WRITING · DISC 1 OF 2 ·  54%
 
+    ALBUM    Nonagon Infinity
+
     TRACK    06 OF 11  Rhymes and Reasons ("Greatest Hits" Version)
     WRITTEN  329 OF 605 MB AT 8.0x
     BUFFER   97%   ELAPSED 0:42   REMAINING 0:36
 
-  ▐▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▊░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
-  ▐····························█▓▒▒░░·································▌
+  ▐▓▓▓▓▓▍▓▓▓▓▎▓▓▓▓▋▓▓▓▓▋▓▓▓▓▓▏▓▓▓▓▓▓▌░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
+  ▐·······················░░▒▒▓█······································▌
 ```
 
 Same badge, same grid, same amber as the plan. **The progress bar is the capacity
-meter again** — the bands are the tracks, in the same alternating ambers, so the
-plan you approved and the disc coming out of it are visibly the same picture at
-two moments. The part not yet written is the same run-out the meter uses for the
-empty end of a disc, and the write head is a partial block rather than a whole
-one, so on a bar this wide it creeps forward continuously instead of sitting
-still and then jumping a cell.
+meter again** — literally the same two functions, one deciding the band widths
+and one drawing them, so the plan you approved and the disc coming out of it are
+the same picture at two moments and cannot drift apart. The bands are the tracks
+in the same alternating ambers, with the same partial blocks on the boundaries;
+the part not yet written is the same run-out the meter uses for the empty end of
+a disc; and the write head is a partial block too, so on a bar this wide it
+creeps forward continuously instead of sitting still and then jumping a cell.
 
 The second line is a lamp sweeping a dark field, in the position the plan gives
 its minute scale. It moves on every message from the drive, which is the point: a

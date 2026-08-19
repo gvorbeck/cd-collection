@@ -159,7 +159,86 @@ term_size() {  # term_size -> $TERM_LINES, $TERM_COLS
   return 0
 }
 
-die() { printf '\nburncd: %s\n' "$1" >&2; exit 1; }
+# ---------------------------------------------------------------- the screen --
+
+# burncd is one instrument for the length of a job, not a program that prints.
+#
+# Everything from the edit panel to the last disc happens on the alternate
+# screen: the plan, the prompt for a blank disc, the conversion, the burn and the
+# summary are stages of one display, and each one is laid over the last from the
+# home position. Nothing scrolls, nothing stacks, and the scrollback underneath
+# is untouched until the job is over — at which point burncd steps off the
+# alternate screen and prints the plan and the summary into the terminal proper,
+# so there is still a record of what was burned.
+#
+# It is all-or-nothing on purpose. A pipe, a dry run, or a window too small to
+# hold the panel gets the old behaviour, printed line by line, and every stage
+# below checks $SCREEN rather than assuming it owns the terminal.
+SCREEN=0
+SCREEN_STTY=''
+
+screen_on() {
+  [ "$SCREEN" -eq 1 ] && return 0
+  [ -t 0 ] && [ -t 1 ] || return 1
+  SCREEN_STTY=$(stty -g 2>/dev/null || true)
+  # Erase on the way in only. Every frame after this one is laid over its
+  # predecessor rather than drawn on a cleared screen — see paint().
+  printf '\033[?1049h\033[?25l\033[H\033[2J'
+  SCREEN=1
+  # Drop the cached window size when the window changes, so the next frame
+  # measures again and every other frame does not have to.
+  trap 'TERM_LINES=; TERM_COLS=' WINCH
+  # From here to the end of the job there is no moment where a Ctrl-C leaves the
+  # terminal on the alternate screen in raw mode. The burn loop replaces this
+  # with one that also takes the working directory with it.
+  trap 'screen_off; printf "\n"; exit 130' INT
+  return 0
+}
+
+# Idempotent, and called from die() and from the exit trap as much as from the
+# ordinary end of a job: whatever goes wrong, the terminal is handed back with
+# its cursor visible, its modes as they were, and the scrollback intact.
+screen_off() {
+  [ "$SCREEN" -eq 1 ] || return 0
+  SCREEN=0
+  [ -n "$SCREEN_STTY" ] && stty "$SCREEN_STTY" 2>/dev/null || true
+  printf '\033[?25h\033[?1049l'
+  return 0
+}
+
+# Lay one frame over the screen from the home position.
+#
+# No erase first, and one write for the whole frame. Clearing and then drawing is
+# two pictures the terminal genuinely paints, so the blank one shows through as a
+# flash — and printing a panel line by line lets the screen refresh mid-frame on
+# top of that. Instead: end every line with an erase-to-end-of-line so a line that
+# got shorter cannot leave the tail of the old one behind, and \033[J at the
+# bottom to clear whatever the previous frame had below this one. Nothing is ever
+# blank in between, so there is nothing to flicker.
+#
+# The frame must be at most one line shorter than the window. \033[H is absolute,
+# so a frame that scrolls the terminal loses its own top row permanently — the
+# next frame homes to a row that now holds something else.
+paint() {  # paint <frame>
+  local nl=$'\n' eol=$'\033[K\n'
+  printf '\033[H%s\033[K\n\033[J' "${1//$nl/$eol}"
+  return 0
+}
+
+# The faceplate every screen wears: engraved badge, a rule across the panel, and
+# the state of the machine stamped at the far end the way a deck prints its mode.
+# The plan, the editor, each burn stage and the summary all print this same line,
+# which is most of why they read as one instrument.
+faceplate() {  # faceplate <meta>
+  local rule=$(( PANEL - 10 - ${#1} ))
+  [ "$rule" -lt 2 ] && rule=2
+  repv '━' "$rule"
+  printf '  %b BURNCD %b %b%s%b %b%s%b\n' \
+    "$BADGE" "$OFF" "$ETCH" "$REP" "$OFF" "$ETCH" "$1" "$OFF"
+  return 0
+}
+
+die() { screen_off; printf '\nburncd: %s\n' "$1" >&2; exit 1; }
 
 usage() {
   awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
@@ -766,93 +845,105 @@ level_note() {
 # band over the incoming one. That is eight times what the bar could otherwise
 # resolve without taking a single extra column, which matters because a half-full
 # disc of eleven tracks only has a few cells to give each one.
-strip() {  # strip <disc-number> [panel-label]
-  local d=$1 lbl="${2:-}" i n=0 cum=0 units filled=0 used=0 left=0 best bi c
-  local b=0 j out="" scale="" col=0 m p tot step want
-  local curfg='' curbg=''
-  local -a DUR HC REM
-  DUR=(); HC=(); REM=()
+#
+# The plan's meter and the burn screen's progress bar are the same instrument at
+# two moments, so they are the same two functions: bands() decides the widths and
+# bandbar() draws them. They were a copy of each other for a while and promptly
+# drifted — the burn bar quietly stopped drawing partial blocks, which threw away
+# every eighth bands() had just worked out and let a 3:00 track and a 3:18 track
+# come out the same width. One copy, so that cannot happen again.
+
+# Widths by largest remainder, not by walking a cumulative total. Truncating each
+# running total independently made a longer track look narrower than a shorter
+# one — a 3:14 rounded down while the 2:58 after it landed on a boundary and got
+# more — which is exactly the comparison the meter exists to support. Here every
+# track gets floor(its share) and the leftover units go to the largest fractions,
+# so the total is still exact and a longer track can never be drawn narrower than
+# a shorter one.
+BEND=(); BCOL=()
+bands() {  # bands <total-units> <duration>...  -> $BEND, $BCOL
+  local units=$1 n=0 cum=0 used=0 left=0 best bi i pos=0 nb=0
+  local -a D HC REM
+  BEND=(); BCOL=(); D=(); HC=(); REM=()
+  shift
+
+  for i in "$@"; do
+    D[$n]=$i
+    cum=$(( cum + i ))
+    n=$(( n + 1 ))
+  done
+  [ "$n" -gt 0 ] && [ "$cum" -gt 0 ] && [ "$units" -gt 0 ] || return 0
 
   i=0
-  while [ "$i" -lt "$N" ]; do
-    if [ "${DISC_OF[$i]}" -eq "$d" ]; then
-      DUR[$n]=${P_DUR[$i]}
-      cum=$(( cum + P_DUR[i] ))
-      n=$(( n + 1 ))
+  while [ "$i" -lt "$n" ]; do
+    HC[$i]=$(( D[i] * units / cum ))
+    REM[$i]=$(( D[i] * units % cum ))
+    used=$(( used + HC[i] ))
+    i=$(( i + 1 ))
+  done
+  left=$(( units - used ))
+  while [ "$left" -gt 0 ]; do
+    best=-1; bi=-1
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      [ "${REM[$i]}" -gt "$best" ] && { best=${REM[$i]}; bi=$i; }
+      i=$(( i + 1 ))
+    done
+    [ "$bi" -lt 0 ] && break
+    HC[$bi]=$(( HC[bi] + 1 ))
+    REM[$bi]=-1          # spent, and -1 keeps it out of later rounds
+    left=$(( left - 1 ))
+  done
+
+  # Where each band ends, in units, and what colour it is. A track too short to
+  # earn a single unit ends up with no band at all and does not consume a colour,
+  # so the two tracks either side of it still contrast.
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ "${HC[$i]}" -gt 0 ]; then
+      pos=$(( pos + HC[i] ))
+      BEND[$nb]=$pos
+      BCOL[$nb]=${SHADES[$(( nb % 4 ))]}
+      nb=$(( nb + 1 ))
     fi
     i=$(( i + 1 ))
   done
+  return 0
+}
 
-  # Eight units to the column, not one. Unicode has a full set of left-aligned
-  # partial blocks, and a cell can show two colours — foreground for the left
-  # part, background for the right — so a boundary can be drawn where it actually
-  # falls rather than snapped to the nearest whole character. That is the whole
-  # game here: at one unit per column a 3:14 and a 2:58 are the same two cells,
-  # and at eight it is about nine seconds to the unit.
+# One row of meter, in $BANDBAR. A column wholly inside a band is a shaded block,
+# a column a boundary runs through is a partial block of the outgoing colour laid
+# over the incoming one as background, and anything past the last band is run-out.
+#
+# The head argument is where the write laser has got to, in the same units. The
+# plan's meter has no laser and passes the full width, so nothing is ever behind
+# the head there; the burn screen passes the real position and gets the same bar
+# with an unwritten tail and a bright edge creeping along it. In a column the head
+# is actually inside, the head wins over any band boundary sharing that column —
+# it is the one thing on the bar that is moving, and it is gone again in a second.
+#
+# Not returned on stdout: a $( ) here is a fork, and the burn screen redraws this
+# on every message from the drive.
+BANDBAR=''
+bandbar() {  # bandbar <head-units>  -- reads $BEND/$BCOL -> $BANDBAR
+  local head=$1 j=0 b=0 nb=${#BEND[@]} cs ce t nxt
+  local out='' curfg='' curbg=''
+  # Unicode has a full set of left-aligned partial blocks, and a cell can show
+  # two colours — foreground for the left part, background for the right — so a
+  # boundary can be drawn where it actually falls rather than snapped to the
+  # nearest whole character. At one unit per column a 3:14 and a 2:58 are the
+  # same two cells; at eight it is about nine seconds to the unit.
   local PARTS=('' '▏' '▎' '▍' '▌' '▋' '▊' '▉')
-  local nb=0 pos=0 cs ce t nxt
-  local -a BEND BCOL
-  BEND=(); BCOL=()
 
-  units=$(( STRIP_WIDTH * 8 ))
-  filled=$(( cum * units / CAPACITY ))
-  [ "$filled" -gt "$units" ] && filled=$units
-
-  # Widths by largest remainder, not by walking a cumulative total. Truncating
-  # each running total independently made a longer track look narrower than a
-  # shorter one — a 3:14 rounded down while the 2:58 after it landed on a
-  # boundary and got more — which is exactly the comparison the meter exists to
-  # support. Here every track gets floor(its share) and the leftover units go to
-  # the largest fractions, so the total is still exact and a longer track can
-  # never be drawn narrower than a shorter one.
-  if [ "$n" -gt 0 ] && [ "$cum" -gt 0 ]; then
-    i=0
-    while [ "$i" -lt "$n" ]; do
-      HC[$i]=$(( DUR[i] * filled / cum ))
-      REM[$i]=$(( DUR[i] * filled % cum ))
-      used=$(( used + HC[i] ))
-      i=$(( i + 1 ))
-    done
-    left=$(( filled - used ))
-    while [ "$left" -gt 0 ]; do
-      best=-1; bi=-1
-      i=0
-      while [ "$i" -lt "$n" ]; do
-        [ "${REM[$i]}" -gt "$best" ] && { best=${REM[$i]}; bi=$i; }
-        i=$(( i + 1 ))
-      done
-      [ "$bi" -lt 0 ] && break
-      HC[$bi]=$(( HC[bi] + 1 ))
-      REM[$bi]=-1          # spent, and -1 keeps it out of later rounds
-      left=$(( left - 1 ))
-    done
-
-    # Where each band ends, in units, and what colour it is. A track too short to
-    # earn a single unit ends up with no band at all and does not consume a
-    # colour, so the two tracks either side of it still contrast.
-    i=0
-    while [ "$i" -lt "$n" ]; do
-      if [ "${HC[$i]}" -gt 0 ]; then
-        pos=$(( pos + HC[i] ))
-        BEND[$nb]=$pos
-        BCOL[$nb]=${SHADES[$(( nb % 4 ))]}
-        nb=$(( nb + 1 ))
-      fi
-      i=$(( i + 1 ))
-    done
-  fi
-
-  # One column at a time, carrying the current band along rather than looking it
-  # up: a column wholly inside a band is a solid block, and a column a boundary
-  # runs through is a partial block of the outgoing colour laid over the incoming
-  # one as background.
-  b=0; j=0
   while [ "$j" -lt "$STRIP_WIDTH" ]; do
     cs=$(( j * 8 )); ce=$(( cs + 8 ))
     while [ "$b" -lt "$nb" ] && [ "${BEND[$b]}" -le "$cs" ]; do b=$(( b + 1 )); done
-    if [ "$b" -ge "$nb" ]; then
-      # Past the last band: the run-out, dithered in the darkest amber on the
-      # ramp rather than left blank, so it still reads as part of the meter.
+    if [ "$head" -gt "$cs" ] && [ "$head" -lt "$ce" ]; then
+      strip_sgr "$HEAD" ''; out="${out}${PARTS[$(( head - cs ))]}"
+    elif [ "$head" -le "$cs" ] || [ "$b" -ge "$nb" ]; then
+      # Not yet written, or past the last band: the run-out, dithered in the
+      # darkest amber on the ramp rather than left blank, so it still reads as
+      # part of the meter.
       strip_sgr "$RUNOUT" ''; out="${out}░"
     elif [ "${BEND[$b]}" -ge "$ce" ]; then
       # Shade rather than solid, for the phosphor-and-oxide texture the rest of
@@ -873,7 +964,34 @@ strip() {  # strip <disc-number> [panel-label]
     fi
     j=$(( j + 1 ))
   done
-  out="$out\033[0m"
+  BANDBAR="$out\033[0m"
+  return 0
+}
+
+strip() {  # strip <disc-number> [panel-label]
+  local d=$1 lbl="${2:-}" i n=0 cum=0 units filled
+  local scale="" col=0 m p tot step want
+  local -a DUR
+  DUR=()
+
+  i=0
+  while [ "$i" -lt "$N" ]; do
+    if [ "${DISC_OF[$i]}" -eq "$d" ]; then
+      DUR[$n]=${P_DUR[$i]}
+      cum=$(( cum + P_DUR[i] ))
+      n=$(( n + 1 ))
+    fi
+    i=$(( i + 1 ))
+  done
+
+  units=$(( STRIP_WIDTH * 8 ))
+  filled=$(( cum * units / CAPACITY ))
+  [ "$filled" -gt "$units" ] && filled=$units
+
+  # The tracks share only as much of the bar as the disc is full; the rest is
+  # run-out. Nothing here is unwritten, so the head goes past the right-hand end.
+  if [ "$n" -gt 0 ]; then bands "$filled" "${DUR[@]}"; else bands 0; fi
+  bandbar "$units"
 
   # Label on the left, readout on the right, meter across the full grid below
   # them. The readout used to sit beside the bar and cost it eighteen columns,
@@ -884,7 +1002,7 @@ strip() {  # strip <disc-number> [panel-label]
   pad $(( PANEL - ${#lbl} - ${#want} ))
   printf '  %b%s%b%s%b%s%b %b/ %s%b\n' \
     "$ETCH" "$lbl" "$OFF" "$PAD" "$AMBER" "$tot" "$OFF" "$DIM" "$MMSS" "$OFF"
-  printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$out" "$ETCH" "$OFF"
+  printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$BANDBAR" "$ETCH" "$OFF"
 
   # A minute scale under it, so the meter answers "how far in does this disc
   # end?" and not only "how full is it?". Positions are derived from CAPACITY
@@ -987,19 +1105,75 @@ tui_prompt() {  # tui_prompt <label> <current>
   [ -n "$reply" ] && printf '%s' "$reply" || printf '%s' "$2"
 }
 
+# How many columns one character takes. Characters are not all one column wide:
+# a CJK ideograph, a kana, a Hangul syllable, a fullwidth form or an emoji is
+# drawn two columns wide, so ${#s} — which counts characters — is half the truth
+# for a Japanese title, and the grid built on it comes out with the artist column
+# a dozen places to the right and the whole panel bent out of shape.
+#
+# Testing by glob range rather than by code point because there is no code point
+# to test: bash 3.2 is what ships with macOS, and printf '%d' "'字" there gives
+# the first byte of the character as a signed char, not its code point. Range
+# patterns over multibyte characters do work, so that is the mechanism.
+CW=1
+cwidth() {  # cwidth <character> -> $CW
+  case "$1" in
+    [⺀-〿]|[぀-ヿ]|[一-鿿]|[가-힣]|[！-｠]|[🀀-🿿]) CW=2 ;;
+    *) CW=1 ;;
+  esac
+}
+
+# Columns a whole string takes. The common case in this program is a Latin title
+# with no wide character in it anywhere, and for that ${#s} is already the answer
+# — so ask that question of the whole string once, and only walk it character by
+# character if the answer is yes. Same ranges as cwidth, written as a substring
+# test; they have to stay in step.
+WCOLS=0
+wcols() {  # wcols <string> -> $WCOLS
+  local s=$1 i=0 n=0
+  case "$s" in
+    *[⺀-〿]*|*[぀-ヿ]*|*[一-鿿]*|*[가-힣]*|*[！-｠]*|*[🀀-🿿]*) ;;
+    *) WCOLS=${#s}; return 0 ;;
+  esac
+  while [ "$i" -lt "${#s}" ]; do
+    cwidth "${s:$i:1}"
+    n=$(( n + CW ))
+    i=$(( i + 1 ))
+  done
+  WCOLS=$n
+  return 0
+}
+
 # Pad or truncate to an exact column count. Not printf's own width and precision:
 # those are counted in bytes even under a UTF-8 locale, so "Björk — Homogénic"
 # cut to 34 loses 34 bytes rather than 34 columns and the artist column after it
-# slides left. Substring expansion and ${#s} do count characters, so they are the
-# ones to build a grid out of. A cut title ends in … so the truncation is visible.
+# slides left. Substring expansion counts characters, which is closer but still
+# not columns; wcols is. A cut title ends in … so the truncation is visible.
 fit() {  # fit <string> <columns>
   fitv "$1" "$2"
   printf '%s' "$FIT"
 }
 fitv() {  # fitv <string> <columns> -> $FIT
-  local s=$1
-  [ "${#s}" -gt "$2" ] && s="${s:0:$(( $2 - 1 ))}…"
-  pad $(( $2 - ${#s} ))
+  local s=$1 i=0 w=0 keep='' lim
+  wcols "$s"
+  if [ "$WCOLS" -gt "$2" ]; then
+    # Cut by columns, taking whole characters: a two-column character that would
+    # straddle the last place is left out rather than half-drawn, which leaves a
+    # column over for pad to fill.
+    lim=$(( $2 - 1 ))
+    while [ "$i" -lt "${#s}" ]; do
+      cwidth "${s:$i:1}"
+      [ $(( w + CW )) -gt "$lim" ] && break
+      keep="$keep${s:$i:1}"
+      w=$(( w + CW ))
+      i=$(( i + 1 ))
+    done
+    # Braces are not optional: bash 3.2 reads "$keep…" as one name and hands back
+    # the tail of the ellipsis's own bytes.
+    s="${keep}…"
+    WCOLS=$(( w + 1 ))
+  fi
+  pad $(( $2 - WCOLS ))
   FIT="$s$PAD"
 }
 
@@ -1021,22 +1195,19 @@ TUI_ROWS=0
 # Everything the panel says, printed to stdout so tui_draw can capture the whole
 # frame and hand it to the terminal in one piece. Split out for that reason only.
 tui_frame() {  # tui_frame <cursor> <top> <visible-rows> <status>
-  local cur=$1 top=$2 vis=$3 status=$4 i k row d lastd=0 meta rule
+  local cur=$1 top=$2 vis=$3 status=$4 i k row d lastd=0 meta
   local num ttl art tm body ts='' ds='' last=$(( top + vis ))
 
-  tui_disc_map
+  # DISC_AT is built by tui_fit_rows before this runs — it has to be, since the
+  # row budget depends on where the disc rules fall.
 
-  # Faceplate: an engraved badge, a rule across the panel, and the job stamped
-  # at the far end the way a deck prints its mode.
   [ "${#ORDER[@]}" -eq 1 ] || ts=S
   [ "$NDISCS" -eq 1 ]      || ds=S
   mmssv "$TOTAL"
   printf -v meta '%d TRACK%s · %s · %d DISC%s' \
     "${#ORDER[@]}" "$ts" "$MMSS" "$NDISCS" "$ds"
-  rule=$(( PANEL - 10 - ${#meta} )); [ "$rule" -lt 2 ] && rule=2
-  repv '━' "$rule"
-  printf '  %b BURNCD %b %b%s%b %b%s%b\n\n' \
-    "$BADGE" "$OFF" "$ETCH" "$REP" "$OFF" "$ETCH" "$meta" "$OFF"
+  faceplate "$meta"
+  printf '\n'
 
   # The three disc-level fields, selectable as cursor rows 0, 1 and 2. They sit
   # on the same mark-plus-body grid as the tracks, so the selection bar is the
@@ -1102,23 +1273,69 @@ tui_frame() {  # tui_frame <cursor> <top> <visible-rows> <status>
   return 0
 }
 
-tui_draw() {  # tui_draw <cursor> <top> <status>
-  local vis frame nl=$'\n' eol=$'\033[K\n'
+# How many track rows fit, given the window and what else the frame has to say.
+#
+# It matters more than it looks. tui_draw deliberately does not erase the screen,
+# and \033[H is absolute, so a frame one line taller than the window scrolls the
+# terminal and the panel's top row is gone — not overdrawn, gone, permanently,
+# because the next frame homes to a row that now holds something else. The badge
+# and the ALBUM/ARTIST/YEAR fields simply vanish and never come back. A fixed
+# TERM_LINES-16 was one row short in the ordinary case (eleven tracks, one disc,
+# a status message) and several short with the disc rules a multi-disc job draws.
+#
+# So the rows are counted rather than assumed. Everything except the track list
+# is fixed: the badge and its blank line, three fields, a blank, the blank before
+# the meter, the meter's three lines, a blank, and two keycap rows — thirteen. A
+# status message adds a blank and itself. What is not fixed is the disc rules,
+# one per disc boundary inside the visible window, and the "▾ n MORE" line, which
+# only appears if the list is cut short — which depends on how many rows fit. So
+# tui_walk is run once, and if that turns out to leave a remainder, again with a
+# row given back for the MORE line.
+#
+# The +1 in TUI_CHROME is the cursor: a frame of N newlines drawn from row 1 puts
+# the cursor on row 1+N, so N has to stay one under the window or the last
+# newline scrolls the very thing this is protecting.
+TUI_CHROME=14
+# Chrome, plus the two a status message costs, plus the three the shortest
+# possible list still needs: a disc rule, one track, and the "▾ n MORE" line.
+TUI_MIN_LINES=$(( TUI_CHROME + 5 ))
+tui_fit_rows() {  # tui_fit_rows <top> <status> -> $TUI_ROWS
+  local budget
   term_size
-  vis=$(( TERM_LINES - 16 )); [ "$vis" -lt 4 ] && vis=4
-  TUI_ROWS=$vis
+  budget=$(( TERM_LINES - TUI_CHROME ))
+  [ -n "$2" ] && budget=$(( budget - 2 ))
+  tui_disc_map
+  tui_walk "$1" "$budget"
+  [ $(( $1 + TUI_ROWS )) -lt "${#ORDER[@]}" ] && tui_walk "$1" $(( budget - 1 ))
+  # A row is spent whether or not there was one to spend: showing no tracks at
+  # all is not a panel. It only bites in a window too short for the editor, which
+  # tui_edit turns away at the door — see TUI_MIN_LINES.
+  [ "$TUI_ROWS" -lt 1 ] && TUI_ROWS=1
+  return 0
+}
 
-  # No erase-screen here, and one write for the frame. Clearing and then drawing
-  # is two pictures the terminal genuinely paints, so at one frame per keypress
-  # the blank one shows through as a flash — and printing the panel line by line
-  # let the screen refresh mid-frame on top of that. Instead: build it all in
-  # memory, end every line with an erase-to-end-of-line so a line that got
-  # shorter cannot leave the tail of the old one behind, and lay the whole thing
-  # over the top from the home position. \033[J at the end clears whatever the
-  # previous frame had below this one — a dropped track, a status line that has
-  # since gone. Nothing is ever blank in between, so there is nothing to flicker.
-  frame=$(tui_frame "$1" "$2" "$vis" "$3")
-  printf '\033[H%s\033[K\n\033[J' "${frame//$nl/$eol}"
+# Walks the list the way tui_frame prints it, spending a row on each disc rule as
+# it crosses one, and stops when the budget runs out.
+tui_walk() {  # tui_walk <top> <rows> -> $TUI_ROWS
+  local k=$1 left=$2 lastd=0 d
+  TUI_ROWS=0
+  while [ "$k" -lt "${#ORDER[@]}" ]; do
+    d=${DISC_AT[${ORDER[$k]}]:-1}
+    [ "$d" = "$lastd" ] || { left=$(( left - 1 )); lastd=$d; }
+    [ "$left" -ge 1 ] || break
+    left=$(( left - 1 ))
+    TUI_ROWS=$(( TUI_ROWS + 1 ))
+    k=$(( k + 1 ))
+  done
+  return 0
+}
+
+tui_draw() {  # tui_draw <cursor> <top> <status>
+  local frame
+  tui_fit_rows "$2" "$3"
+  # Built in memory and handed to paint() in one piece; see paint() for why.
+  frame=$(tui_frame "$1" "$2" "$TUI_ROWS" "$3")
+  paint "$frame"
   return 0
 }
 
@@ -1139,31 +1356,33 @@ tui_disc_map() {
 
 DROPPED=()
 tui_edit() {
-  local cur=3 top=0 status="" n k tmp saved_stty
+  local cur=3 top=0 status="" n k tmp
 
-  # Guarded at the call site too, but returning is kinder than dying if that
-  # ever changes: the static plan below still says everything that matters.
-  [ -t 0 ] && [ -t 1 ] || return 0
+  # The screen is already ours by the time this runs — the editor is the first
+  # stage of the display, not the owner of it. Guarded here as well because
+  # returning is kinder than dying if that ever changes: the static plan still
+  # says everything that matters.
+  [ "$SCREEN" -eq 1 ] || return 0
 
-  saved_stty=$(stty -g 2>/dev/null || true)
-  # Alternate screen, so quitting leaves the scrollback exactly as it was.
-  printf '\033[?1049h\033[?25l'
   tui_block
-  # shellcheck disable=SC2064
-  trap "stty $saved_stty 2>/dev/null; printf '\033[?25h\033[?1049l'; exit 130" INT
-  # Drop the cached window size when the window changes, so the redraw after a
-  # resize measures again and every other redraw does not have to.
-  trap 'TERM_LINES=; TERM_COLS=' WINCH
 
   while :; do
     n=${#ORDER[@]}
     [ "$cur" -lt 3 ] || [ "$cur" -lt $(( n + 3 )) ] || cur=$(( n + 2 ))
     [ "$cur" -ge 0 ] || cur=0
-    # Keep the cursor inside the viewport.
+    # Keep the cursor inside the viewport. How many rows fit depends on where the
+    # window starts — a disc rule scrolling into view costs one — so scrolling
+    # down means measuring again, not once. It settles: each pass moves top up
+    # towards the cursor, and at top = k a single row is enough.
     if [ "$cur" -ge 3 ]; then
       k=$(( cur - 3 ))
       [ "$k" -lt "$top" ] && top=$k
-      [ "$k" -ge $(( top + TUI_ROWS )) ] && [ "$TUI_ROWS" -gt 0 ] && top=$(( k - TUI_ROWS + 1 ))
+      [ "$top" -lt 0 ] && top=0
+      tui_fit_rows "$top" "$status"
+      while [ "$k" -ge $(( top + TUI_ROWS )) ]; do
+        top=$(( k - TUI_ROWS + 1 ))
+        tui_fit_rows "$top" "$status"
+      done
     fi
     [ "$top" -lt 0 ] && top=0
 
@@ -1185,16 +1404,13 @@ tui_edit() {
       r|R)              ORDER=("${ORDER_ORIG[@]}"); DROPPED=(); replan
                         status="▪ ORIGINAL ORDER RESTORED" ;;
       b|B|$' ')         break ;;
-      q|Q)              stty "$saved_stty" 2>/dev/null || true
-                        printf '\033[?25h\033[?1049l'
-                        trap - INT
-                        die "cancelled" ;;
+      q|Q)              die "cancelled" ;;
     esac
   done
 
-  stty "$saved_stty" 2>/dev/null || true
-  printf '\033[?25h\033[?1049l'
-  trap - INT
+  # Cooked again, but still on the alternate screen: the next stage is the disc
+  # prompt, and it takes over the same frame the editor was drawing on.
+  tui_cooked
   return 0
 }
 
@@ -1284,7 +1500,7 @@ show_plan() {
       printf '   %2d. %s %6s\n' "$num" "$(fit "${P_TITLE[$i]}" 52)" "$(mmss "${P_DUR[$i]}")"
     done
     printf '       %*s %6s\n' 52 "" "$(mmss "$dtot")"
-    strip "$d"
+    strip "$d" "DISC $d"
     printf '\n'
   done
   return 0
@@ -1293,16 +1509,179 @@ show_plan() {
 # The preview IS the editor. A wrong title or a bad order is noticed and fixed
 # on the same screen it was spotted on, so there is no flag to predict in
 # advance. A dry run has nothing to steer and a pipe has no one driving it;
-# both fall through to the static plan below.
-if [ "$DRY_RUN" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
-  tui_edit
+# both fall through to the static plan below, and so does a window with no room
+# in it — see TUI_MIN_LINES, and PANEL for the width, which does not reflow.
+term_size
+if [ "$DRY_RUN" -eq 0 ] && [ -t 0 ] && [ -t 1 ] \
+   && [ "$TERM_LINES" -ge "$TUI_MIN_LINES" ] && [ "$TERM_COLS" -ge $(( PANEL + 2 )) ]; then
+  screen_on && tui_edit
 fi
 
-# The plan is printed even after the edit screen: the alternate screen is gone
-# by now, so this is the copy that stays in the scrollback next to the burn.
-show_plan
+# Printed here only when there is no panel to print it on. A screened run keeps
+# the plan on the display until the job is over and then lays it into the
+# scrollback on the way out, so it reads as a record rather than as leftovers.
+[ "$SCREEN" -eq 1 ] || show_plan
 
 [ "$DRY_RUN" -eq 1 ] && exit 0
+
+# ----------------------------------------------------------------- stages --
+
+# Everything between the editor and the summary is a stage of the same display:
+# a faceplate, the album being worked on, a body the stage supplies, and the log
+# of what has happened so far. Each one replaces the last from the home position,
+# so waiting for a disc, converting it, writing it and reporting on it are four
+# states of one instrument rather than four messages stacked up the terminal.
+#
+# The stage is remembered rather than just drawn, because a note arriving later —
+# a disc finished, a verify result — has to redraw the frame it belongs to
+# instead of printing on top of it.
+STAGE_META='' STAGE_BODY='' STAGE_FOOT=''
+LOG=()
+
+stage() {  # stage <meta> <body> [foot]
+  STAGE_META=$1
+  STAGE_BODY=$2
+  STAGE_FOOT=${3:-}
+  stage_paint
+  return 0
+}
+
+stage_paint() {
+  local frame
+  [ "$SCREEN" -eq 1 ] && [ -n "$STAGE_META" ] || return 0
+  frame=$(stage_frame)
+  paint "$frame"
+  return 0
+}
+
+# One frame's worth of stage, on stdout for paint() to lay down in a piece. What
+# is going on sits at the top, what has happened under it, and what to press last
+# of all, so the eye ends the frame on the thing it has to answer.
+#
+# The log is trimmed to whatever is left of the window, oldest lines first: a
+# frame taller than the window would scroll the panel's own top row away for good.
+stage_frame() {
+  local nls used=4 room i n
+  faceplate "$STAGE_META"
+  printf '\n'
+  printf '    %b%-8s%b %s\n' "$ETCH" ALBUM "$OFF" "${ALBUM:-—}"
+  printf '\n'
+  if [ -n "$STAGE_BODY" ]; then
+    printf '%s\n' "$STAGE_BODY"
+    nls=${STAGE_BODY//[!$'\n']/}
+    used=$(( used + ${#nls} + 1 ))
+  fi
+  if [ -n "$STAGE_FOOT" ]; then
+    nls=${STAGE_FOOT//[!$'\n']/}
+    used=$(( used + ${#nls} + 2 ))
+  fi
+
+  n=${#LOG[@]}
+  term_size
+  # One row for the blank before the log, and one for the row the cursor has to
+  # land on after the frame's last newline.
+  room=$(( TERM_LINES - 2 - used ))
+  if [ "$n" -gt 0 ] && [ "$room" -gt 0 ]; then
+    printf '\n'
+    i=0
+    [ "$n" -gt "$room" ] && i=$(( n - room ))
+    while [ "$i" -lt "$n" ]; do
+      printf '  %b\n' "${LOG[$i]}"
+      i=$(( i + 1 ))
+    done
+  fi
+
+  [ -n "$STAGE_FOOT" ] && printf '\n%s\n' "$STAGE_FOOT"
+  return 0
+}
+
+# What used to be a bare printf into the scroll. On a screened run it joins the
+# log and the current stage is redrawn around it; everywhere else it is the line
+# it always was.
+note() {  # note <line>
+  LOG+=("$1")
+  if [ "$SCREEN" -eq 1 ]; then
+    stage_paint
+  else
+    printf '  %b\n' "$1"
+  fi
+  return 0
+}
+
+# Block for one key without disturbing the frame. Cooked mode is no good here:
+# the prompt is part of the picture, not a line at the bottom of a scrolling
+# terminal, so the terminal goes raw for exactly as long as it takes to read one
+# key. Returns nonzero if stdin is gone, which callers treat differently — a
+# closed stdin partway through a multi-disc job is a failure, at the end of one
+# it is just the end.
+wait_key() {  # wait_key -> $KEY
+  local rc=0
+  tui_block
+  read_key || rc=1
+  tui_cooked
+  return "$rc"
+}
+
+# Waiting for a blank disc. The meter is the one from the plan, for this disc
+# only, so the thing about to be written is on screen while you feed the drive.
+stage_insert() {  # stage_insert <disc-number>
+  local d=$1 body
+  body=$(
+    strip "$d" "DISC $d"
+    printf '\n'
+    if [ "$NDISCS" -gt 1 ]; then
+      printf '  %bINSERT%b a blank CD-R for disc %d of %d\n' \
+        "$AMBER" "$OFF" "$d" "$NDISCS"
+    else
+      printf '  %bINSERT%b a blank CD-R\n' "$AMBER" "$OFF"
+    fi
+  )
+  stage "INSERT · DISC $d OF $NDISCS" "$body" "$(keys '⏎' BURN Q CANCEL)"
+  return 0
+}
+
+# Converting. The bar is the same bar the burn draws — same bands, same head —
+# because from the outside these are one process with two halves, and watching
+# the head cross the disc twice is a truer picture of the wait than a spinner.
+stage_convert() {  # stage_convert <disc> <track-no> <of> <title> <head-units>
+  local body
+  bandbar "$5"
+  fitv "$4" 46
+  body=$(
+    printf '    %b%-8s%b %02d OF %02d  %s\n' "$ETCH" TRACK "$OFF" "$2" "$3" "$FIT"
+    printf '\n'
+    printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$BANDBAR" "$ETCH" "$OFF"
+  )
+  stage "CONVERTING · DISC $1 OF $NDISCS · $(( $5 * 100 / (STRIP_WIDTH * 8) ))%" "$body"
+  return 0
+}
+
+# The job, finished, waiting to be dismissed. Every disc gets its meter if the
+# window has room for them; a seventeen-disc job in a short window shows what
+# fits and says how many it did not, and the full set goes to the scrollback
+# afterwards either way.
+stage_done() {  # stage_done <meta>
+  local body max
+  term_size
+  # Four chrome rows, the blank and keycap row at the foot, two kept back for the
+  # log, and the row the cursor lands on; each disc costs three meter rows and a
+  # blank.
+  max=$(( (TERM_LINES - 9) / 4 ))
+  [ "$max" -lt 1 ] && max=1
+  body=$(
+    d=$FROM; shown=0
+    while [ "$d" -le "$NDISCS" ] && [ "$shown" -lt "$max" ]; do
+      strip "$d" "DISC $d"
+      printf '\n'
+      shown=$(( shown + 1 )); d=$(( d + 1 ))
+    done
+    if [ "$d" -le "$NDISCS" ]; then
+      printf '    %b▾ %d MORE%b\n' "$ETCH" $(( NDISCS - d + 1 )) "$OFF"
+    fi
+  )
+  stage "$1" "$body" "$(keys Q QUIT)"
+  return 0
+}
 
 # ------------------------------------------------------------- burn screen --
 
@@ -1317,76 +1696,9 @@ show_plan
 # approved and the disc being written out of it are visibly the same picture at
 # two different moments. The part not yet written is the same run-out the meter
 # uses for the empty end of a disc.
-BB_END=(); BB_COL=()
-burn_bands() {  # burn_bands  -- reads IDX/P_DUR, fills BB_END/BB_COL
-  local n=0 i cum=0 units used=0 left=0 best bi pos=0 nb=0
-  local -a D HC REM
-  BB_END=(); BB_COL=(); D=(); HC=(); REM=()
-
-  for i in "${IDX[@]}"; do
-    D[$n]=${P_DUR[$i]}
-    cum=$(( cum + P_DUR[i] ))
-    n=$(( n + 1 ))
-  done
-  units=$(( STRIP_WIDTH * 8 ))
-  [ "$n" -gt 0 ] && [ "$cum" -gt 0 ] || return 0
-
-  # Largest remainder, as in the meter: the bands add up to the full bar exactly,
-  # and a longer track is never drawn narrower than a shorter one.
-  i=0
-  while [ "$i" -lt "$n" ]; do
-    HC[$i]=$(( D[i] * units / cum ))
-    REM[$i]=$(( D[i] * units % cum ))
-    used=$(( used + HC[i] ))
-    i=$(( i + 1 ))
-  done
-  left=$(( units - used ))
-  while [ "$left" -gt 0 ]; do
-    best=-1; bi=-1
-    i=0
-    while [ "$i" -lt "$n" ]; do
-      [ "${REM[$i]}" -gt "$best" ] && { best=${REM[$i]}; bi=$i; }
-      i=$(( i + 1 ))
-    done
-    [ "$bi" -lt 0 ] && break
-    HC[$bi]=$(( HC[bi] + 1 )); REM[$bi]=-1; left=$(( left - 1 ))
-  done
-
-  i=0
-  while [ "$i" -lt "$n" ]; do
-    if [ "${HC[$i]}" -gt 0 ]; then
-      pos=$(( pos + HC[i] ))
-      BB_END[$nb]=$pos
-      BB_COL[$nb]=${SHADES[$(( nb % 4 ))]}
-      nb=$(( nb + 1 ))
-    fi
-    i=$(( i + 1 ))
-  done
-}
-
-# One frame of the bar. Written cells carry their track's colour, the rest is
-# run-out, and the write head is a partial block rather than a whole one — eight
-# steps to the cell, so on a bar this wide it creeps forward continuously instead
-# of sitting still for twenty seconds and then jumping.
-burn_bar() {  # burn_bar <units-written>
-  local head=$1 j=0 b=0 nb=${#BB_END[@]} cs ce t out='' curfg='' curbg=''
-  local PARTS=('' '▏' '▎' '▍' '▌' '▋' '▊' '▉')
-  while [ "$j" -lt "$STRIP_WIDTH" ]; do
-    cs=$(( j * 8 )); ce=$(( cs + 8 ))
-    while [ "$b" -lt "$nb" ] && [ "${BB_END[$b]}" -le "$cs" ]; do b=$(( b + 1 )); done
-    if [ "$head" -ge "$ce" ]; then
-      strip_sgr "${BB_COL[$b]:-${SHADES[0]}}" ''; out="${out}▓"
-    elif [ "$head" -le "$cs" ]; then
-      strip_sgr "$RUNOUT" ''; out="${out}░"
-    else
-      t=$(( head - cs ))
-      strip_sgr "$HEAD" ''
-      out="${out}${PARTS[$t]}"
-    fi
-    j=$(( j + 1 ))
-  done
-  printf '%b\033[0m' "$out"
-}
+# It is literally the same instrument: bands() over this disc's durations, then
+# bandbar() with the write head where the drive says it is. Both of those live
+# with the plan's meter, above.
 
 # A lamp sweeping a dark field, under the bar where the plan puts its minute
 # scale. It exists because a burn is twenty minutes of a number that moves once
@@ -1394,7 +1706,11 @@ burn_bar() {  # burn_bar <units-written>
 # that has died. This one moves on every message from the drive, so a stall in
 # the write is a stall on the screen — which is exactly the thing you want to be
 # able to see from across the room.
-burn_scan() {  # burn_scan <frame>
+#
+# Left in $SCANBAR rather than printed, for the same reason as bandbar: this is
+# redrawn on every message from the drive and a $( ) around it is a fork per frame.
+SCANBAR=''
+burn_scan() {  # burn_scan <frame> -> $SCANBAR
   local f=$1 span p dir j dd out='' curfg='' curbg=''
   span=$(( (STRIP_WIDTH - 1) * 2 ))
   p=$(( f % span ))
@@ -1417,7 +1733,8 @@ burn_scan() {  # burn_scan <frame>
     esac
     j=$(( j + 1 ))
   done
-  printf '%b\033[0m' "$out"
+  SCANBAR="$out\033[0m"
+  return 0
 }
 
 # Parses cdrecord's progress output and redraws the display in place.
@@ -1425,17 +1742,31 @@ burn_scan() {  # burn_scan <frame>
 #   Track 03:  12 of  45 MB written (fifo 100%) [buf  98%]  8.0x.
 render() {  # render <disc-no> <of> <ntracks> <total-mb>
   local disc_no=$1 disc_of=$2 ntracks=$3 total_mb=$4
-  local chunk trk mb_done buf spd title verb meta rule head frame=0
+  local chunk trk mb_done buf spd title verb meta head frame=0
   local base_mb=0 last_trk=1 done_mb=0 pct=0 eta="--:--" plain_trk=0
-  local start elapsed i tty=0 cols lines wide=0 bar filled
+  local elapsed el i tty=0 cols lines wide=0 bar filled home='' tail=''
+  local -a bdur
 
   [ -t 1 ] && tty=1
   # The panel is 71 columns and does not reflow; below that, a compact readout
   # rather than a grid folded in half.
   term_size; cols=$TERM_COLS
   if [ "$tty" -eq 1 ] && [ "$cols" -ge $(( PANEL + 2 )) ]; then
-    wide=1; lines=8
-    burn_bands
+    wide=1; lines=10
+    # The bands are fixed for the whole disc; only the head moves, so this is
+    # worked out once here rather than per frame. The bar is the tracks end to
+    # end — unlike the plan's meter there is no empty tail to leave unlit, since
+    # the burn is over when the last track is written.
+    bdur=(); i=0
+    while [ "$i" -lt "${#IDX[@]}" ]; do
+      bdur[$i]=${P_DUR[${IDX[$i]}]}
+      i=$(( i + 1 ))
+    done
+    if [ "${#bdur[@]}" -gt 0 ]; then
+      bands $(( STRIP_WIDTH * 8 )) "${bdur[@]}"
+    else
+      bands 0
+    fi
   else
     wide=0; lines=4
   fi
@@ -1443,10 +1774,24 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
   verb=WRITING
   [ "${DUMMY:-0}" -eq 1 ] && verb=REHEARSING
 
-  start=$(date +%s)
+  # Where a frame starts and how it ends. On the alternate screen this panel is
+  # the whole display, so each frame is laid over the last from the home position
+  # the way every other stage is, and \033[J takes the tail of a taller
+  # predecessor with it. Without the screen — a burn logged to a file, or a
+  # terminal too small for the editor — the panel is the bottom of a scrolling
+  # terminal instead, so it opens itself a hole and redraws relatively into it.
+  if [ "$SCREEN" -eq 1 ]; then
+    home='\033[H'; tail='\033[J'
+  else
+    printf -v home '\033[%dA\r' "$lines"
+  fi
+
+  SECONDS=0                                  # a builtin, so elapsed costs no fork
   if [ "$tty" -eq 1 ]; then
     printf '\033[?25l'                       # hide cursor
-    for (( i = 0; i < lines; i++ )); do printf '\n'; done
+    if [ "$SCREEN" -eq 0 ]; then
+      for (( i = 0; i < lines; i++ )); do printf '\n'; done
+    fi
   fi
 
   while IFS= read -r -d $'\r' chunk || [ -n "$chunk" ]; do
@@ -1466,10 +1811,14 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
     [ "$total_mb" -gt 0 ] && pct=$(( done_mb * 100 / total_mb ))
     [ "$pct" -gt 100 ] && pct=100
 
-    elapsed=$(( $(date +%s) - start ))
+    # No forks in the redraw path: $SECONDS is a builtin and mmssv leaves its
+    # answer in a variable. This loop runs on every message from the drive, and a
+    # date(1) plus two command substitutions per frame is most of a burn's CPU.
+    elapsed=$SECONDS
     if [ "$pct" -ge 3 ] && [ "$elapsed" -gt 0 ]; then
-      eta=$(mmss $(( elapsed * (100 - pct) / pct )))
+      mmssv $(( elapsed * (100 - pct) / pct )); eta=$MMSS
     fi
+    mmssv "$elapsed"; el=$MMSS
 
     if [ "$tty" -eq 0 ]; then
       # Piped or logged: one line per track instead of redraw escapes.
@@ -1481,7 +1830,7 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
     fi
 
     frame=$(( frame + 1 ))
-    printf '\033[%dA\r' "$lines"
+    printf '%b' "$home"
 
     if [ "$wide" -eq 0 ]; then
       filled=$(( pct * BAR_WIDTH / 100 ))
@@ -1495,21 +1844,23 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
       printf '\033[K  %bTRACK%b %d/%d  %bDATA%b %d/%d MB  %b%sx%b\n' \
         "$ETCH" "$OFF" "$trk" "$ntracks" "$ETCH" "$OFF" "$done_mb" "$total_mb" \
         "$ETCH" "$spd" "$OFF"
-      printf '\033[K  %bBUFFER%b %s%%  %bELAPSED%b %s  %bLEFT%b %s\n' \
-        "$ETCH" "$OFF" "$buf" "$ETCH" "$OFF" "$(mmss "$elapsed")" "$ETCH" "$OFF" "$eta"
+      printf '\033[K  %bBUFFER%b %s%%  %bELAPSED%b %s  %bLEFT%b %s\n%b' \
+        "$ETCH" "$OFF" "$buf" "$ETCH" "$OFF" "$el" "$ETCH" "$OFF" "$eta" "$tail"
       continue
     fi
 
-    # Header, laid out exactly like the plan's: badge, rule, and the state of the
-    # machine pushed against the right edge.
+    # Header, laid out exactly like every other stage's, and the album under it
+    # for the same reason: the thing on screen while a disc is being written
+    # should be recognisably the thing that was on screen while it was planned.
+    #
     # %3d, not %d: the rule is sized from what is left after the meta, so a
     # percentage that grows a digit would shorten the rule by one and the whole
     # header would twitch sideways twice a burn.
     printf -v meta '%s · DISC %d OF %d · %3d%%' "$verb" "$disc_no" "$disc_of" "$pct"
-    rule=$(( PANEL - 10 - ${#meta} )); [ "$rule" -lt 2 ] && rule=2
-    repv '━' "$rule"
-    printf '\033[K  %b BURNCD %b %b%s%b %b%s%b\n\033[K\n' \
-      "$BADGE" "$OFF" "$ETCH" "$REP" "$OFF" "$ETCH" "$meta" "$OFF"
+    printf '\033[K'; faceplate "$meta"
+    printf '\033[K\n'
+    printf '\033[K    %b%-8s%b %s\n' "$ETCH" ALBUM "$OFF" "${ALBUM:-—}"
+    printf '\033[K\n'
 
     title='—'
     [ "$trk" -ge 1 ] && [ "$trk" -le "${#IDX[@]}" ] && title=${P_TITLE[${IDX[$(( trk - 1 ))]}]}
@@ -1519,16 +1870,21 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
     printf '\033[K    %b%-8s%b %d OF %d MB AT %sx\n' \
       "$ETCH" WRITTEN "$OFF" "$done_mb" "$total_mb" "$spd"
     printf '\033[K    %b%-8s%b %s%%   %bELAPSED%b %s   %bREMAINING%b %s\n\033[K\n' \
-      "$ETCH" BUFFER "$OFF" "$buf" "$ETCH" "$OFF" "$(mmss "$elapsed")" \
+      "$ETCH" BUFFER "$OFF" "$buf" "$ETCH" "$OFF" "$el" \
       "$ETCH" "$OFF" "$eta"
 
     head=$(( total_mb > 0 ? done_mb * STRIP_WIDTH * 8 / total_mb : 0 ))
     [ "$head" -gt $(( STRIP_WIDTH * 8 )) ] && head=$(( STRIP_WIDTH * 8 ))
-    printf '\033[K  %b▐%b%s%b▌%b\n' "$ETCH" "$OFF" "$(burn_bar "$head")" "$ETCH" "$OFF"
-    printf '\033[K  %b▐%b%s%b▌%b\n' "$ETCH" "$OFF" "$(burn_scan "$frame")" "$ETCH" "$OFF"
+    bandbar "$head"; burn_scan "$frame"
+    printf '\033[K  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$BANDBAR" "$ETCH" "$OFF"
+    printf '\033[K  %b▐%b%b%b▌%b\n%b' "$ETCH" "$OFF" "$SCANBAR" "$ETCH" "$OFF" "$tail"
   done
 
-  [ "$tty" -eq 1 ] && printf '\033[?25h'      # show cursor
+  # Hand the cursor back only to a terminal that is about to get its prompt. On
+  # the alternate screen the next stage is drawn over this one and a cursor
+  # parked in the middle of it is just a blinking artefact; screen_off puts it
+  # back when the job is over.
+  [ "$tty" -eq 1 ] && [ "$SCREEN" -eq 0 ] && printf '\033[?25h'
   return 0
 }
 
@@ -1596,17 +1952,17 @@ cue_text() {
 # wrong: the table of contents, whether every sector can be read back, and
 # whether the CD-Text survived.
 verify_disc() {  # verify_disc <disc-number> <expected-track-count>
-  local d=$1 want=$2 toc got rc bad=0
+  local d=$1 want=$2 toc got rc bad=0 msg ln
 
-  printf '  %bVERIFYING%b disc %d...\n' "$AMBER" "$OFF" "$d"
+  note "$(printf '%bVERIFYING%b disc %d...' "$AMBER" "$OFF" "$d")"
 
   toc=$(cdrecord -toc dev="$DEV" 2>&1 || true)
   got=$(printf '%s\n' "$toc" | grep -c '^track:[[:space:]]*[0-9]' || true)
   if [ "$got" -eq "$want" ]; then
-    printf '    %b✓%b table of contents — %d tracks\n' "$AMBER" "$OFF" "$got"
+    note "$(printf '  %b✓%b table of contents — %d tracks' "$AMBER" "$OFF" "$got")"
   else
-    printf '    \033[31m✗\033[0m table of contents — expected %d tracks, disc reports %d\n' \
-      "$want" "$got"
+    note "$(printf '  \033[31m✗\033[0m table of contents — expected %d tracks, disc reports %d' \
+      "$want" "$got")"
     bad=1
   fi
 
@@ -1620,10 +1976,12 @@ verify_disc() {  # verify_disc <disc-number> <expected-track-count>
     rc=$?
     set -e
     if [ "$rc" -eq 0 ]; then
-      printf '    %b✓%b full read — every sector came back\n' "$AMBER" "$OFF"
+      note "$(printf '  %b✓%b full read — every sector came back' "$AMBER" "$OFF")"
     else
-      printf '    \033[31m✗\033[0m full read failed (exit %d):\n' "$rc"
-      tail -6 "$WORK/verify-$d.log" | sed 's/^/        /'
+      note "$(printf '  \033[31m✗\033[0m full read failed (exit %d):' "$rc")"
+      # A line at a time, so the drive's complaint joins the log rather than
+      # printing straight through whatever stage is on screen.
+      while IFS= read -r ln; do note "      $ln"; done < <(tail -6 "$WORK/verify-$d.log")
       bad=1
     fi
 
@@ -1631,13 +1989,13 @@ verify_disc() {  # verify_disc <disc-number> <expected-track-count>
       # Best effort: -J asks for information only. If the field does not come
       # back that is not proof it is missing, so this never fails the disc.
       if cdda2wav dev="$DEV" -J -v titles 2>&1 | qgrep -F "$ALBUM"; then
-        printf '    %b✓%b CD-Text — album title reads back\n' "$AMBER" "$OFF"
+        note "$(printf '  %b✓%b CD-Text — album title reads back' "$AMBER" "$OFF")"
       else
-        printf '    \033[33m!\033[0m CD-Text — could not read it back; check on a player\n'
+        note "$(printf '  \033[33m!\033[0m CD-Text — could not read it back; check on a player')"
       fi
     fi
   else
-    printf '    \033[33m!\033[0m cdda2wav not installed — TOC checked, sectors not read\n'
+    note "$(printf '  \033[33m!\033[0m cdda2wav not installed — TOC checked, sectors not read')"
   fi
 
   return "$bad"
@@ -1648,21 +2006,23 @@ verify_disc() {  # verify_disc <disc-number> <expected-track-count>
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/burncd.XXXXXX")
 STARTED=$(date +%s)
 
-# Only emit the show-cursor escape to a real terminal, so piped output and log
-# files stay clean.
-cleanup() { rm -rf "$WORK"; [ -t 1 ] && printf '\033[?25h'; return 0; }
+# The screen comes off first, whatever happened: a job that ends on the alternate
+# screen and does not step off it leaves the terminal in raw mode with no cursor.
+# The show-cursor escape is for the unscreened path, and only to a real terminal,
+# so piped output and log files stay clean.
+cleanup() { screen_off; rm -rf "$WORK"; [ -t 1 ] && printf '\033[?25h'; return 0; }
 trap cleanup EXIT
 trap 'cleanup; printf "\n"; exit 130' INT
 
 if [ "$DUMMY" -eq 1 ]; then
-  printf '  %bTEST BURN%b — the laser stays off and nothing is written.\n' "$AMBER" "$OFF"
-  printf '  The disc is not ejected, so you can burn it for real straight after.\n\n'
+  note "$(printf '%bTEST BURN%b — the laser stays off and nothing is written.' "$AMBER" "$OFF")"
+  note 'The disc is not ejected, so you can burn it for real straight after.'
 fi
 
 if [ "$FROM" -gt 1 ]; then
   [ "$FROM" -le "$NDISCS" ] || die "--from-disc $FROM but this job is only $NDISCS discs"
-  printf '  Resuming at disc %d of %d, skipping %d already burned.\n\n' \
-    "$FROM" "$NDISCS" "$((FROM - 1))"
+  note "$(printf 'Resuming at disc %d of %d, skipping %d already burned.' \
+    "$FROM" "$NDISCS" "$((FROM - 1))")"
 fi
 
 for d in $(seq "$FROM" "$NDISCS"); do
@@ -1684,21 +2044,51 @@ for d in $(seq "$FROM" "$NDISCS"); do
   in ${TMPDIR:-/tmp}. Free some space or set TMPDIR to a bigger volume."
   fi
 
-  if [ "$NDISCS" -gt 1 ]; then
-    printf '  %bINSERT%b a blank CD-R for disc %d of %d, then press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
-      "$AMBER" "$OFF" "$d" "$NDISCS" "$CAP" "$OFF" "$DIM" "$OFF"
+  # Wait for a blank disc. On the panel that is a stage of its own, with this
+  # disc's meter on it and one key to press; without it, the prompt it always
+  # was.
+  if [ "$SCREEN" -eq 1 ]; then
+    stage_insert "$d"
+    while :; do
+      # Without this guard, a closed stdin makes the loop exit silently partway
+      # through a multi-disc job, which looks exactly like a successful finish.
+      wait_key || die "stdin closed — burncd needs a terminal to confirm each disc"
+      case "$KEY" in
+        q|Q)          die "cancelled" ;;
+        $'\n'|$' ')   break ;;
+      esac
+    done
   else
-    printf '  %bINSERT%b a blank CD-R and press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
-      "$AMBER" "$OFF" "$CAP" "$OFF" "$DIM" "$OFF"
+    if [ "$NDISCS" -gt 1 ]; then
+      printf '  %bINSERT%b a blank CD-R for disc %d of %d, then press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
+        "$AMBER" "$OFF" "$d" "$NDISCS" "$CAP" "$OFF" "$DIM" "$OFF"
+    else
+      printf '  %bINSERT%b a blank CD-R and press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
+        "$AMBER" "$OFF" "$CAP" "$OFF" "$DIM" "$OFF"
+    fi
+    read -r _ || die "stdin closed — burncd needs a terminal to confirm each disc"
   fi
-  # Without this guard, a closed stdin makes the loop exit silently partway
-  # through a multi-disc job, which looks exactly like a successful finish.
-  read -r _ || die "stdin closed — burncd needs a terminal to confirm each disc"
 
   IMAGE="$WORK/disc$d.wav"
   CUE="$WORK/disc$d.cue"
+  FFLOG="$WORK/ffmpeg-$d.log"
+  : > "$FFLOG"
 
-  printf '  %bCONVERTING%b to 16-bit/44.1kHz...\n' "$ETCH" "$OFF"
+  # The bands the conversion and the burn both draw against: this disc's tracks
+  # end to end across the full bar. Worked out once here, then bandbar() moves a
+  # head along them twice — once while the image is built, once while it is
+  # written — so the two halves of the wait are the same picture.
+  DSECS=0; CSECS=0
+  BDUR=()
+  n=0
+  for i in "${IDX[@]}"; do
+    BDUR[$n]=${P_DUR[$i]}
+    DSECS=$(( DSECS + P_DUR[i] ))
+    n=$(( n + 1 ))
+  done
+  if [ "$n" -gt 0 ]; then bands $(( STRIP_WIDTH * 8 )) "${BDUR[@]}"; else bands 0; fi
+
+  [ "$SCREEN" -eq 1 ] || printf '  %bCONVERTING%b to 16-bit/44.1kHz...\n' "$ETCH" "$OFF"
 
   # One continuous image rather than a file per track. Two reasons: cdrecord
   # only writes CD-Text from a cue sheet, and a cue sheet must point at a
@@ -1710,6 +2100,11 @@ for d in $(seq "$FROM" "$NDISCS"); do
 
   for i in "${IDX[@]}"; do
     n=$((n + 1))
+    if [ "$SCREEN" -eq 1 ]; then
+      stage_convert "$d" "$n" "${#IDX[@]}" "${P_TITLE[$i]}" \
+        $(( DSECS > 0 ? CSECS * STRIP_WIDTH * 8 / DSECS : 0 ))
+    fi
+    CSECS=$(( CSECS + P_DUR[i] ))
     # Track boundaries must land on sector boundaries, so record where this
     # track begins before appending it.
     STARTS+=( $(( ($(file_size "$IMAGE") - HDR) / SECTOR )) )
@@ -1729,14 +2124,21 @@ for d in $(seq "$FROM" "$NDISCS"); do
       FILTER="aformat=sample_fmts=fltp,volume=${g}dB,aresample=out_sample_fmt=s16:dither_method=triangular"
     fi
 
+    # stderr to a log rather than to the terminal: on the alternate screen a
+    # stray ffmpeg warning would print through the middle of the panel and be
+    # gone with the next frame. If the conversion fails, the log is what the
+    # error message is made of — and by then the screen is off.
+    ok=1
     if [ -n "${P_OFF[$i]}" ]; then
       ffmpeg -nostdin -v error -ss "${P_OFF[$i]}" -i "${P_FILE[$i]}" \
         -t "${P_LEN[$i]}" -map a:0 -af "$FILTER" \
-        -ar 44100 -ac 2 -c:a pcm_s16le -f s16le - >> "$IMAGE"
+        -ar 44100 -ac 2 -c:a pcm_s16le -f s16le - 2>> "$FFLOG" >> "$IMAGE" || ok=0
     else
       ffmpeg -nostdin -v error -i "${P_FILE[$i]}" -map a:0 -af "$FILTER" \
-        -ar 44100 -ac 2 -c:a pcm_s16le -f s16le - >> "$IMAGE"
+        -ar 44100 -ac 2 -c:a pcm_s16le -f s16le - 2>> "$FFLOG" >> "$IMAGE" || ok=0
     fi
+    [ "$ok" -eq 1 ] || die "ffmpeg failed on ${P_FILE[$i]}
+$(tail -8 "$FFLOG" | sed 's/^/    /')"
 
     # Pad out to a whole sector so the next track starts aligned. Same job
     # cdrecord's -pad used to do, moved here where the offsets are computed.
@@ -1775,13 +2177,15 @@ for d in $(seq "$FROM" "$NDISCS"); do
   # CD-Text lives in the lead-in, which is small. If the metadata is enormous
   # the drive rejects the whole burn, so shed per-track artists first.
   if [ "$CDTEXT" -eq 1 ] && [ "$(file_size "$CUE")" -gt "$CDTEXT_BUDGET" ]; then
-    printf '  \033[33m!\033[0m CD-Text too large for the lead-in; dropping per-track artists\n'
+    note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; dropping per-track artists')"
     grep -v '^    PERFORMER' "$CUE" > "$CUE.trim" && mv "$CUE.trim" "$CUE"
   fi
 
   total_mb=$(( DATA / 1048576 ))
 
-  printf '\n'
+  # The blank line opens the burn panel's hole in a scrolling terminal. On the
+  # alternate screen render() draws over the stage that is already there.
+  [ "$SCREEN" -eq 1 ] || printf '\n'
 
   set +e
   if [ "$DEMO" -eq 1 ]; then
@@ -1812,6 +2216,10 @@ for d in $(seq "$FROM" "$NDISCS"); do
   set -e
 
   if [ "$rc" -ne 0 ]; then
+    # Off the alternate screen before a word of this: it is going to stderr and
+    # the terminal is about to get its prompt back, so it has to land in the
+    # scrollback and not on a panel that is one printf from being discarded.
+    screen_off
     if [ -s "$WORK/cdrecord-$d.log" ]; then
       printf '\n  cdrecord said:\n' >&2
       tr '\r' '\n' < "$WORK/cdrecord-$d.log" \
@@ -1826,26 +2234,32 @@ for d in $(seq "$FROM" "$NDISCS"); do
 
   rm -f "$IMAGE"
 
+  # The disc is done, and the panel says so on a stage of its own: the meter it
+  # was planned against, and the log of everything that has happened up to here.
+  # The burn screen's last frame is not left sitting at 100% while the next disc
+  # is being asked for.
   if [ "$DUMMY" -eq 1 ]; then
-    printf '  %b✓%b Disc %d of %d rehearsed — nothing written, disc still blank\n\n' \
-      "$AMBER" "$OFF" "$d" "$NDISCS"
+    stage "REHEARSED · DISC $d OF $NDISCS" "$(strip "$d" "DISC $d")"
+    note "$(printf '%b✓%b Disc %d of %d rehearsed — nothing written, disc still blank' \
+      "$AMBER" "$OFF" "$d" "$NDISCS")"
     continue
   fi
 
-  printf '  %b✓%b Disc %d of %d written\n' "$AMBER" "$OFF" "$d" "$NDISCS"
+  stage "WRITTEN · DISC $d OF $NDISCS" "$(strip "$d" "DISC $d")"
+  note "$(printf '%b✓%b Disc %d of %d written' "$AMBER" "$OFF" "$d" "$NDISCS")"
 
   if [ "$VERIFY" -eq 1 ] && [ "$DEMO" -eq 0 ]; then
     if verify_disc "$d" "${#IDX[@]}"; then
-      printf '  %b✓%b Disc %d verified\n' "$AMBER" "$OFF" "$d"
+      note "$(printf '%b✓%b Disc %d verified' "$AMBER" "$OFF" "$d")"
     else
       VERIFY_FAILED="${VERIFY_FAILED:-}$d "
-      printf '  \033[31m✗\033[0m Disc %d did not verify — see above\n' "$d"
+      note "$(printf '\033[31m✗\033[0m Disc %d did not verify — see above' "$d")"
     fi
     # We suppressed cdrecord's own eject to keep the disc readable; do it now
     # so a multi-disc job still cues the next one the same way.
     cdrecord -eject dev="$DEV" >/dev/null 2>&1 || true
   fi
-  printf '\n'
+  [ "$SCREEN" -eq 1 ] || printf '\n'
 done
 
 # ------------------------------------------------------------------ summary --
@@ -1854,24 +2268,49 @@ BURNED=$((NDISCS - FROM + 1))
 ELAPSED=$(( $(date +%s) - STARTED ))
 
 if [ "$DUMMY" -eq 1 ]; then
-  printf '  %bREHEARSAL COMPLETE%b — %d disc%s, %s elapsed.\n' \
-    "$AMBER" "$OFF" "$BURNED" "$([ "$BURNED" -eq 1 ] || echo s)" "$(mmss "$ELAPSED")"
-  printf '  Every step ran except the laser. Drop --dummy to burn for real.\n\n'
+  printf -v SUMMARY 'REHEARSED · %d DISC%s · %s ELAPSED' \
+    "$BURNED" "$([ "$BURNED" -eq 1 ] || echo S)" "$(mmss "$ELAPSED")"
 else
-  # The same header the plan and the burn screen wear, so the last thing on the
-  # screen is recognisably the same machine as the first.
   printf -v SUMMARY '%d DISC%s · %s · %s ELAPSED' \
     "$BURNED" "$([ "$BURNED" -eq 1 ] || echo S)" \
     "$(mmss "$TOTAL")" "$(mmss "$ELAPSED")"
-  RULE=$(( PANEL - 10 - ${#SUMMARY} )); [ "$RULE" -lt 2 ] && RULE=2
-  repv '━' "$RULE"
-  printf '  %b BURNCD %b %b%s%b %b%s%b\n\n' \
-    "$BADGE" "$OFF" "$ETCH" "$REP" "$OFF" "$ETCH" "$SUMMARY" "$OFF"
+fi
+
+# The same faceplate the plan and the burn screen wear, so the last thing to be
+# printed is recognisably the same machine as the first.
+summary_panel() {
+  local d
+  faceplate "$SUMMARY"
+  printf '\n'
   printf '    %b%-7s%b %s\n\n' "$ETCH" ALBUM "$OFF" "${ALBUM:-—}"
   for d in $(seq "$FROM" "$NDISCS"); do
     strip "$d" "DISC $d"
     printf '\n'
   done
+  return 0
+}
+
+# The last stage: the job as a whole, and one key to leave by. Nothing scrolls
+# past it and nothing prints over it — it sits there until it is dismissed, which
+# is the point of having been in an application the whole time.
+if [ "$SCREEN" -eq 1 ]; then
+  stage_done "$SUMMARY"
+  while :; do
+    wait_key || break
+    case "$KEY" in q|Q|$'\n'|$' ') break ;; esac
+  done
+  screen_off
+  # And now the record, laid into the terminal proper: what was planned, and
+  # what came of it, for the scrollback to keep.
+  show_plan
+fi
+
+if [ "$DUMMY" -eq 1 ]; then
+  printf '  %bREHEARSAL COMPLETE%b — %d disc%s, %s elapsed.\n' \
+    "$AMBER" "$OFF" "$BURNED" "$([ "$BURNED" -eq 1 ] || echo s)" "$(mmss "$ELAPSED")"
+  printf '  Every step ran except the laser. Drop --dummy to burn for real.\n\n'
+else
+  summary_panel
   printf '\n'
   if [ -n "${VERIFY_FAILED:-}" ]; then
     printf '  \033[31mDiscs that did not verify: %s\033[0m\n\n' "$VERIFY_FAILED"
