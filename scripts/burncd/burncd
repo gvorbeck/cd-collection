@@ -197,7 +197,18 @@ screen_on() {
   # From here to the end of the job there is no moment where a Ctrl-C leaves the
   # terminal on the alternate screen in raw mode. The burn loop replaces this
   # with one that also takes the working directory with it.
-  trap 'screen_off; printf "\n"; exit 130' INT
+  trap 'int_nl; screen_off; exit 130' INT
+  return 0
+}
+
+# The newline a Ctrl-C prints is for the shell prompt's benefit: the terminal
+# echoes ^C where the cursor is, and without it the prompt lands beside it. On a
+# screened run that echo went to the alternate buffer and leaves with it, so the
+# primary screen's cursor is still at the start of the line after the command
+# that was typed — printing here would open a blank line under it instead. Call
+# this before screen_off, while SCREEN still says which case this is.
+int_nl() {
+  [ "$SCREEN" -eq 1 ] || printf '\n'
   return 0
 }
 
@@ -2080,7 +2091,7 @@ STARTED=$(date +%s)
 # so piped output and log files stay clean.
 cleanup() { screen_off; rm -rf "$WORK"; [ -t 1 ] && printf '\033[?25h'; return 0; }
 trap cleanup EXIT
-trap 'cleanup; printf "\n"; exit 130' INT
+trap 'int_nl; cleanup; exit 130' INT
 
 if [ "$DUMMY" -eq 1 ]; then
   note "$(printf '%bTEST BURN%b — the laser stays off and nothing is written.' "$AMBER" "$OFF")"

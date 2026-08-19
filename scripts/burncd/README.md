@@ -127,7 +127,7 @@ names it in the summary.
 | Command | What it does |
 | --- | --- |
 | `burncd --check` | Verify this machine can burn. Run first on a new setup. |
-| `burncd DIR` | Show the folder's plan, edit it if needed, then `b` to burn |
+| `burncd DIR` | Open the plan, edit it if needed, `b` to burn — the whole job on one screen |
 | `burncd -n DIR` | Dry run — print the plan, burn nothing |
 | `burncd --demo DIR` | Convert for real, build the image and cue, simulate the burn |
 | `burncd --dummy DIR` | Rehearse the burn on the drive with the laser off |
@@ -297,7 +297,9 @@ in the lead-in and to the cue sheet — and they are gone when the command exits
 The editor needs a terminal and something to decide, so `-n` and any piped or
 redirected run skip it and print the static plan instead. Pressing `b` does not
 close the editor so much as turn the page: the screen stays where it is and the
-burn happens on it. See [one screen, start to finish](#one-screen-start-to-finish).
+burn happens on it, starting with a confirm screen that `e` brings you straight
+back here from. See [one screen, start to
+finish](#one-screen-start-to-finish).
 
 The disc layout is recomputed after every change, so on a multi-disc set the
 `━━ DISC N` separators and the meter move as you reorder or drop tracks; you can
@@ -305,8 +307,10 @@ see a disc boundary land somewhere better in real time. The meter always shows
 the disc the cursor is on, with a minute scale under it, so "where does this
 disc end?" and "how full is it?" are the same glance.
 
-The screen draws on the terminal's alternate buffer, so nothing above it moves
-and none of it is in your scrollback afterwards.
+The screen draws on the terminal's alternate buffer, and that buffer is opened
+before the first line of output rather than after — even "reading the folder"
+happens inside it. So nothing above it moves, and when it closes there is nothing
+of the run left behind at all.
 
 Year is worth setting even though no CD player will ever show it — CD-Text has no
 year field. It is written to the cue sheet as `REM DATE`, which some ripping
@@ -394,8 +398,9 @@ whether your ffmpeg has the `ebur128` filter this needs.
 
 What a normal run opens with. It is the editor described above — arrow around
 it, fix what's wrong, `b` when it's right — and this is the plain-text copy of
-the same thing, which is what `-n` prints and what lands in your scrollback once
-the job is over:
+the same thing, which is what `-n` prints and what a piped run or a window too
+short for a panel falls back to. A normal run keeps the plan on the panel
+instead and leaves nothing in your scrollback at all:
 
 ```
   Nonagon Infinity — King Gizzard
@@ -457,27 +462,64 @@ top, the album under it, the stage's own body, then whatever has already happene
 and last of all the keys you can press:
 
 ```
-   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ INSERT · DISC 2 OF 2
+   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ INSERT · DISC 1 OF 1
 
     ALBUM    John Denver's Greatest Hits
+    ARTIST   John Denver
+    YEAR     1973
 
-  DISC 2                                                  72:35 / 79:57
-  ▐▓▓▓▌▓▓▓▓▉▓▊▓▋▓▌▓▓▓▉▓▓▓▓▎▓▓▓▋▓▓▊▓▓▉▓▓▓▓▓▓▓▓▓▓▉▓▓▓▊▓▓▓▊▓▓▓▊▓▓▓▊░░░░░░▌
+    01  Take Me Home, Country Roads (Orig…  John Denver            3:14
+    02  Follow Me ("Greatest Hits" Versio…  John Denver            2:58
+    03  Starwood In Aspen ("Greatest Hits…  John Denver            3:16
+    04  For Baby (For Bobbie)               John Denver            3:00
+    05  Rhymes and Reasons ("Greatest Hit…  John Denver            3:18
+    06  Leaving, On a Jet Plane ("Greates…  John Denver            4:09
+    07  The Eagle and the Hawk ("Greatest…  John Denver            2:17
+    08  Sunshine on My Shoulders ("Greate…  John Denver            5:15
+    09  Goodbye Again                       John Denver            3:42
+    10  Poems, Prayers and Promises ("Gre…  John Denver            4:42
+    11  Rocky Mountain High                 John Denver            4:44
+
+  DISC 1                                                  40:35 / 79:57
+  ▐▓▓▊▓▓▎▓▓▓▓▌▓▓▎▓▓▊▓▋▓▓▓▓▓▓▓▏▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
    0               20               40               60             80
 
-  INSERT a blank CD-R for disc 2 of 2
+  INSERT a blank CD-R
+   ⏎  BURN    E  EDIT    Q  CANCEL
+```
 
+**Asking for the disc is also the confirmation step.** The point of no return is
+the moment a blank goes in, so that is the screen that shows you what you are
+about to commit to: the album, artist and year as you edited them, the running
+order as you left it, and the meter for the disc about to be written. `e` goes
+back to the editor with everything you changed still changed; `⏎` starts the
+burn. Nothing is converted or written until then, so the round trip costs a
+keystroke and nothing else.
+
+`e` is offered only on the first disc of a job that started at disc one. Once a
+disc has been written the plan is a fact about a physical object sitting on the
+desk, and re-cutting the running order underneath it would renumber discs that
+are already in a sleeve — so from disc two on, the keys are `⏎ BURN` and
+`Q CANCEL`.
+
+When the track list is taller than the window has room for, it is cut to fit and
+the last line reads `▾ 7 MORE`. There is no scrolling here — this screen is a
+last look, and the place to read a long album line by line is the editor `e`
+takes you back to.
+
+Under the meter is the running log — discs finished, verify results, anything the
+drive had to say:
+
+```
   ✓ Disc 1 of 2 written
 
+  INSERT a blank CD-R for disc 2 of 2
    ⏎  BURN    Q  CANCEL
 ```
 
-The meter is the one you approved in the plan, for the disc about to be written,
-so the thing going into the drive is on screen while you feed it. Underneath it
-is the running log — discs finished, verify results, anything the drive had to
-say. Those lines used to print wherever the cursor happened to be, over the top
-of whatever was being drawn at the time; now they join the frame they belong to
-and it is redrawn around them. If the log outgrows the window, the oldest lines
+Those lines used to print wherever the cursor happened to be, over the top of
+whatever was being drawn at the time; now they join the frame they belong to and
+it is redrawn around them. If the log outgrows the window, the oldest lines
 scroll out of the panel rather than pushing its header off the top of the screen.
 
 Converting is the same frame with the capacity meter filling as each track is
@@ -522,12 +564,12 @@ progress instead of redrawing anything.
 
 ### When it's done
 
+The last state of the same panel, not a message printed after it:
+
 ```
-  ✓ Disc 2 of 2 written
+   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━ 2 DISCS · 78:10 · 41:12 ELAPSED
 
-   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━ 2 DISCS · 78:10 · 6:41 ELAPSED
-
-    ALBUM   Nonagon Infinity
+    ALBUM    Nonagon Infinity
 
   DISC 1                                                  46:12 / 79:57
   ▐▓▓▓▎▓▓▓▓▊▓▓▓▌▓▓▓▓▏▓▓▓▊▓▓▓▓▎▓▓▓▌▓▓▓▓▏▓▓▓▓▎░░░░░░░░░░░░░░░░░░░░░░░░░░▌
@@ -536,10 +578,28 @@ progress instead of redrawing anything.
   DISC 2                                                  31:58 / 79:57
   ▐▓▓▓▓▌▓▓▓▏▓▓▓▓▊▓▓▓▎▓▓▓▓▋▓▓▓▌▓▓▓▏░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
    0               20               40               60             80
+
+  ✓ Disc 1 of 2 written
+  ✓ Disc 2 of 2 written
+
+   Q  QUIT
 ```
 
-Same bars as the plan, so you can see what actually landed on each disc without
-scrolling back up. `--from-disc` reruns show only the discs they burned.
+Same bars as the plan, so you can see what actually landed on each disc, with the
+whole log of the job under them. `--from-disc` reruns show only the discs they
+burned.
+
+**`q` is the end of the job, and it takes the screen with it.** The alternate
+buffer closes and your terminal is exactly as you left it — the last thing in the
+scrollback is the `burncd` command you typed, with nothing between it and the next
+prompt. Nothing from the run is printed before the screen opens or after it
+closes, so a burn leaves no wreckage to scroll past. The one exception is a disc
+that failed `--verify`: that is worth keeping, so it is written to stderr after
+the screen is down, and burncd exits non-zero.
+
+A window shorter than 19 rows or narrower than 71 columns never opens the screen
+in the first place and prints the whole job linearly instead, the same way a pipe
+does.
 
 Run `burncd --demo` on any folder to see all of this without a disc in the drive.
 
