@@ -79,9 +79,10 @@ They do different things and none of them replaces another:
 | `--dummy` | yes | yes — a complete burn with the write laser off | no, the blank survives |
 
 So: `--check` proves the hardware and tooling are there. `--demo` proves the
-*output* is right — it prints the generated cue sheet so you can read the CD-Text
-before anyone burns it. `--dummy` proves the drive actually accepts that cue
-sheet and CD-Text, by doing the entire burn for real minus the laser.
+*output* is right — it converts the audio and builds the real image and cue sheet,
+then runs the burn screen against them so you can see the whole thing land without
+a disc in the drive. `--dummy` proves the drive actually accepts that cue sheet
+and CD-Text, by doing the entire burn for real minus the laser.
 
 ```bash
 burncd --check
@@ -128,7 +129,7 @@ names it in the summary.
 | `burncd --check` | Verify this machine can burn. Run first on a new setup. |
 | `burncd DIR` | Show the folder's plan, edit it if needed, then `b` to burn |
 | `burncd -n DIR` | Dry run — print the plan, burn nothing |
-| `burncd --demo DIR` | Convert for real, show the cue sheet, simulate the burn |
+| `burncd --demo DIR` | Convert for real, build the image and cue, simulate the burn |
 | `burncd --dummy DIR` | Rehearse the burn on the drive with the laser off |
 | `burncd --verify DIR` | Burn, then read the disc back and check it |
 | `burncd --level DIR` | Bring a quiet album up to normal CD loudness |
@@ -441,30 +442,34 @@ Red Book disc, closer together on the short ones `BURNCD_MINUTES` can ask for.
 ### Burning
 
 ```
-             █
-       █████████████        Burning disc 1 of 2
-     █████████████████
-   █████████████████████    ███████████████░░░░░░░░░░░  58%
-   ████████     ████████    track 3 of 4
-  ████████       ████████   128 of 220 MB at 8.0x
-   ████████     ████████    buffer 97%   ETA 0:02
-   █████████████████████
-     █████████████████      ▰▰▰▱
-       █████████████
-             █
+   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ WRITING · DISC 1 OF 2 ·  54%
+
+    TRACK    06 OF 11  Rhymes and Reasons ("Greatest Hits" Version)
+    WRITTEN  329 OF 605 MB AT 8.0x
+    BUFFER   97%   ELAPSED 0:42   REMAINING 0:36
+
+  ▐▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▊░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
+  ▐····························█▓▒▒░░·································▌
 ```
 
-That's a disc filling in from the hub outward, which is the direction a CD is
-actually written. Only the shape survives being pasted into a README — in a real
-terminal the same cells are colored: the unwritten outer area is dim grey, the
-leading edge is a bright white ring, and everything behind it is teal. At 58% the
-ring above would be sitting a little past the middle. The fill is area-
-proportional rather than radial, so the ring visibly slows as it nears the rim,
-which is also what a real burn does.
+Same badge, same grid, same amber as the plan. **The progress bar is the capacity
+meter again** — the bands are the tracks, in the same alternating ambers, so the
+plan you approved and the disc coming out of it are visibly the same picture at
+two moments. The part not yet written is the same run-out the meter uses for the
+empty end of a disc, and the write head is a partial block rather than a whole
+one, so on a bar this wide it creeps forward continuously instead of sitting
+still and then jumping a cell.
 
-The pips are tracks: filled ones are written, the bright one is in progress.
+The second line is a lamp sweeping a dark field, in the position the plan gives
+its minute scale. It moves on every message from the drive, which is the point: a
+burn is twenty minutes of a number that changes every few seconds, and a stalled
+write should look different from a slow one across the room.
 
-In a terminal narrower than 62 columns it falls back to a compact four-line
+There used to be a disc filling in from the hub outward here, in cyan and white.
+It was a second, unrelated instrument bolted to the side of this one, and it said
+nothing the numbers beside it did not.
+
+In a terminal narrower than 71 columns it falls back to a compact four-line
 readout, and when output is piped to a file it prints plain one-line-per-track
 progress instead of redrawing anything.
 
@@ -473,8 +478,9 @@ progress instead of redrawing anything.
 ```
   ✓ Disc 2 of 2 written
 
-  Nonagon Infinity
-  2 discs of 2 · 78:10 of audio · 6:41 elapsed
+   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━ 2 DISCS · 78:10 · 6:41 ELAPSED
+
+    ALBUM   Nonagon Infinity
 
   DISC 1                                                  46:12 / 79:57
   ▐▓▓▓▎▓▓▓▓▊▓▓▓▌▓▓▓▓▏▓▓▓▊▓▓▓▓▎▓▓▓▌▓▓▓▓▏▓▓▓▓▎░░░░░░░░░░░░░░░░░░░░░░░░░░▌

@@ -83,8 +83,6 @@ PANEL=69
 # tracks across a half-full disc had about two cells each, and at two cells the
 # difference between a 3:14 and a 2:58 is not a thing the bar can say.
 STRIP_WIDTH=$(( PANEL - 2 ))
-DISC_ROWS=11           # the burning-disc animation, in terminal cells
-DISC_COLS=23           # ~2x rows, because cells are about twice as tall as wide
 MAX_TRACKS=99          # Red Book hard limit: a CD cannot hold more than 99 tracks.
 SECTOR=2352            # bytes per CD audio sector: 588 stereo 16-bit samples
 BYTES_PER_SEC=176400   # 44100 Hz * 2 channels * 2 bytes
@@ -100,8 +98,17 @@ BADGE='\033[48;5;214m\033[38;5;232m'   # engraved plate: black on amber
 CAP='\033[48;5;236m\033[38;5;214m'     # a keycap, backlit from behind
 OFF='\033[0m'
 DIM='\033[2m'
-BOLD='\033[1m'
 INV='\033[7m'
+# Four steps around the panel's own amber rather than four cool hues: cyan and
+# violet on an amber faceplate read as a different instrument bolted on. These
+# stay in the lamp-and-oxide family — amber, brown, gold, burnt orange — and
+# zigzag light/dark/light/dark, so neighbouring bands separate on brightness even
+# where the hues are cousins, and the edges survive without colour vision. The
+# plan's capacity meter and the burn screen's progress bar share them, because
+# they are the same picture at two moments.
+SHADES=(214 130 220 166)
+RUNOUT=94              # the darkest amber on the ramp: everything not yet used
+HEAD=231               # the write head, the brightest thing on the screen
 
 # Repeat one character n times, for panel rules.
 rep() {  # rep <char> <count>
@@ -763,12 +770,6 @@ strip() {  # strip <disc-number> [panel-label]
   local d=$1 lbl="${2:-}" i n=0 cum=0 units filled=0 used=0 left=0 best bi c
   local b=0 j out="" scale="" col=0 m p tot step want
   local curfg='' curbg=''
-  # Four steps around the panel's own amber rather than four cool hues: cyan and
-  # violet on an amber faceplate read as a different instrument bolted on. These
-  # stay in the lamp-and-oxide family — amber, brown, gold, burnt orange — and
-  # zigzag light/dark/light/dark, so neighbouring bands separate on brightness
-  # even where the hues are cousins, and the edges survive without colour vision.
-  local SHADES=(214 130 220 166)
   local -a DUR HC REM
   DUR=(); HC=(); REM=()
 
@@ -852,7 +853,7 @@ strip() {  # strip <disc-number> [panel-label]
     if [ "$b" -ge "$nb" ]; then
       # Past the last band: the run-out, dithered in the darkest amber on the
       # ramp rather than left blank, so it still reads as part of the meter.
-      strip_sgr 94 ''; out="${out}░"
+      strip_sgr "$RUNOUT" ''; out="${out}░"
     elif [ "${BEND[$b]}" -ge "$ce" ]; then
       # Shade rather than solid, for the phosphor-and-oxide texture the rest of
       # the panel has. The same shade the whole way across a band, though — an
@@ -1303,75 +1304,144 @@ show_plan
 
 [ "$DRY_RUN" -eq 1 ] && exit 0
 
-# ------------------------------------------------------------- progress bar --
+# ------------------------------------------------------------- burn screen --
 
-# A real CD is written from the centre outwards, so the progress display is a
-# disc filling from the hub to the rim. THRESH holds, for every terminal cell,
-# the percentage at which that cell lights up — computed once here, because
-# doing trigonometry per cell per frame in bash would be far too slow.
+# The burn screen is the edit panel with the laser on: the same badge, the same
+# 69-column grid, the same amber. What used to be here was a disc filling in from
+# the hub — a second, unrelated machine bolted to the side of this one, drawn in
+# cyan and white, telling you nothing the numbers underneath it did not already
+# say. Now the screen is one instrument all the way down.
 #
-# The threshold goes by AREA, not radius: data on a CD is spread over the
-# surface, so a track at the rim covers more ground per millimetre than one
-# near the hub. Filling by radius would race ahead and then stall.
-THRESH=()
-disc_geometry() {
-  while IFS= read -r v; do THRESH+=("$v"); done < <(
-    awk -v rows="$DISC_ROWS" -v cols="$DISC_COLS" 'BEGIN {
-      cy = (rows - 1) / 2; cx = (cols - 1) / 2
-      rin = 0.30                                  # the hole in the middle
-      for (r = 0; r < rows; r++) for (c = 0; c < cols; c++) {
-        ny = (r - cy) / cy; nx = (c - cx) / cx
-        rad = sqrt(nx * nx + ny * ny)
-        if (rad > 1.0) { print 999; continue }    # outside the disc
-        if (rad < rin) { print 998; continue }    # the hub
-        f = (rad * rad - rin * rin) / (1 - rin * rin)
-        p = int(f * 100 + 0.5)
-        print (p < 0 ? 0 : (p > 100 ? 100 : p))
-      }
-    }'
-  )
+# The progress bar is the plan's capacity meter again, and that is the whole
+# idea: the bands are the tracks, in the same alternating ambers, so the plan you
+# approved and the disc being written out of it are visibly the same picture at
+# two different moments. The part not yet written is the same run-out the meter
+# uses for the empty end of a disc.
+BB_END=(); BB_COL=()
+burn_bands() {  # burn_bands  -- reads IDX/P_DUR, fills BB_END/BB_COL
+  local n=0 i cum=0 units used=0 left=0 best bi pos=0 nb=0
+  local -a D HC REM
+  BB_END=(); BB_COL=(); D=(); HC=(); REM=()
+
+  for i in "${IDX[@]}"; do
+    D[$n]=${P_DUR[$i]}
+    cum=$(( cum + P_DUR[i] ))
+    n=$(( n + 1 ))
+  done
+  units=$(( STRIP_WIDTH * 8 ))
+  [ "$n" -gt 0 ] && [ "$cum" -gt 0 ] || return 0
+
+  # Largest remainder, as in the meter: the bands add up to the full bar exactly,
+  # and a longer track is never drawn narrower than a shorter one.
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    HC[$i]=$(( D[i] * units / cum ))
+    REM[$i]=$(( D[i] * units % cum ))
+    used=$(( used + HC[i] ))
+    i=$(( i + 1 ))
+  done
+  left=$(( units - used ))
+  while [ "$left" -gt 0 ]; do
+    best=-1; bi=-1
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      [ "${REM[$i]}" -gt "$best" ] && { best=${REM[$i]}; bi=$i; }
+      i=$(( i + 1 ))
+    done
+    [ "$bi" -lt 0 ] && break
+    HC[$bi]=$(( HC[bi] + 1 )); REM[$bi]=-1; left=$(( left - 1 ))
+  done
+
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ "${HC[$i]}" -gt 0 ]; then
+      pos=$(( pos + HC[i] ))
+      BB_END[$nb]=$pos
+      BB_COL[$nb]=${SHADES[$(( nb % 4 ))]}
+      nb=$(( nb + 1 ))
+    fi
+    i=$(( i + 1 ))
+  done
 }
 
-# One row of the disc at a given percentage. Colour escapes are only emitted
-# when the colour actually changes, which keeps a frame down to a handful of
-# escapes instead of one per cell.
-disc_row() {  # disc_row <row> <pct>
-  local r=$1 pct=$2 c t out="" want last=""
-  for (( c = 0; c < DISC_COLS; c++ )); do
-    t=${THRESH[$(( r * DISC_COLS + c ))]}
-    if [ "$t" -ge 998 ]; then
-      [ -n "$last" ] && { out="$out\033[0m"; last=""; }
-      out="$out "
-      continue
+# One frame of the bar. Written cells carry their track's colour, the rest is
+# run-out, and the write head is a partial block rather than a whole one — eight
+# steps to the cell, so on a bar this wide it creeps forward continuously instead
+# of sitting still for twenty seconds and then jumping.
+burn_bar() {  # burn_bar <units-written>
+  local head=$1 j=0 b=0 nb=${#BB_END[@]} cs ce t out='' curfg='' curbg=''
+  local PARTS=('' '▏' '▎' '▍' '▌' '▋' '▊' '▉')
+  while [ "$j" -lt "$STRIP_WIDTH" ]; do
+    cs=$(( j * 8 )); ce=$(( cs + 8 ))
+    while [ "$b" -lt "$nb" ] && [ "${BB_END[$b]}" -le "$cs" ]; do b=$(( b + 1 )); done
+    if [ "$head" -ge "$ce" ]; then
+      strip_sgr "${BB_COL[$b]:-${SHADES[0]}}" ''; out="${out}▓"
+    elif [ "$head" -le "$cs" ]; then
+      strip_sgr "$RUNOUT" ''; out="${out}░"
+    else
+      t=$(( head - cs ))
+      strip_sgr "$HEAD" ''
+      out="${out}${PARTS[$t]}"
     fi
-    if [ "$t" -gt "$pct" ]; then      want='\033[38;5;236m'   # not yet written
-    elif [ $(( pct - t )) -le 6 ]; then want='\033[38;5;231m' # the write head
-    else                               want='\033[38;5;44m'   # burned
-    fi
-    [ "$want" != "$last" ] && { out="$out$want"; last=$want; }
-    out="${out}█"
+    j=$(( j + 1 ))
   done
-  printf '%s\033[0m' "$out"
+  printf '%b\033[0m' "$out"
+}
+
+# A lamp sweeping a dark field, under the bar where the plan puts its minute
+# scale. It exists because a burn is twenty minutes of a number that moves once
+# every few seconds, and a panel with nothing moving on it looks like a panel
+# that has died. This one moves on every message from the drive, so a stall in
+# the write is a stall on the screen — which is exactly the thing you want to be
+# able to see from across the room.
+burn_scan() {  # burn_scan <frame>
+  local f=$1 span p dir j dd out='' curfg='' curbg=''
+  span=$(( (STRIP_WIDTH - 1) * 2 ))
+  p=$(( f % span ))
+  if [ "$p" -ge "$STRIP_WIDTH" ]; then p=$(( span - p )); dir=-1; else dir=1; fi
+  j=0
+  while [ "$j" -lt "$STRIP_WIDTH" ]; do
+    # Distance behind the lamp, measured against the way it is travelling: the
+    # trail falls off the way it came and the leading edge stays sharp, so the
+    # direction is never ambiguous. Getting the sign the wrong way round puts the
+    # fade out in front, and the whole thing reads as moving backwards.
+    dd=$(( (p - j) * dir ))
+    case $dd in
+      0) strip_sgr "$HEAD" ''; out="${out}█" ;;
+      1) strip_sgr 220 '';     out="${out}▓" ;;
+      2) strip_sgr 214 '';     out="${out}▒" ;;
+      3) strip_sgr 172 '';     out="${out}▒" ;;
+      4) strip_sgr 130 '';     out="${out}░" ;;
+      5) strip_sgr "$RUNOUT" ''; out="${out}░" ;;
+      *) strip_sgr 236 '';     out="${out}·" ;;
+    esac
+    j=$(( j + 1 ))
+  done
+  printf '%b\033[0m' "$out"
 }
 
 # Parses cdrecord's progress output and redraws the display in place.
 # cdrecord emits carriage-return-delimited lines like:
 #   Track 03:  12 of  45 MB written (fifo 100%) [buf  98%]  8.0x.
-render() {
+render() {  # render <disc-no> <of> <ntracks> <total-mb>
   local disc_no=$1 disc_of=$2 ntracks=$3 total_mb=$4
-  local chunk trk mb_done buf spd bar pips
+  local chunk trk mb_done buf spd title verb meta rule head frame=0
   local base_mb=0 last_trk=1 done_mb=0 pct=0 eta="--:--" plain_trk=0
-  local start elapsed i filled tty=0 cols lines barw discmode=0 r info
+  local start elapsed i tty=0 cols lines wide=0 bar filled
 
   [ -t 1 ] && tty=1
-  # The disc needs room beside it for the readout; below that, fall back to
-  # the compact four-line display rather than wrapping into a mess.
+  # The panel is 71 columns and does not reflow; below that, a compact readout
+  # rather than a grid folded in half.
   term_size; cols=$TERM_COLS
-  if [ "$tty" -eq 1 ] && [ "$cols" -ge 62 ] && [ ${#THRESH[@]} -gt 0 ]; then
-    discmode=1; lines=$DISC_ROWS; barw=26
+  if [ "$tty" -eq 1 ] && [ "$cols" -ge $(( PANEL + 2 )) ]; then
+    wide=1; lines=8
+    burn_bands
   else
-    discmode=0; lines=4; barw=$BAR_WIDTH
+    wide=0; lines=4
   fi
+
+  verb=WRITING
+  [ "${DUMMY:-0}" -eq 1 ] && verb=REHEARSING
 
   start=$(date +%s)
   if [ "$tty" -eq 1 ]; then
@@ -1401,21 +1471,6 @@ render() {
       eta=$(mmss $(( elapsed * (100 - pct) / pct )))
     fi
 
-    filled=$(( pct * barw / 100 ))
-    bar=""
-    for ((i = 0; i < barw; i++)); do
-      if [ "$i" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar}░"; fi
-    done
-
-    pips=""
-    if [ "$ntracks" -le 48 ]; then
-      for ((i = 1; i <= ntracks; i++)); do
-        if   [ "$i" -lt "$trk" ]; then pips="$pips\033[32m▰\033[0m"
-        elif [ "$i" -eq "$trk" ]; then pips="$pips\033[1;36m▰\033[0m"
-        else pips="$pips\033[2m▱\033[0m"; fi
-      done
-    fi
-
     if [ "$tty" -eq 0 ]; then
       # Piped or logged: one line per track instead of redraw escapes.
       [ "$trk" -ne "$plain_trk" ] && {
@@ -1425,31 +1480,52 @@ render() {
       continue
     fi
 
+    frame=$(( frame + 1 ))
     printf '\033[%dA\r' "$lines"
 
-    if [ "$discmode" -eq 0 ]; then
-      printf '\033[K  \033[1mBurning disc %d of %d\033[0m\n' "$disc_no" "$disc_of"
-      printf '\033[K  \033[36m%s\033[0m %3d%%\n' "$bar" "$pct"
-      printf '\033[K  track %d/%d · %d/%d MB · %sx · buf %s%% · ETA %s\n' \
-        "$trk" "$ntracks" "$done_mb" "$total_mb" "$spd" "$buf" "$eta"
-      printf '\033[K  %b\n' "$pips"
+    if [ "$wide" -eq 0 ]; then
+      filled=$(( pct * BAR_WIDTH / 100 ))
+      bar=''
+      for (( i = 0; i < BAR_WIDTH; i++ )); do
+        if [ "$i" -lt "$filled" ]; then bar="${bar}▓"; else bar="${bar}░"; fi
+      done
+      printf '\033[K  %b%s DISC %d OF %d%b\n' "$AMBER" "$verb" "$disc_no" "$disc_of" "$OFF"
+      printf '\033[K  %b▐%b%b%s%b%b▌%b %b%3d%%%b\n' \
+        "$ETCH" "$OFF" "$AMBER" "$bar" "$OFF" "$ETCH" "$OFF" "$AMBER" "$pct" "$OFF"
+      printf '\033[K  %bTRACK%b %d/%d  %bDATA%b %d/%d MB  %b%sx%b\n' \
+        "$ETCH" "$OFF" "$trk" "$ntracks" "$ETCH" "$OFF" "$done_mb" "$total_mb" \
+        "$ETCH" "$spd" "$OFF"
+      printf '\033[K  %bBUFFER%b %s%%  %bELAPSED%b %s  %bLEFT%b %s\n' \
+        "$ETCH" "$OFF" "$buf" "$ETCH" "$OFF" "$(mmss "$elapsed")" "$ETCH" "$OFF" "$eta"
       continue
     fi
 
-    # The disc on the left, the readout beside it. Rows the readout does not
-    # use are still printed so the block keeps a constant height.
-    for (( r = 0; r < DISC_ROWS; r++ )); do
-      case $r in
-        1) info=$(printf '\033[1mBurning disc %d of %d\033[0m' "$disc_no" "$disc_of") ;;
-        3) info=$(printf '\033[38;5;44m%s\033[0m %3d%%' "$bar" "$pct") ;;
-        4) info=$(printf 'track %d of %d' "$trk" "$ntracks") ;;
-        5) info=$(printf '%d of %d MB at %sx' "$done_mb" "$total_mb" "$spd") ;;
-        6) info=$(printf 'buffer %s%%   ETA %s' "$buf" "$eta") ;;
-        8) info=$pips ;;
-        *) info="" ;;
-      esac
-      printf '\033[K  %b   %b\n' "$(disc_row "$r" "$pct")" "$info"
-    done
+    # Header, laid out exactly like the plan's: badge, rule, and the state of the
+    # machine pushed against the right edge.
+    # %3d, not %d: the rule is sized from what is left after the meta, so a
+    # percentage that grows a digit would shorten the rule by one and the whole
+    # header would twitch sideways twice a burn.
+    printf -v meta '%s · DISC %d OF %d · %3d%%' "$verb" "$disc_no" "$disc_of" "$pct"
+    rule=$(( PANEL - 10 - ${#meta} )); [ "$rule" -lt 2 ] && rule=2
+    repv '━' "$rule"
+    printf '\033[K  %b BURNCD %b %b%s%b %b%s%b\n\033[K\n' \
+      "$BADGE" "$OFF" "$ETCH" "$REP" "$OFF" "$ETCH" "$meta" "$OFF"
+
+    title='—'
+    [ "$trk" -ge 1 ] && [ "$trk" -le "${#IDX[@]}" ] && title=${P_TITLE[${IDX[$(( trk - 1 ))]}]}
+    fitv "$title" 46
+    printf '\033[K    %b%-8s%b %02d OF %02d  %s\n' \
+      "$ETCH" TRACK "$OFF" "$trk" "$ntracks" "$FIT"
+    printf '\033[K    %b%-8s%b %d OF %d MB AT %sx\n' \
+      "$ETCH" WRITTEN "$OFF" "$done_mb" "$total_mb" "$spd"
+    printf '\033[K    %b%-8s%b %s%%   %bELAPSED%b %s   %bREMAINING%b %s\n\033[K\n' \
+      "$ETCH" BUFFER "$OFF" "$buf" "$ETCH" "$OFF" "$(mmss "$elapsed")" \
+      "$ETCH" "$OFF" "$eta"
+
+    head=$(( total_mb > 0 ? done_mb * STRIP_WIDTH * 8 / total_mb : 0 ))
+    [ "$head" -gt $(( STRIP_WIDTH * 8 )) ] && head=$(( STRIP_WIDTH * 8 ))
+    printf '\033[K  %b▐%b%s%b▌%b\n' "$ETCH" "$OFF" "$(burn_bar "$head")" "$ETCH" "$OFF"
+    printf '\033[K  %b▐%b%s%b▌%b\n' "$ETCH" "$OFF" "$(burn_scan "$frame")" "$ETCH" "$OFF"
   done
 
   [ "$tty" -eq 1 ] && printf '\033[?25h'      # show cursor
@@ -1522,12 +1598,12 @@ cue_text() {
 verify_disc() {  # verify_disc <disc-number> <expected-track-count>
   local d=$1 want=$2 toc got rc bad=0
 
-  printf '  Verifying disc %d...\n' "$d"
+  printf '  %bVERIFYING%b disc %d...\n' "$AMBER" "$OFF" "$d"
 
   toc=$(cdrecord -toc dev="$DEV" 2>&1 || true)
   got=$(printf '%s\n' "$toc" | grep -c '^track:[[:space:]]*[0-9]' || true)
   if [ "$got" -eq "$want" ]; then
-    printf '    \033[32m✓\033[0m table of contents — %d tracks\n' "$got"
+    printf '    %b✓%b table of contents — %d tracks\n' "$AMBER" "$OFF" "$got"
   else
     printf '    \033[31m✗\033[0m table of contents — expected %d tracks, disc reports %d\n' \
       "$want" "$got"
@@ -1544,7 +1620,7 @@ verify_disc() {  # verify_disc <disc-number> <expected-track-count>
     rc=$?
     set -e
     if [ "$rc" -eq 0 ]; then
-      printf '    \033[32m✓\033[0m full read — every sector came back\n'
+      printf '    %b✓%b full read — every sector came back\n' "$AMBER" "$OFF"
     else
       printf '    \033[31m✗\033[0m full read failed (exit %d):\n' "$rc"
       tail -6 "$WORK/verify-$d.log" | sed 's/^/        /'
@@ -1555,7 +1631,7 @@ verify_disc() {  # verify_disc <disc-number> <expected-track-count>
       # Best effort: -J asks for information only. If the field does not come
       # back that is not proof it is missing, so this never fails the disc.
       if cdda2wav dev="$DEV" -J -v titles 2>&1 | qgrep -F "$ALBUM"; then
-        printf '    \033[32m✓\033[0m CD-Text — album title reads back\n'
+        printf '    %b✓%b CD-Text — album title reads back\n' "$AMBER" "$OFF"
       else
         printf '    \033[33m!\033[0m CD-Text — could not read it back; check on a player\n'
       fi
@@ -1578,11 +1654,8 @@ cleanup() { rm -rf "$WORK"; [ -t 1 ] && printf '\033[?25h'; return 0; }
 trap cleanup EXIT
 trap 'cleanup; printf "\n"; exit 130' INT
 
-# Only worth the awk call if there is a terminal to draw on.
-[ -t 1 ] && disc_geometry
-
 if [ "$DUMMY" -eq 1 ]; then
-  printf '  \033[1mTest burn\033[0m — the laser stays off and nothing is written.\n'
+  printf '  %bTEST BURN%b — the laser stays off and nothing is written.\n' "$AMBER" "$OFF"
   printf '  The disc is not ejected, so you can burn it for real straight after.\n\n'
 fi
 
@@ -1612,10 +1685,11 @@ for d in $(seq "$FROM" "$NDISCS"); do
   fi
 
   if [ "$NDISCS" -gt 1 ]; then
-    printf '  Insert a blank CD-R for disc %d of %d, then press Enter (Ctrl-C to stop) ' \
-      "$d" "$NDISCS"
+    printf '  %bINSERT%b a blank CD-R for disc %d of %d, then press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
+      "$AMBER" "$OFF" "$d" "$NDISCS" "$CAP" "$OFF" "$DIM" "$OFF"
   else
-    printf '  Insert a blank CD-R and press Enter (Ctrl-C to stop) '
+    printf '  %bINSERT%b a blank CD-R and press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
+      "$AMBER" "$OFF" "$CAP" "$OFF" "$DIM" "$OFF"
   fi
   # Without this guard, a closed stdin makes the loop exit silently partway
   # through a multi-disc job, which looks exactly like a successful finish.
@@ -1624,7 +1698,7 @@ for d in $(seq "$FROM" "$NDISCS"); do
   IMAGE="$WORK/disc$d.wav"
   CUE="$WORK/disc$d.cue"
 
-  printf '  Converting to 16-bit/44.1kHz...\n'
+  printf '  %bCONVERTING%b to 16-bit/44.1kHz...\n' "$ETCH" "$OFF"
 
   # One continuous image rather than a file per track. Two reasons: cdrecord
   # only writes CD-Text from a cue sheet, and a cue sheet must point at a
@@ -1707,13 +1781,7 @@ for d in $(seq "$FROM" "$NDISCS"); do
 
   total_mb=$(( DATA / 1048576 ))
 
-  if [ "$DEMO" -eq 1 ]; then
-    # The image and cue above are real. This is the part worth eyeballing
-    # before trusting a disc to it.
-    printf '\n  \033[1mGenerated cue sheet\033[0m (image %d MB)\n' "$total_mb"
-    sed 's/^/    /' "$CUE" | head -24
-    printf '\n'
-  fi
+  printf '\n'
 
   set +e
   if [ "$DEMO" -eq 1 ]; then
@@ -1759,16 +1827,16 @@ for d in $(seq "$FROM" "$NDISCS"); do
   rm -f "$IMAGE"
 
   if [ "$DUMMY" -eq 1 ]; then
-    printf '  \033[32m✓\033[0m Disc %d of %d rehearsed — nothing written, disc still blank\n\n' \
-      "$d" "$NDISCS"
+    printf '  %b✓%b Disc %d of %d rehearsed — nothing written, disc still blank\n\n' \
+      "$AMBER" "$OFF" "$d" "$NDISCS"
     continue
   fi
 
-  printf '  \033[32m✓\033[0m Disc %d of %d written\n' "$d" "$NDISCS"
+  printf '  %b✓%b Disc %d of %d written\n' "$AMBER" "$OFF" "$d" "$NDISCS"
 
   if [ "$VERIFY" -eq 1 ] && [ "$DEMO" -eq 0 ]; then
     if verify_disc "$d" "${#IDX[@]}"; then
-      printf '  \033[32m✓\033[0m Disc %d verified\n' "$d"
+      printf '  %b✓%b Disc %d verified\n' "$AMBER" "$OFF" "$d"
     else
       VERIFY_FAILED="${VERIFY_FAILED:-}$d "
       printf '  \033[31m✗\033[0m Disc %d did not verify — see above\n' "$d"
@@ -1786,14 +1854,20 @@ BURNED=$((NDISCS - FROM + 1))
 ELAPSED=$(( $(date +%s) - STARTED ))
 
 if [ "$DUMMY" -eq 1 ]; then
-  printf '  \033[1mRehearsal complete\033[0m — %d disc%s, %s elapsed.\n' \
-    "$BURNED" "$([ "$BURNED" -eq 1 ] || echo s)" "$(mmss "$ELAPSED")"
+  printf '  %bREHEARSAL COMPLETE%b — %d disc%s, %s elapsed.\n' \
+    "$AMBER" "$OFF" "$BURNED" "$([ "$BURNED" -eq 1 ] || echo s)" "$(mmss "$ELAPSED")"
   printf '  Every step ran except the laser. Drop --dummy to burn for real.\n\n'
 else
-  printf '  \033[1m%s\033[0m\n' "${ALBUM:-Done}"
-  printf '  %d disc%s of %d · %s of audio · %s elapsed\n\n' \
-    "$BURNED" "$([ "$BURNED" -eq 1 ] || echo s)" "$NDISCS" \
+  # The same header the plan and the burn screen wear, so the last thing on the
+  # screen is recognisably the same machine as the first.
+  printf -v SUMMARY '%d DISC%s · %s · %s ELAPSED' \
+    "$BURNED" "$([ "$BURNED" -eq 1 ] || echo S)" \
     "$(mmss "$TOTAL")" "$(mmss "$ELAPSED")"
+  RULE=$(( PANEL - 10 - ${#SUMMARY} )); [ "$RULE" -lt 2 ] && RULE=2
+  repv '━' "$RULE"
+  printf '  %b BURNCD %b %b%s%b %b%s%b\n\n' \
+    "$BADGE" "$OFF" "$ETCH" "$REP" "$OFF" "$ETCH" "$SUMMARY" "$OFF"
+  printf '    %b%-7s%b %s\n\n' "$ETCH" ALBUM "$OFF" "${ALBUM:-—}"
   for d in $(seq "$FROM" "$NDISCS"); do
     strip "$d" "DISC $d"
     printf '\n'
