@@ -83,6 +83,12 @@ PANEL=69
 # tracks across a half-full disc had about two cells each, and at two cells the
 # difference between a 3:14 and a 2:58 is not a thing the bar can say.
 STRIP_WIDTH=$(( PANEL - 2 ))
+# Every row of the edit panel that is not a track, and the shortest window that
+# can still hold one. Up here rather than beside tui_fit_rows, which is what
+# counts with them, because the decision to open the screen at all is made before
+# any of the display exists — see the screen gate after the requirements check.
+TUI_CHROME=14
+TUI_MIN_LINES=$(( TUI_CHROME + 5 ))
 MAX_TRACKS=99          # Red Book hard limit: a CD cannot hold more than 99 tracks.
 SECTOR=2352            # bytes per CD audio sector: 588 stereo 16-bit samples
 BYTES_PER_SEC=176400   # 44100 Hz * 2 channels * 2 bytes
@@ -477,6 +483,23 @@ command -v ffmpeg  >/dev/null || die "ffmpeg not found. brew install ffmpeg"
 command -v ffprobe >/dev/null || die "ffprobe not found. brew install ffmpeg"
 if [ "$DRY_RUN" -eq 0 ] && [ "$DEMO" -eq 0 ]; then
   command -v cdrecord >/dev/null || die "cdrecord not found. brew install cdrtools"
+fi
+
+# The screen opens here, before the first line of output, and does not close
+# again until the job is over. Everything from reading the tags onwards happens
+# inside it, so what is left in the scrollback afterwards is the command you
+# typed and nothing else — no progress lines, no plan, no summary. That is the
+# whole point of an application: it occupies the terminal while it runs and gives
+# it back the way it found it.
+#
+# A dry run has nothing to steer, a pipe has no one driving it, and a window too
+# small for the panel has nowhere to draw it; all three keep the plain output
+# they always had. See TUI_MIN_LINES, and PANEL for the width, which does not
+# reflow.
+term_size
+if [ "$DRY_RUN" -eq 0 ] && [ -t 0 ] && [ -t 1 ] \
+   && [ "$TERM_LINES" -ge "$TUI_MIN_LINES" ] && [ "$TERM_COLS" -ge $(( PANEL + 2 )) ]; then
+  screen_on || true
 fi
 
 # ------------------------------------------------------------ read metadata --
@@ -1294,11 +1317,10 @@ tui_frame() {  # tui_frame <cursor> <top> <visible-rows> <status>
 #
 # The +1 in TUI_CHROME is the cursor: a frame of N newlines drawn from row 1 puts
 # the cursor on row 1+N, so N has to stay one under the window or the last
-# newline scrolls the very thing this is protecting.
-TUI_CHROME=14
-# Chrome, plus the two a status message costs, plus the three the shortest
+# newline scrolls the very thing this is protecting. TUI_MIN_LINES is that
+# chrome, plus the two a status message costs, plus the three the shortest
 # possible list still needs: a disc rule, one track, and the "▾ n MORE" line.
-TUI_MIN_LINES=$(( TUI_CHROME + 5 ))
+# Both are set at the top of the file, where PANEL is.
 tui_fit_rows() {  # tui_fit_rows <top> <status> -> $TUI_ROWS
   local budget
   term_size
@@ -1508,18 +1530,12 @@ show_plan() {
 
 # The preview IS the editor. A wrong title or a bad order is noticed and fixed
 # on the same screen it was spotted on, so there is no flag to predict in
-# advance. A dry run has nothing to steer and a pipe has no one driving it;
-# both fall through to the static plan below, and so does a window with no room
-# in it — see TUI_MIN_LINES, and PANEL for the width, which does not reflow.
-term_size
-if [ "$DRY_RUN" -eq 0 ] && [ -t 0 ] && [ -t 1 ] \
-   && [ "$TERM_LINES" -ge "$TUI_MIN_LINES" ] && [ "$TERM_COLS" -ge $(( PANEL + 2 )) ]; then
-  screen_on && tui_edit
-fi
+# advance. Whether there is a screen to draw on was settled before the tags were
+# read; tui_edit returns straight away if there isn't.
+tui_edit
 
-# Printed here only when there is no panel to print it on. A screened run keeps
-# the plan on the display until the job is over and then lays it into the
-# scrollback on the way out, so it reads as a record rather than as leftovers.
+# Printed only when there is no panel to print it on. A screened run has the plan
+# on the display instead, and leaves nothing behind when it closes.
 [ "$SCREEN" -eq 1 ] || show_plan
 
 [ "$DRY_RUN" -eq 1 ] && exit 0
@@ -1561,11 +1577,12 @@ stage_paint() {
 # The log is trimmed to whatever is left of the window, oldest lines first: a
 # frame taller than the window would scroll the panel's own top row away for good.
 stage_frame() {
-  local nls used=4 room i n
+  local nls used=3 room i n
   faceplate "$STAGE_META"
   printf '\n'
   printf '    %b%-8s%b %s\n' "$ETCH" ALBUM "$OFF" "${ALBUM:-—}"
-  printf '\n'
+  # No blank line here: the body opens with one if it wants one, and the insert
+  # stage does not — its ARTIST and YEAR belong to the same block of fields.
   if [ -n "$STAGE_BODY" ]; then
     printf '%s\n' "$STAGE_BODY"
     nls=${STAGE_BODY//[!$'\n']/}
@@ -1622,21 +1639,71 @@ wait_key() {  # wait_key -> $KEY
   return "$rc"
 }
 
-# Waiting for a blank disc. The meter is the one from the plan, for this disc
-# only, so the thing about to be written is on screen while you feed the drive.
+# Waiting for a blank disc — and the last look at what is about to be permanent.
+# It shows the same fields and the same track rows the editor showed, for this
+# disc, because this is the moment the edits stop being reversible: the next key
+# starts writing them into a lead-in. Reading the listing off a summary two
+# screens back is not checking it.
+#
+# The tracks come from IDX, which the burn loop has already gathered for this
+# disc by the time this runs.
+#
+# ROOM: everything that is not a track row — the faceplate and its blank, the
+# three fields, the blank under them, the blank and three lines of meter, the
+# blank and two rows at the foot, and the row the cursor lands on. Whatever is
+# left is the listing, less one row for "▾ n MORE" if the list is cut, and less
+# whatever the log needs — up to four rows of it, since a disc prompt with the
+# last disc's result hidden is the one place the log has something to say.
 stage_insert() {  # stage_insert <disc-number>
-  local d=$1 body
+  local d=$1 body foot prompt rows reserve=0 n k i num ttl art tm
+  n=${#IDX[@]}
+  term_size
+  [ "${#LOG[@]}" -gt 0 ] && reserve=$(( ${#LOG[@]} + 1 ))
+  [ "$reserve" -gt 4 ] && reserve=4
+  rows=$(( TERM_LINES - 14 - reserve ))
+  [ "$n" -gt "$rows" ] && rows=$(( rows - 1 ))
+  [ "$rows" -lt 1 ] && rows=1
+
   body=$(
-    strip "$d" "DISC $d"
+    printf '    %b%-8s%b %s\n' "$ETCH" ARTIST "$OFF" "${ALBUM_ARTIST:-—}"
+    printf '    %b%-8s%b %s\n' "$ETCH" YEAR   "$OFF" "${YEAR:-—}"
     printf '\n'
-    if [ "$NDISCS" -gt 1 ]; then
-      printf '  %bINSERT%b a blank CD-R for disc %d of %d\n' \
-        "$AMBER" "$OFF" "$d" "$NDISCS"
-    else
-      printf '  %bINSERT%b a blank CD-R\n' "$AMBER" "$OFF"
+    k=0
+    while [ "$k" -lt "$n" ] && [ "$k" -lt "$rows" ]; do
+      i=${IDX[$k]}
+      printf -v num '%02d' $(( k + 1 ))
+      fitv "${P_TITLE[$i]}" 34; ttl=$FIT
+      fitv "${P_ARTIST[$i]}" 20; art=$FIT
+      mmssv "${P_DUR[$i]}"; printf -v tm '%5s' "$MMSS"
+      printf '    %b%s%b  %s  %b%s%b  %b%s%b\n' \
+        "$ETCH" "$num" "$OFF" "$ttl" "$DIM" "$art" "$OFF" "$ETCH" "$tm" "$OFF"
+      k=$(( k + 1 ))
+    done
+    if [ "$k" -lt "$n" ]; then
+      printf '    %b▾ %d MORE%b\n' "$ETCH" $(( n - k )) "$OFF"
     fi
+    printf '\n'
+    strip "$d" "DISC $d"
   )
-  stage "INSERT · DISC $d OF $NDISCS" "$body" "$(keys '⏎' BURN Q CANCEL)"
+
+  if [ "$NDISCS" -gt 1 ]; then
+    printf -v prompt '  %bINSERT%b a blank CD-R for disc %d of %d' \
+      "$AMBER" "$OFF" "$d" "$NDISCS"
+  else
+    printf -v prompt '  %bINSERT%b a blank CD-R' "$AMBER" "$OFF"
+  fi
+
+  # Going back is only offered on the first disc of the job, and only when the
+  # job started there. Once a disc is written the plan it came from is a fact
+  # about a physical object, and re-cutting the running order underneath it would
+  # renumber discs that are already in a sleeve.
+  if [ "$d" -eq 1 ] && [ "$FROM" -eq 1 ]; then
+    foot=$(keys '⏎' BURN E EDIT Q CANCEL)
+  else
+    foot=$(keys '⏎' BURN Q CANCEL)
+  fi
+  stage "INSERT · DISC $d OF $NDISCS" "$body" "$prompt
+$foot"
   return 0
 }
 
@@ -1648,6 +1715,7 @@ stage_convert() {  # stage_convert <disc> <track-no> <of> <title> <head-units>
   bandbar "$5"
   fitv "$4" 46
   body=$(
+    printf '\n'
     printf '    %b%-8s%b %02d OF %02d  %s\n' "$ETCH" TRACK "$OFF" "$2" "$3" "$FIT"
     printf '\n'
     printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$BANDBAR" "$ETCH" "$OFF"
@@ -1658,17 +1726,17 @@ stage_convert() {  # stage_convert <disc> <track-no> <of> <title> <head-units>
 
 # The job, finished, waiting to be dismissed. Every disc gets its meter if the
 # window has room for them; a seventeen-disc job in a short window shows what
-# fits and says how many it did not, and the full set goes to the scrollback
-# afterwards either way.
+# fits and says how many it did not.
 stage_done() {  # stage_done <meta>
   local body max
   term_size
-  # Four chrome rows, the blank and keycap row at the foot, two kept back for the
-  # log, and the row the cursor lands on; each disc costs three meter rows and a
-  # blank.
+  # Three chrome rows and the blank the body opens with, the blank and keycap row
+  # at the foot, two kept back for the log, and the row the cursor lands on; each
+  # disc costs three meter rows and a blank.
   max=$(( (TERM_LINES - 9) / 4 ))
   [ "$max" -lt 1 ] && max=1
   body=$(
+    printf '\n'
     d=$FROM; shown=0
     while [ "$d" -le "$NDISCS" ] && [ "$shown" -lt "$max" ]; do
       strip "$d" "DISC $d"
@@ -2025,6 +2093,14 @@ if [ "$FROM" -gt 1 ]; then
     "$FROM" "$NDISCS" "$((FROM - 1))")"
 fi
 
+# Wrapped in a restart, because the disc prompt can send you back to the editor.
+# An edit re-cuts the discs — a dropped track can change how many there are — so
+# the job cannot simply resume where it left off; the seq below was expanded from
+# the old layout. Going back is only offered before the first disc is written, so
+# there is never anything to undo when this runs a second time.
+REEDIT=1
+while [ "$REEDIT" -eq 1 ]; do
+REEDIT=0
 for d in $(seq "$FROM" "$NDISCS"); do
   # Gather this disc's tracks in play order.
   IDX=()
@@ -2044,9 +2120,9 @@ for d in $(seq "$FROM" "$NDISCS"); do
   in ${TMPDIR:-/tmp}. Free some space or set TMPDIR to a bigger volume."
   fi
 
-  # Wait for a blank disc. On the panel that is a stage of its own, with this
-  # disc's meter on it and one key to press; without it, the prompt it always
-  # was.
+  # Wait for a blank disc. On the panel that is a stage of its own, showing this
+  # disc exactly as it will be written and offering the way back to the editor;
+  # without it, the prompt it always was.
   if [ "$SCREEN" -eq 1 ]; then
     stage_insert "$d"
     while :; do
@@ -2055,9 +2131,14 @@ for d in $(seq "$FROM" "$NDISCS"); do
       wait_key || die "stdin closed — burncd needs a terminal to confirm each disc"
       case "$KEY" in
         q|Q)          die "cancelled" ;;
+        e|E)          if [ "$d" -eq 1 ] && [ "$FROM" -eq 1 ]; then REEDIT=1; break; fi ;;
         $'\n'|$' ')   break ;;
       esac
     done
+    if [ "$REEDIT" -eq 1 ]; then
+      tui_edit
+      break
+    fi
   else
     if [ "$NDISCS" -gt 1 ]; then
       printf '  %bINSERT%b a blank CD-R for disc %d of %d, then press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
@@ -2239,13 +2320,13 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
   # The burn screen's last frame is not left sitting at 100% while the next disc
   # is being asked for.
   if [ "$DUMMY" -eq 1 ]; then
-    stage "REHEARSED · DISC $d OF $NDISCS" "$(strip "$d" "DISC $d")"
+    stage "REHEARSED · DISC $d OF $NDISCS" "$(printf '\n'; strip "$d" "DISC $d")"
     note "$(printf '%b✓%b Disc %d of %d rehearsed — nothing written, disc still blank' \
       "$AMBER" "$OFF" "$d" "$NDISCS")"
     continue
   fi
 
-  stage "WRITTEN · DISC $d OF $NDISCS" "$(strip "$d" "DISC $d")"
+  stage "WRITTEN · DISC $d OF $NDISCS" "$(printf '\n'; strip "$d" "DISC $d")"
   note "$(printf '%b✓%b Disc %d of %d written' "$AMBER" "$OFF" "$d" "$NDISCS")"
 
   if [ "$VERIFY" -eq 1 ] && [ "$DEMO" -eq 0 ]; then
@@ -2260,6 +2341,7 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
     cdrecord -eject dev="$DEV" >/dev/null 2>&1 || true
   fi
   [ "$SCREEN" -eq 1 ] || printf '\n'
+done
 done
 
 # ------------------------------------------------------------------ summary --
@@ -2293,6 +2375,12 @@ summary_panel() {
 # The last stage: the job as a whole, and one key to leave by. Nothing scrolls
 # past it and nothing prints over it — it sits there until it is dismissed, which
 # is the point of having been in an application the whole time.
+#
+# And then nothing. Quitting hands the terminal back exactly as it was found,
+# with the command you typed as the last thing in the scrollback; an application
+# that unloads its screens into your history on the way out is not one you can
+# run twice without scrolling. The only exception is a disc that did not verify,
+# which is a result you need after the screen is gone.
 if [ "$SCREEN" -eq 1 ]; then
   stage_done "$SUMMARY"
   while :; do
@@ -2300,9 +2388,11 @@ if [ "$SCREEN" -eq 1 ]; then
     case "$KEY" in q|Q|$'\n'|$' ') break ;; esac
   done
   screen_off
-  # And now the record, laid into the terminal proper: what was planned, and
-  # what came of it, for the scrollback to keep.
-  show_plan
+  if [ -n "${VERIFY_FAILED:-}" ]; then
+    printf 'burncd: discs that did not verify: %s\n' "$VERIFY_FAILED" >&2
+    exit 1
+  fi
+  exit 0
 fi
 
 if [ "$DUMMY" -eq 1 ]; then
