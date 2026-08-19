@@ -227,25 +227,45 @@ notice the bad title on the same screen you fix it on, with no flag to decide on
 in advance:
 
 ```
-  burncd — 6 tracks, 1:23, 1 disc
+   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 11 TRACKS · 40:35 · 1 DISC
 
-   Album   Nonagon Infinity
-   Artist  King Gizzard
-   Year    2016
+    ALBUM   John Denver's Greatest Hits
+    ARTIST  John Denver
+    YEAR    1973
 
-   ── disc 1 ──
- ▸  1  Robot Stop                          King Gizzard           0:12
-    2  Big Fig Wasp                        King Gizzard           0:10
-    3  Gamma Knife                         King Gizzard           0:14
-    4  People-Vultures                     King Gizzard           0:11
-    5  Mr Beat                             King Gizzard           0:16
-    6  Evil Death Roll                     King Gizzard           0:20
+  ━━ DISC 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ▶ 01  Take Me Home, Country Roads (Orig…  John Denver            3:14
+    02  Follow Me ("Greatest Hits" Versio…  John Denver            2:58
+    03  Starwood In Aspen ("Greatest Hits…  John Denver            3:16
+    04  For Baby (For Bobbie)               John Denver            3:00
+    05  Rhymes and Reasons ("Greatest Hit…  John Denver            3:18
+    06  Leaving, On a Jet Plane ("Greates…  John Denver            4:09
+    07  The Eagle and the Hawk ("Greatest…  John Denver            2:17
+    08  Sunshine on My Shoulders ("Greate…  John Denver            5:15
+    09  Goodbye Again                       John Denver            3:42
+    10  Poems, Prayers and Promises ("Gre…  John Denver            4:42
+    11  Rocky Mountain High                 John Denver            4:44
 
-  disc 1  ··············································  1:23 of 79:57
+  DISC 1                                                  40:35 / 79:57
+  ▐▓▓▊▓▓▎▓▓▓▓▌▓▓▎▓▓▊▓▋▓▓▓▓▓▓▓▏▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
+   0               20               40               60             80
 
-  ↑↓ select   ⇧↑↓ or J/K reorder   ⏎ rename   a artist   x drop
-  u undo   r reset   b burn   q quit
+   ↑↓  SELECT    ⇧↑↓  MOVE    ⏎  RENAME    A  ARTIST    X  DROP
+   U  UNDO    R  RESET    B  BURN    Q  QUIT
 ```
+
+That is the screen with its colour stripped out. On the terminal the `BURNCD`
+badge is engraved black-on-amber, the rules and labels are the darker amber of
+paint on a metal panel, the keycaps along the bottom are backlit, and the track
+titles are left the brightest thing on the screen. Titles too long for the column
+end in `…` so a truncated one is obvious. The meter is dithered throughout and
+coloured in the same amber family — amber, brown, gold, burnt orange, alternating
+light and dark so one track ends and the next begins visibly.
+
+Redraws are whole frames laid over the top of the last one, never a clear
+followed by a repaint, so holding an arrow key down does not strobe. Building a
+frame costs no subprocesses at all, which is what keeps that redraw under a
+frame's worth of time on a folder of any size.
 
 **`b` is what starts the burn** — or `space`, whichever your hand finds first.
 Nothing is written, converted, or asked of the drive until then, so there is no
@@ -273,8 +293,10 @@ that same static plan is printed to the scrollback, so the burn log has the
 final running order sitting above it.
 
 The disc layout is recomputed after every change, so on a multi-disc set the
-`── disc N ──` separators and the capacity bar move as you reorder or drop
-tracks; you can see a disc boundary land somewhere better in real time.
+`━━ DISC N` separators and the meter move as you reorder or drop tracks; you can
+see a disc boundary land somewhere better in real time. The meter always shows
+the disc the cursor is on, with a minute scale under it, so "where does this
+disc end?" and "how full is it?" are the same glance.
 
 The screen draws on the terminal's alternate buffer, so when it closes your
 scrollback is exactly as it was. The plan is then printed normally, which is the
@@ -379,14 +401,42 @@ to the burn once the editor closes:
     ...
    12. Road Train                                             4:12
                                                              41:38
-  ███████████████████████·······················  41:38 of 79:57
+                                                          41:38 / 79:57
+  ▐▓▓▓▎▓▓▓▊▓▓▌▓▓▓▏▓▓▓▊▓▓▓▎▓▓▌▓▓▓▓▏▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
+   0               20               40               60             80
 ```
 
-The bar under each disc is that disc filling up. Each block is real time on the
-disc and the shade steps between tracks, so you can see at a glance both how full
+The meter under each disc is that disc filling up. Each cell is real time on the
+disc and the colour steps between tracks, so you can see at a glance both how full
 the disc is and where the tracks divide it — which is the thing you actually want
 to look at on a multi-disc split, where every disc gets its own listing and its
-own bar.
+own meter.
+
+It is drawn at eighth-cell resolution. A cell can carry two colours — one as
+foreground, one as background — and Unicode has the full run of left-aligned
+partial blocks, so where a track boundary lands mid-column it is drawn as a
+partial block of the outgoing colour over the incoming one rather than snapped to
+the nearest character. That is eight times the precision for no extra width,
+which is what makes the widths comparable at all: on a half-full disc of eleven
+tracks each band is about three cells, and at whole-cell resolution a 3:14 and a
+2:58 are simply the same bar.
+
+Widths are apportioned by largest remainder rather than by truncating a running
+total, so a longer track is never drawn narrower than a shorter one, and the bands
+always add up to exactly the filled length. Measured against a real album the
+bands come out within about 1% of true. A track under about ten seconds rounds
+away to nothing and does not consume a colour, so the tracks either side of it
+keep their contrast.
+
+The grain is uniform within a band on purpose. An earlier version varied the
+density from cell to cell and the speckle read as gaps, which destroyed the only
+comparison the bar exists to support; a shaded cell is exactly as wide as a solid
+one, so the texture costs nothing as long as it does not vary. The unburnt tail is
+the same texture at a quarter density in the darkest amber, so it still reads as
+part of the meter rather than as the end of it.
+
+The scale underneath is spaced from the disc's capacity — every 20 minutes on a
+Red Book disc, closer together on the short ones `BURNCD_MINUTES` can ask for.
 
 ### Burning
 
@@ -426,8 +476,13 @@ progress instead of redrawing anything.
   Nonagon Infinity
   2 discs of 2 · 78:10 of audio · 6:41 elapsed
 
-  disc 1   ██████████████████████████····················  46:12 of 79:57
-  disc 2   ██████████████████····························  31:58 of 79:57
+  DISC 1                                                  46:12 / 79:57
+  ▐▓▓▓▎▓▓▓▓▊▓▓▓▌▓▓▓▓▏▓▓▓▊▓▓▓▓▎▓▓▓▌▓▓▓▓▏▓▓▓▓▎░░░░░░░░░░░░░░░░░░░░░░░░░░▌
+   0               20               40               60             80
+
+  DISC 2                                                  31:58 / 79:57
+  ▐▓▓▓▓▌▓▓▓▏▓▓▓▓▊▓▓▓▎▓▓▓▓▋▓▓▓▌▓▓▓▏░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
+   0               20               40               60             80
 ```
 
 Same bars as the plan, so you can see what actually landed on each disc without

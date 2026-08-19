@@ -36,6 +36,20 @@
 
 set -euo pipefail
 
+# Every rule, meter cell and track title on the edit screen is UTF-8, and ${#s}
+# counts bytes unless the ctype locale says otherwise — one accented title would
+# then shove the whole column grid sideways. Only LC_CTYPE is set, so collation
+# and number formatting elsewhere are left exactly as the user has them.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *UTF-8*|*utf-8*|*UTF8*|*utf8*) ;;
+  *) LOCALES=$( (locale -a 2>/dev/null || true) | tr '\n' ' ' )
+     case " $LOCALES " in
+       *" en_US.UTF-8 "*) export LC_CTYPE=en_US.UTF-8 ;;
+       *" C.UTF-8 "*)     export LC_CTYPE=C.UTF-8 ;;
+       *)                 export LC_CTYPE=UTF-8 ;;   # BSD libc accepts the bare name
+     esac ;;
+esac
+
 SPEED="${BURNCD_SPEED:-8}"
 DEV="${BURNCD_DEV:-IOCompactDiscServices}"
 DRY_RUN=0
@@ -59,13 +73,84 @@ LUFS_TARGET="${BURNCD_LUFS:--11}"
 PEAK_CEIL="${BURNCD_PEAK:--1}"
 
 BAR_WIDTH=42
-STRIP_WIDTH=46
+# The panel is a fixed 71 columns: 2 of margin plus a 69-column grid that the
+# header rule, the track rows and the meter all share. Fixed rather than fluid
+# because every column here has a job — 34 for a title, 20 for an artist — and
+# a grid that reflows is a grid you cannot learn.
+PANEL=69
+# The meter gets the whole grid minus its two brackets, and its readout moves to
+# a line of its own. Width is the only thing that buys resolution here: eleven
+# tracks across a half-full disc had about two cells each, and at two cells the
+# difference between a 3:14 and a 2:58 is not a thing the bar can say.
+STRIP_WIDTH=$(( PANEL - 2 ))
 DISC_ROWS=11           # the burning-disc animation, in terminal cells
 DISC_COLS=23           # ~2x rows, because cells are about twice as tall as wide
 MAX_TRACKS=99          # Red Book hard limit: a CD cannot hold more than 99 tracks.
 SECTOR=2352            # bytes per CD audio sector: 588 stereo 16-bit samples
 BYTES_PER_SEC=176400   # 44100 Hz * 2 channels * 2 bytes
 CDTEXT_BUDGET=3800     # rough byte ceiling for CD-Text packs in the lead-in
+
+# Panel palette. The edit screen is dressed as the faceplate of a deck that never
+# existed: amber silkscreen on black, backlit keycaps, a tape-counter readout.
+# Amber is the chrome — rules, labels, the badge — and never the data, so the
+# titles stay the brightest thing on the screen.
+AMBER='\033[38;5;214m'      # lit amber, for the readout and keycap legends
+ETCH='\033[38;5;172m'       # the darker amber of paint on a metal panel
+BADGE='\033[48;5;214m\033[38;5;232m'   # engraved plate: black on amber
+CAP='\033[48;5;236m\033[38;5;214m'     # a keycap, backlit from behind
+OFF='\033[0m'
+DIM='\033[2m'
+BOLD='\033[1m'
+INV='\033[7m'
+
+# Repeat one character n times, for panel rules.
+rep() {  # rep <char> <count>
+  repv "$1" "$2"
+  printf '%s' "$REP"
+}
+
+# The same, and the padding it is built from, returned in a global instead of on
+# stdout. Every $( ) is a fork, forks on macOS cost a millisecond or two, and one
+# frame of the edit screen wanted about 130 of them — a quarter of a second of
+# lag after an arrow key, which is exactly long enough to feel. Nothing on the
+# panel's hot path spawns a process now; it all writes into REP, PAD, FIT, MMSS.
+SPACES='                                                                                '
+pad() {  # pad <count> -> $PAD
+  PAD=''
+  [ "$1" -gt 0 ] || return 0
+  while [ "$1" -gt "${#SPACES}" ]; do SPACES="$SPACES$SPACES"; done
+  PAD=${SPACES:0:$1}
+}
+repv() {  # repv <char> <count> -> $REP
+  REP=''
+  [ "$2" -gt 0 ] || return 0
+  pad "$2"
+  REP=${PAD// /$1}
+}
+
+# How big the window actually is. Not plain `tput lines`: tput measures the
+# terminal attached to its own stdout, and inside $( ) that is a pipe, so it
+# falls back to whatever static size the terminfo entry declares — 24x80 for
+# most xterm entries. The edit screen would then page a 30-track album in a
+# 50-row window for no reason. stty asks the kernel for the real window size
+# off /dev/tty, which no redirection can move.
+#
+# The answer lands in globals and is cached, because asking costs an exec and the
+# edit screen asks once per keypress. A SIGWINCH handler clears the cache, so a
+# resized window is still noticed at the next redraw.
+TERM_LINES='' TERM_COLS=''
+term_size() {  # term_size -> $TERM_LINES, $TERM_COLS
+  local sz
+  [ -n "$TERM_LINES" ] && [ -n "$TERM_COLS" ] && return 0
+  sz=$( (stty size </dev/tty) 2>/dev/null || true )
+  TERM_LINES=${sz%% *}
+  TERM_COLS=${sz##* }
+  case "$TERM_LINES" in ''|*[!0-9]*|0) TERM_LINES=$(tput lines 2>/dev/null || true) ;; esac
+  case "$TERM_COLS"  in ''|*[!0-9]*|0) TERM_COLS=$(tput cols 2>/dev/null || true) ;; esac
+  case "$TERM_LINES" in ''|*[!0-9]*|0) TERM_LINES=24 ;; esac
+  case "$TERM_COLS"  in ''|*[!0-9]*|0) TERM_COLS=80 ;; esac
+  return 0
+}
 
 die() { printf '\nburncd: %s\n' "$1" >&2; exit 1; }
 
@@ -74,8 +159,9 @@ usage() {
   exit "${1:-0}"
 }
 
-# Seconds -> M:SS
+# Seconds -> M:SS, on stdout or (on the panel's hot path) in $MMSS.
 mmss() { printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
+mmssv() { printf -v MMSS '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
 
 # Sectors -> MM:SS:FF, the addressing a cue sheet uses (75 frames per second).
 msf() { printf '%02d:%02d:%02d' $(( $1 / 4500 )) $(( $1 % 4500 / 75 )) $(( $1 % 75 )); }
@@ -662,73 +748,180 @@ level_note() {
   return 0
 }
 
-# One segment per track, sized by its share of a whole disc, with the unused
-# tail left as dots. Makes "disc 2 is only two-thirds full" obvious at a glance,
-# which is the moment to reorder the folder rather than after burning it.
-strip() {  # strip <disc-number>
-  local d=$1 i n=0 cum=0 filled=0 used=0 left=0 best bi c drawn=0
-  local prev=0 out="" shade last=""
-  # Four cool hues rather than four shades of one: neighbouring steps of a single
-  # teal ramp are hard to tell apart at this size, and a boundary you cannot see
-  # is a boundary that is not there. Cyan → green → blue → violet, each also a
-  # different lightness so the edges hold up without colour vision too.
-  local SHADES=(51 42 39 141)
-  local -a DUR CELLS REM
-  DUR=(); CELLS=(); REM=()
+# The capacity meter: one band per track, sized by its share of a whole disc,
+# with the unused tail left unlit. Makes "disc 2 is only two-thirds full" obvious
+# at a glance, which is the moment to reorder the folder rather than after
+# burning it.
+#
+# Everything about it is in service of one comparison — is this track longer than
+# that one — so it is drawn at eighth-cell resolution: each column is eight units,
+# and a boundary landing mid-column is drawn as a partial block of the outgoing
+# band over the incoming one. That is eight times what the bar could otherwise
+# resolve without taking a single extra column, which matters because a half-full
+# disc of eleven tracks only has a few cells to give each one.
+strip() {  # strip <disc-number> [panel-label]
+  local d=$1 lbl="${2:-}" i n=0 cum=0 units filled=0 used=0 left=0 best bi c
+  local b=0 j out="" scale="" col=0 m p tot step want
+  local curfg='' curbg=''
+  # Four steps around the panel's own amber rather than four cool hues: cyan and
+  # violet on an amber faceplate read as a different instrument bolted on. These
+  # stay in the lamp-and-oxide family — amber, brown, gold, burnt orange — and
+  # zigzag light/dark/light/dark, so neighbouring bands separate on brightness
+  # even where the hues are cousins, and the edges survive without colour vision.
+  local SHADES=(214 130 220 166)
+  local -a DUR HC REM
+  DUR=(); HC=(); REM=()
 
-  for i in $(seq 0 $(( N - 1 ))); do
-    [ "${DISC_OF[$i]}" -eq "$d" ] || continue
-    DUR[$n]=${P_DUR[$i]}
-    cum=$(( cum + P_DUR[i] ))
-    n=$(( n + 1 ))
+  i=0
+  while [ "$i" -lt "$N" ]; do
+    if [ "${DISC_OF[$i]}" -eq "$d" ]; then
+      DUR[$n]=${P_DUR[$i]}
+      cum=$(( cum + P_DUR[i] ))
+      n=$(( n + 1 ))
+    fi
+    i=$(( i + 1 ))
   done
 
-  filled=$(( cum * STRIP_WIDTH / CAPACITY ))
-  [ "$filled" -gt "$STRIP_WIDTH" ] && filled=$STRIP_WIDTH
+  # Eight units to the column, not one. Unicode has a full set of left-aligned
+  # partial blocks, and a cell can show two colours — foreground for the left
+  # part, background for the right — so a boundary can be drawn where it actually
+  # falls rather than snapped to the nearest whole character. That is the whole
+  # game here: at one unit per column a 3:14 and a 2:58 are the same two cells,
+  # and at eight it is about nine seconds to the unit.
+  local PARTS=('' '▏' '▎' '▍' '▌' '▋' '▊' '▉')
+  local nb=0 pos=0 cs ce t nxt
+  local -a BEND BCOL
+  BEND=(); BCOL=()
+
+  units=$(( STRIP_WIDTH * 8 ))
+  filled=$(( cum * units / CAPACITY ))
+  [ "$filled" -gt "$units" ] && filled=$units
 
   # Widths by largest remainder, not by walking a cumulative total. Truncating
   # each running total independently made a longer track look narrower than a
-  # shorter one — a 3:14 rounded down to one cell while the 2:58 after it landed
-  # on a boundary and got two — which is exactly the comparison the strip exists
-  # to support. Here every track gets floor(its share) and the leftover cells go
-  # to the largest fractions, so the total is still exact to the cell and a
-  # longer track can never be drawn narrower than a shorter one.
+  # shorter one — a 3:14 rounded down while the 2:58 after it landed on a
+  # boundary and got more — which is exactly the comparison the meter exists to
+  # support. Here every track gets floor(its share) and the leftover units go to
+  # the largest fractions, so the total is still exact and a longer track can
+  # never be drawn narrower than a shorter one.
   if [ "$n" -gt 0 ] && [ "$cum" -gt 0 ]; then
-    for i in $(seq 0 $(( n - 1 ))); do
-      CELLS[$i]=$(( DUR[i] * filled / cum ))
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      HC[$i]=$(( DUR[i] * filled / cum ))
       REM[$i]=$(( DUR[i] * filled % cum ))
-      used=$(( used + CELLS[i] ))
+      used=$(( used + HC[i] ))
+      i=$(( i + 1 ))
     done
     left=$(( filled - used ))
     while [ "$left" -gt 0 ]; do
       best=-1; bi=-1
-      for i in $(seq 0 $(( n - 1 ))); do
+      i=0
+      while [ "$i" -lt "$n" ]; do
         [ "${REM[$i]}" -gt "$best" ] && { best=${REM[$i]}; bi=$i; }
+        i=$(( i + 1 ))
       done
       [ "$bi" -lt 0 ] && break
-      CELLS[$bi]=$(( CELLS[bi] + 1 ))
+      HC[$bi]=$(( HC[bi] + 1 ))
       REM[$bi]=-1          # spent, and -1 keeps it out of later rounds
       left=$(( left - 1 ))
     done
 
-    for i in $(seq 0 $(( n - 1 ))); do
-      # A track too short to earn a cell draws nothing and does not consume a
-      # colour, so the two tracks either side of it still contrast.
-      [ "${CELLS[$i]}" -gt 0 ] || continue
-      shade="\033[38;5;${SHADES[$(( drawn % 4 ))]}m"
-      [ "$shade" != "$last" ] && { out="$out$shade"; last=$shade; }
-      c=0
-      while [ "$c" -lt "${CELLS[$i]}" ]; do
-        out="${out}█"; c=$(( c + 1 )); prev=$(( prev + 1 ))
-      done
-      drawn=$(( drawn + 1 ))
+    # Where each band ends, in units, and what colour it is. A track too short to
+    # earn a single unit ends up with no band at all and does not consume a
+    # colour, so the two tracks either side of it still contrast.
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      if [ "${HC[$i]}" -gt 0 ]; then
+        pos=$(( pos + HC[i] ))
+        BEND[$nb]=$pos
+        BCOL[$nb]=${SHADES[$(( nb % 4 ))]}
+        nb=$(( nb + 1 ))
+      fi
+      i=$(( i + 1 ))
     done
   fi
 
-  out="$out\033[2m"
-  while [ "$prev" -lt "$STRIP_WIDTH" ]; do out="${out}·"; prev=$(( prev + 1 )); done
+  # One column at a time, carrying the current band along rather than looking it
+  # up: a column wholly inside a band is a solid block, and a column a boundary
+  # runs through is a partial block of the outgoing colour laid over the incoming
+  # one as background.
+  b=0; j=0
+  while [ "$j" -lt "$STRIP_WIDTH" ]; do
+    cs=$(( j * 8 )); ce=$(( cs + 8 ))
+    while [ "$b" -lt "$nb" ] && [ "${BEND[$b]}" -le "$cs" ]; do b=$(( b + 1 )); done
+    if [ "$b" -ge "$nb" ]; then
+      # Past the last band: the run-out, dithered in the darkest amber on the
+      # ramp rather than left blank, so it still reads as part of the meter.
+      strip_sgr 94 ''; out="${out}░"
+    elif [ "${BEND[$b]}" -ge "$ce" ]; then
+      # Shade rather than solid, for the phosphor-and-oxide texture the rest of
+      # the panel has. The same shade the whole way across a band, though — an
+      # earlier version varied the density within a band and the speckle read as
+      # gaps, which broke the one thing the bar is for. Uniform grain costs
+      # nothing: a shaded cell is exactly as wide as a solid one.
+      strip_sgr "${BCOL[$b]}" ''; out="${out}▓"
+    else
+      t=$(( BEND[b] - cs ))
+      nxt=$(( b + 1 ))
+      if [ "$nxt" -lt "$nb" ]; then
+        strip_sgr "${BCOL[$b]}" "${BCOL[$nxt]}"
+      else
+        strip_sgr "${BCOL[$b]}" ''      # last band meeting the run-out
+      fi
+      out="${out}${PARTS[$t]}"
+    fi
+    j=$(( j + 1 ))
+  done
   out="$out\033[0m"
-  printf '  %b  %s of %s\n' "$out" "$(mmss "$cum")" "$(mmss "$CAPACITY")"
+
+  # Label on the left, readout on the right, meter across the full grid below
+  # them. The readout used to sit beside the bar and cost it eighteen columns,
+  # which is eighteen columns of resolution the comparison needed more.
+  mmssv "$cum"; tot=$MMSS
+  mmssv "$CAPACITY"
+  printf -v want '%s / %s' "$tot" "$MMSS"
+  pad $(( PANEL - ${#lbl} - ${#want} ))
+  printf '  %b%s%b%s%b%s%b %b/ %s%b\n' \
+    "$ETCH" "$lbl" "$OFF" "$PAD" "$AMBER" "$tot" "$OFF" "$DIM" "$MMSS" "$OFF"
+  printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$out" "$ETCH" "$OFF"
+
+  # A minute scale under it, so the meter answers "how far in does this disc
+  # end?" and not only "how full is it?". Positions are derived from CAPACITY
+  # rather than hard-coded, so changing BURNCD_MINUTES moves the ticks with it.
+  #
+  # The spacing follows the capacity: every 20 minutes across a Red Book disc,
+  # closer together on the short ones BURNCD_MINUTES can ask for. Ticks past the
+  # end are dropped rather than clamped — pinning 20, 40, 60 and 80 to the right
+  # edge of a twelve-minute disc printed "20406080" and meant nothing. A minute
+  # of slack keeps the last tick on a disc whose capacity just misses it, which
+  # is every CD: 80 minutes is 79:57.
+  step=20
+  [ "$CAPACITY" -le 2700 ] && step=10
+  [ "$CAPACITY" -le 1200 ] && step=5
+  m=0
+  while [ $(( m * 60 )) -le $(( CAPACITY + 60 )) ]; do
+    p=$(( m * 60 * STRIP_WIDTH / CAPACITY ))
+    [ $(( p + ${#m} )) -gt "$STRIP_WIDTH" ] && p=$(( STRIP_WIDTH - ${#m} ))
+    if [ "$p" -ge "$col" ]; then
+      pad $(( p - col ))
+      scale="$scale$PAD$m"
+      col=$(( p + ${#m} ))
+    fi
+    m=$(( m + step ))
+  done
+  printf '   %b%s%b\n' "$DIM" "$scale" "$OFF"
+}
+
+# One meter cell's colour, appended to $out only when it differs from what is
+# already in effect — a fresh pair of escapes per cell would treble the size of
+# the frame for nothing.
+strip_sgr() {  # strip_sgr <fg> <bg-or-empty>
+  [ "$1" = "$curfg" ] || { out="$out\033[38;5;$1m"; curfg=$1; }
+  if [ -n "$2" ]; then
+    [ "$2" = "$curbg" ] || { out="$out\033[48;5;$2m"; curbg=$2; }
+  elif [ -n "$curbg" ]; then
+    out="$out\033[49m"; curbg=''
+  fi
 }
 
 # ---------------------------------------------------------------- edit screen --
@@ -785,88 +978,162 @@ read_key() {
 tui_prompt() {  # tui_prompt <label> <current>
   local reply
   tui_cooked
-  printf '\033[?25h\r\033[K  \033[1m%s\033[0m \033[2m[%s]\033[0m ' "$1" "${2:-empty}" > /dev/tty
+  printf '\033[?25h\r\033[K  %b▶%b %b%-7s%b %b[%s]%b ' \
+    "$AMBER" "$OFF" "$ETCH" "$1" "$OFF" "$DIM" "${2:-empty}" "$OFF" > /dev/tty
   IFS= read -r reply || reply=""
   printf '\033[?25l' > /dev/tty
   tui_block
   [ -n "$reply" ] && printf '%s' "$reply" || printf '%s' "$2"
 }
 
-fit() { printf '%-*.*s' "$2" "$2" "$1"; }
+# Pad or truncate to an exact column count. Not printf's own width and precision:
+# those are counted in bytes even under a UTF-8 locale, so "Björk — Homogénic"
+# cut to 34 loses 34 bytes rather than 34 columns and the artist column after it
+# slides left. Substring expansion and ${#s} do count characters, so they are the
+# ones to build a grid out of. A cut title ends in … so the truncation is visible.
+fit() {  # fit <string> <columns>
+  fitv "$1" "$2"
+  printf '%s' "$FIT"
+}
+fitv() {  # fitv <string> <columns> -> $FIT
+  local s=$1
+  [ "${#s}" -gt "$2" ] && s="${s:0:$(( $2 - 1 ))}…"
+  pad $(( $2 - ${#s} ))
+  FIT="$s$PAD"
+}
+
+# One row of backlit keycaps, given as key/label pairs. Assembled in a string
+# rather than one substitution per cap so the legend costs nothing to draw and
+# still reads here as keys and labels instead of as escape codes.
+keys() {  # keys <key> <label> [<key> <label> ...]
+  local line='' sep=''
+  while [ "$#" -gt 1 ]; do
+    line="$line$sep$CAP $1 $OFF $2"
+    sep='   '
+    shift 2
+  done
+  printf '  %b\n' "$line"
+}
 
 TUI_ROWS=0
-tui_draw() {  # tui_draw <cursor> <top> <status>
-  local cur=$1 top=$2 status=$3 rows i k row d lastd=0 mark line vis
-  rows=$(tput lines 2>/dev/null || echo 24)
-  vis=$(( rows - 12 )); [ "$vis" -lt 4 ] && vis=4
-  TUI_ROWS=$vis
 
-  printf '\033[H\033[2J'
-  printf '  \033[1mburncd\033[0m \033[2m— %d track%s, %s, %d disc%s\033[0m\n\n' \
-    "${#ORDER[@]}" "$([ ${#ORDER[@]} -eq 1 ] || echo s)" \
-    "$(mmss "$TOTAL")" "$NDISCS" "$([ "$NDISCS" -eq 1 ] || echo s)"
+# Everything the panel says, printed to stdout so tui_draw can capture the whole
+# frame and hand it to the terminal in one piece. Split out for that reason only.
+tui_frame() {  # tui_frame <cursor> <top> <visible-rows> <status>
+  local cur=$1 top=$2 vis=$3 status=$4 i k row d lastd=0 meta rule
+  local num ttl art tm body ts='' ds='' last=$(( top + vis ))
 
-  # The three disc-level fields, selectable as cursor rows -3, -2, -1.
+  tui_disc_map
+
+  # Faceplate: an engraved badge, a rule across the panel, and the job stamped
+  # at the far end the way a deck prints its mode.
+  [ "${#ORDER[@]}" -eq 1 ] || ts=S
+  [ "$NDISCS" -eq 1 ]      || ds=S
+  mmssv "$TOTAL"
+  printf -v meta '%d TRACK%s · %s · %d DISC%s' \
+    "${#ORDER[@]}" "$ts" "$MMSS" "$NDISCS" "$ds"
+  rule=$(( PANEL - 10 - ${#meta} )); [ "$rule" -lt 2 ] && rule=2
+  repv '━' "$rule"
+  printf '  %b BURNCD %b %b%s%b %b%s%b\n\n' \
+    "$BADGE" "$OFF" "$ETCH" "$REP" "$OFF" "$ETCH" "$meta" "$OFF"
+
+  # The three disc-level fields, selectable as cursor rows 0, 1 and 2. They sit
+  # on the same mark-plus-body grid as the tracks, so the selection bar is the
+  # same width wherever the cursor is.
   tui_field() {  # tui_field <slot> <label> <value>
+    local b
     if [ "$cur" -eq "$1" ]; then
-      printf '  \033[7m %-7s %s \033[0m\n' "$2" "${3:-—}"
+      printf -v b '%-7s %s' "$2" "${3:-—}"
+      fitv "$b" 67
+      printf '  %b▶%b %b%s%b\n' "$AMBER" "$OFF" "$INV" "$FIT" "$OFF"
     else
-      printf '   \033[2m%-7s\033[0m %s\n' "$2" "${3:-—}"
+      printf '    %b%-7s%b %s\n' "$ETCH" "$2" "$OFF" "${3:-—}"
     fi
   }
-  tui_field 0 Album  "$ALBUM"
-  tui_field 1 Artist "$ALBUM_ARTIST"
-  tui_field 2 Year   "$YEAR"
+  tui_field 0 ALBUM  "$ALBUM"
+  tui_field 1 ARTIST "$ALBUM_ARTIST"
+  tui_field 2 YEAR   "$YEAR"
   printf '\n'
 
-  for k in $(seq "$top" $(( top + vis - 1 ))); do
+  k=$top
+  while [ "$k" -lt "$last" ]; do
     [ "$k" -lt "${#ORDER[@]}" ] || break
     row=$(( k + 3 ))
     i=${ORDER[$k]}
-    d=$(tui_disc_of "$k")
+    d=${DISC_AT[$i]:-1}
     if [ "$d" != "$lastd" ]; then
-      printf '   \033[2m── disc %s ──\033[0m\n' "$d"
+      repv '━' $(( PANEL - 9 - ${#d} ))
+      printf '  %b━━ DISC %s %s%b\n' "$ETCH" "$d" "$REP" "$OFF"
       lastd=$d
     fi
-    mark=" "; [ "$cur" -eq "$row" ] && mark="▸"
-    line=$(printf '%s %2d  %s  %s %6s' "$mark" $(( k + 1 )) \
-      "$(fit "${TITLES[$i]}" 34)" "$(fit "${ARTISTS[$i]}" 20)" "$(mmss "${DURS[$i]}")")
+    printf -v num '%02d' $(( k + 1 ))
+    fitv "${TITLES[$i]}" 34; ttl=$FIT
+    fitv "${ARTISTS[$i]}" 20; art=$FIT
+    mmssv "${DURS[$i]}"; printf -v tm '%5s' "$MMSS"
     if [ "$cur" -eq "$row" ]; then
-      printf ' \033[7m%s\033[0m\n' "$line"
+      # One reversed bar, no colour inside it: an inner reset would punch a hole
+      # in the highlight partway along the row.
+      printf -v body '%s  %s  %s  %s' "$num" "$ttl" "$art" "$tm"
+      printf '  %b▶%b %b%s%b\n' "$AMBER" "$OFF" "$INV" "$body" "$OFF"
     else
-      printf ' %s\n' "$line"
+      printf '    %b%s%b  %s  %b%s%b  %b%s%b\n' \
+        "$ETCH" "$num" "$OFF" "$ttl" "$DIM" "$art" "$OFF" "$ETCH" "$tm" "$OFF"
     fi
+    k=$(( k + 1 ))
   done
 
-  [ $(( top + vis )) -lt "${#ORDER[@]}" ] && printf '   \033[2m  … %d more\033[0m\n' \
-    $(( ${#ORDER[@]} - top - vis ))
+  [ $(( top + vis )) -lt "${#ORDER[@]}" ] && printf '    %b▾ %d MORE%b\n' \
+    "$ETCH" $(( ${#ORDER[@]} - top - vis )) "$OFF"
 
   printf '\n'
-  # The strip for whichever disc the cursor is sitting on, so the effect of a
-  # reorder on disc fullness is visible while you are doing it.
-  if [ "$cur" -ge 3 ]; then
-    printf '  \033[2mdisc %s\033[0m' "$(tui_disc_of $(( cur - 3 )))"
-    strip "$(tui_disc_of $(( cur - 3 )))"
-  else
-    printf '\n'
-  fi
+  # The meter for whichever disc the cursor is sitting on, so the effect of a
+  # reorder on disc fullness is visible while you are doing it. On the header
+  # fields there is no track to follow, so it falls back to disc 1 rather than
+  # going blank — a gauge that disappears is worse than one that idles.
+  d=1
+  [ "$cur" -ge 3 ] && d=${DISC_AT[${ORDER[$(( cur - 3 ))]}]:-1}
+  strip "$d" "DISC $d"
 
-  # The legend is the only instructions on screen, so it is not dimmed: keys in
-  # bold, labels at normal weight. Dim grey on a dark terminal is unreadable.
-  printf '\n  \033[1m↑↓\033[0m select   \033[1m⇧↑↓\033[0m or \033[1mJ/K\033[0m reorder'
-  printf '   \033[1m⏎\033[0m rename   \033[1ma\033[0m artist   \033[1mx\033[0m drop'
-  printf '\n  \033[1mu\033[0m undo   \033[1mr\033[0m reset   \033[1mb\033[0m burn   \033[1mq\033[0m quit\n'
-  [ -n "$status" ] && printf '\n  %b\n' "$status"
+  printf '\n'
+  keys '↑↓' SELECT '⇧↑↓' MOVE '⏎' RENAME A ARTIST X DROP
+  keys U UNDO R RESET B BURN Q QUIT
+  [ -n "$status" ] && printf '\n  %b%s%b\n' "$AMBER" "$status" "$OFF"
   return 0
 }
 
-# Which disc a source track lands on: the disc of its first playlist entry.
-tui_disc_of() {  # tui_disc_of <order-index>
-  local k=$1 i
-  for i in $(seq 0 $(( N - 1 ))); do
-    [ "${P_SRC[$i]}" -eq "${ORDER[$k]}" ] && { printf '%s' "${DISC_OF[$i]}"; return 0; }
+tui_draw() {  # tui_draw <cursor> <top> <status>
+  local vis frame nl=$'\n' eol=$'\033[K\n'
+  term_size
+  vis=$(( TERM_LINES - 16 )); [ "$vis" -lt 4 ] && vis=4
+  TUI_ROWS=$vis
+
+  # No erase-screen here, and one write for the frame. Clearing and then drawing
+  # is two pictures the terminal genuinely paints, so at one frame per keypress
+  # the blank one shows through as a flash — and printing the panel line by line
+  # let the screen refresh mid-frame on top of that. Instead: build it all in
+  # memory, end every line with an erase-to-end-of-line so a line that got
+  # shorter cannot leave the tail of the old one behind, and lay the whole thing
+  # over the top from the home position. \033[J at the end clears whatever the
+  # previous frame had below this one — a dropped track, a status line that has
+  # since gone. Nothing is ever blank in between, so there is nothing to flicker.
+  frame=$(tui_frame "$1" "$2" "$vis" "$3")
+  printf '\033[H%s\033[K\n\033[J' "${frame//$nl/$eol}"
+  return 0
+}
+
+# Which disc each source track lands on, keyed by source index: the disc of its
+# first playlist entry. Built once per frame rather than rescanned per row —
+# looking it up per track made drawing quadratic in the track count, which a
+# hundred-track folder can feel even without a fork in the loop.
+DISC_AT=()
+tui_disc_map() {
+  local i
+  DISC_AT=()
+  i=0
+  while [ "$i" -lt "$N" ]; do
+    [ -n "${DISC_AT[${P_SRC[$i]}]:-}" ] || DISC_AT[${P_SRC[$i]}]=${DISC_OF[$i]}
+    i=$(( i + 1 ))
   done
-  printf '1'
 }
 
 DROPPED=()
@@ -883,6 +1150,9 @@ tui_edit() {
   tui_block
   # shellcheck disable=SC2064
   trap "stty $saved_stty 2>/dev/null; printf '\033[?25h\033[?1049l'; exit 130" INT
+  # Drop the cached window size when the window changes, so the redraw after a
+  # resize measures again and every other redraw does not have to.
+  trap 'TERM_LINES=; TERM_COLS=' WINCH
 
   while :; do
     n=${#ORDER[@]}
@@ -909,10 +1179,10 @@ tui_edit() {
       $'\033[6~')       cur=$(( cur + TUI_ROWS )) ;;
       $'\n'|$'\r')      tui_rename "$cur" ;;
       a|A)              tui_artist "$cur" ;;
-      x|d)              tui_drop "$cur" && status="\033[1mdropped — u to undo\033[0m" ;;
-      u|U)              tui_undo && status="\033[1mrestored\033[0m" ;;
+      x|d)              tui_drop "$cur" && status="▪ TRACK DROPPED — PRESS U TO UNDO" ;;
+      u|U)              tui_undo && status="▪ TRACK RESTORED" ;;
       r|R)              ORDER=("${ORDER_ORIG[@]}"); DROPPED=(); replan
-                        status="\033[1mback to the original order\033[0m" ;;
+                        status="▪ ORIGINAL ORDER RESTORED" ;;
       b|B|$' ')         break ;;
       q|Q)              stty "$saved_stty" 2>/dev/null || true
                         printf '\033[?25h\033[?1049l'
@@ -942,11 +1212,11 @@ tui_move() {  # tui_move <cursor> <delta>
 tui_rename() {  # tui_rename <cursor>
   local cur=$1 i
   case "$cur" in
-    0) ALBUM=$(tui_prompt "Album" "$ALBUM") ;;
-    1) ALBUM_ARTIST=$(tui_prompt "Artist" "$ALBUM_ARTIST") ;;
-    2) YEAR=$(tui_prompt "Year" "$YEAR") ;;
+    0) ALBUM=$(tui_prompt "ALBUM" "$ALBUM") ;;
+    1) ALBUM_ARTIST=$(tui_prompt "ARTIST" "$ALBUM_ARTIST") ;;
+    2) YEAR=$(tui_prompt "YEAR" "$YEAR") ;;
     *) i=${ORDER[$(( cur - 3 ))]}
-       TITLES[$i]=$(tui_prompt "Title" "${TITLES[$i]}")
+       TITLES[$i]=$(tui_prompt "TITLE" "${TITLES[$i]}")
        replan ;;
   esac
   return 0
@@ -955,10 +1225,10 @@ tui_rename() {  # tui_rename <cursor>
 tui_artist() {  # tui_artist <cursor>
   local cur=$1 i
   if [ "$cur" -lt 3 ]; then
-    ALBUM_ARTIST=$(tui_prompt "Artist" "$ALBUM_ARTIST")
+    ALBUM_ARTIST=$(tui_prompt "ARTIST" "$ALBUM_ARTIST")
   else
     i=${ORDER[$(( cur - 3 ))]}
-    ARTISTS[$i]=$(tui_prompt "Track artist" "${ARTISTS[$i]}")
+    ARTISTS[$i]=$(tui_prompt "ARTIST" "${ARTISTS[$i]}")
     replan
   fi
   return 0
@@ -1010,7 +1280,7 @@ show_plan() {
     for i in $(seq 0 $(( N - 1 ))); do
       [ "${DISC_OF[$i]}" -eq "$d" ] || continue
       num=$((num + 1)); dtot=$((dtot + P_DUR[i]))
-      printf '   %2d. %-52.52s %6s\n' "$num" "${P_TITLE[$i]}" "$(mmss "${P_DUR[$i]}")"
+      printf '   %2d. %s %6s\n' "$num" "$(fit "${P_TITLE[$i]}" 52)" "$(mmss "${P_DUR[$i]}")"
     done
     printf '       %*s %6s\n' 52 "" "$(mmss "$dtot")"
     strip "$d"
@@ -1096,7 +1366,7 @@ render() {
   [ -t 1 ] && tty=1
   # The disc needs room beside it for the readout; below that, fall back to
   # the compact four-line display rather than wrapping into a mess.
-  cols=$(tput cols 2>/dev/null || echo 80)
+  term_size; cols=$TERM_COLS
   if [ "$tty" -eq 1 ] && [ "$cols" -ge 62 ] && [ ${#THRESH[@]} -gt 0 ]; then
     discmode=1; lines=$DISC_ROWS; barw=26
   else
@@ -1525,8 +1795,8 @@ else
     "$BURNED" "$([ "$BURNED" -eq 1 ] || echo s)" "$NDISCS" \
     "$(mmss "$TOTAL")" "$(mmss "$ELAPSED")"
   for d in $(seq "$FROM" "$NDISCS"); do
-    printf '  disc %d ' "$d"
-    strip "$d"
+    strip "$d" "DISC $d"
+    printf '\n'
   done
   printf '\n'
   if [ -n "${VERIFY_FAILED:-}" ]; then
