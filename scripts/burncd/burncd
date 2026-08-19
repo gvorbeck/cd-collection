@@ -666,21 +666,65 @@ level_note() {
 # tail left as dots. Makes "disc 2 is only two-thirds full" obvious at a glance,
 # which is the moment to reorder the folder rather than after burning it.
 strip() {  # strip <disc-number>
-  local d=$1 i cum=0 prev=0 cell n=0 out="" shade last=""
-  # Four steps of one teal, so adjacent tracks separate without becoming confetti.
-  local SHADES=(45 44 37 36)
+  local d=$1 i n=0 cum=0 filled=0 used=0 left=0 best bi c drawn=0
+  local prev=0 out="" shade last=""
+  # Four cool hues rather than four shades of one: neighbouring steps of a single
+  # teal ramp are hard to tell apart at this size, and a boundary you cannot see
+  # is a boundary that is not there. Cyan → green → blue → violet, each also a
+  # different lightness so the edges hold up without colour vision too.
+  local SHADES=(51 42 39 141)
+  local -a DUR CELLS REM
+  DUR=(); CELLS=(); REM=()
+
   for i in $(seq 0 $(( N - 1 ))); do
     [ "${DISC_OF[$i]}" -eq "$d" ] || continue
+    DUR[$n]=${P_DUR[$i]}
     cum=$(( cum + P_DUR[i] ))
-    # Round from the cumulative total, so rounding error cannot accumulate
-    # and no track can push the strip past its width.
-    cell=$(( cum * STRIP_WIDTH / CAPACITY ))
-    [ "$cell" -gt "$STRIP_WIDTH" ] && cell=$STRIP_WIDTH
-    shade="\033[38;5;${SHADES[$(( n % 4 ))]}m"
-    [ "$shade" != "$last" ] && { out="$out$shade"; last=$shade; }
-    while [ "$prev" -lt "$cell" ]; do out="${out}█"; prev=$(( prev + 1 )); done
     n=$(( n + 1 ))
   done
+
+  filled=$(( cum * STRIP_WIDTH / CAPACITY ))
+  [ "$filled" -gt "$STRIP_WIDTH" ] && filled=$STRIP_WIDTH
+
+  # Widths by largest remainder, not by walking a cumulative total. Truncating
+  # each running total independently made a longer track look narrower than a
+  # shorter one — a 3:14 rounded down to one cell while the 2:58 after it landed
+  # on a boundary and got two — which is exactly the comparison the strip exists
+  # to support. Here every track gets floor(its share) and the leftover cells go
+  # to the largest fractions, so the total is still exact to the cell and a
+  # longer track can never be drawn narrower than a shorter one.
+  if [ "$n" -gt 0 ] && [ "$cum" -gt 0 ]; then
+    for i in $(seq 0 $(( n - 1 ))); do
+      CELLS[$i]=$(( DUR[i] * filled / cum ))
+      REM[$i]=$(( DUR[i] * filled % cum ))
+      used=$(( used + CELLS[i] ))
+    done
+    left=$(( filled - used ))
+    while [ "$left" -gt 0 ]; do
+      best=-1; bi=-1
+      for i in $(seq 0 $(( n - 1 ))); do
+        [ "${REM[$i]}" -gt "$best" ] && { best=${REM[$i]}; bi=$i; }
+      done
+      [ "$bi" -lt 0 ] && break
+      CELLS[$bi]=$(( CELLS[bi] + 1 ))
+      REM[$bi]=-1          # spent, and -1 keeps it out of later rounds
+      left=$(( left - 1 ))
+    done
+
+    for i in $(seq 0 $(( n - 1 ))); do
+      # A track too short to earn a cell draws nothing and does not consume a
+      # colour, so the two tracks either side of it still contrast.
+      [ "${CELLS[$i]}" -gt 0 ] || continue
+      shade="\033[38;5;${SHADES[$(( drawn % 4 ))]}m"
+      [ "$shade" != "$last" ] && { out="$out$shade"; last=$shade; }
+      c=0
+      while [ "$c" -lt "${CELLS[$i]}" ]; do
+        out="${out}█"; c=$(( c + 1 )); prev=$(( prev + 1 ))
+      done
+      drawn=$(( drawn + 1 ))
+    done
+  fi
+
   out="$out\033[2m"
   while [ "$prev" -lt "$STRIP_WIDTH" ]; do out="${out}·"; prev=$(( prev + 1 )); done
   out="$out\033[0m"
@@ -807,8 +851,11 @@ tui_draw() {  # tui_draw <cursor> <top> <status>
     printf '\n'
   fi
 
-  printf '\n  \033[2m↑↓ select   ⇧↑↓ or J/K reorder   ⏎ rename   a artist   x drop'
-  printf '\n  u undo   r reset   b burn   q quit\033[0m\n'
+  # The legend is the only instructions on screen, so it is not dimmed: keys in
+  # bold, labels at normal weight. Dim grey on a dark terminal is unreadable.
+  printf '\n  \033[1m↑↓\033[0m select   \033[1m⇧↑↓\033[0m or \033[1mJ/K\033[0m reorder'
+  printf '   \033[1m⏎\033[0m rename   \033[1ma\033[0m artist   \033[1mx\033[0m drop'
+  printf '\n  \033[1mu\033[0m undo   \033[1mr\033[0m reset   \033[1mb\033[0m burn   \033[1mq\033[0m quit\n'
   [ -n "$status" ] && printf '\n  %b\n' "$status"
   return 0
 }
@@ -862,10 +909,10 @@ tui_edit() {
       $'\033[6~')       cur=$(( cur + TUI_ROWS )) ;;
       $'\n'|$'\r')      tui_rename "$cur" ;;
       a|A)              tui_artist "$cur" ;;
-      x|d)              tui_drop "$cur" && status="\033[2mdropped — u to undo\033[0m" ;;
-      u|U)              tui_undo && status="\033[2mrestored\033[0m" ;;
+      x|d)              tui_drop "$cur" && status="\033[1mdropped — u to undo\033[0m" ;;
+      u|U)              tui_undo && status="\033[1mrestored\033[0m" ;;
       r|R)              ORDER=("${ORDER_ORIG[@]}"); DROPPED=(); replan
-                        status="\033[2mback to the original order\033[0m" ;;
+                        status="\033[1mback to the original order\033[0m" ;;
       b|B|$' ')         break ;;
       q|Q)              stty "$saved_stty" 2>/dev/null || true
                         printf '\033[?25h\033[?1049l'
