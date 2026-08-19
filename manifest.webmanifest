@@ -36,6 +36,11 @@
   ],
   "shortcuts": [
     {
+      "name": "Wishlist",
+      "short_name": "Wishlist",
+      "url": "wishlist.html"
+    },
+    {
       "name": "Statistics",
       "short_name": "Stats",
       "url": "stats.html"

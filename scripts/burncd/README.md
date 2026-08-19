@@ -7,8 +7,9 @@ dragging files into Music.app, no thinking about disc formats.
 burncd ~/Music/Nonagon\ Infinity
 ```
 
-That's the whole thing. It reads the folder, works out the track order, shows
-you the plan, asks once, and burns — gapless, with CD-Text.
+That's the whole thing. It reads the folder, works out the track order, and puts
+the plan on screen. Look it over, fix anything the tags got wrong, and press
+**`b`** to burn — gapless, with CD-Text. `q` walks away without burning.
 
 ---
 
@@ -125,12 +126,11 @@ names it in the summary.
 | Command | What it does |
 | --- | --- |
 | `burncd --check` | Verify this machine can burn. Run first on a new setup. |
-| `burncd DIR` | Burn the folder |
+| `burncd DIR` | Show the folder's plan, edit it if needed, then `b` to burn |
 | `burncd -n DIR` | Dry run — print the plan, burn nothing |
 | `burncd --demo DIR` | Convert for real, show the cue sheet, simulate the burn |
 | `burncd --dummy DIR` | Rehearse the burn on the drive with the laser off |
 | `burncd --verify DIR` | Burn, then read the disc back and check it |
-| `burncd --edit DIR` | Reorder, rename and retag on screen before burning |
 | `burncd --level DIR` | Bring a quiet album up to normal CD loudness |
 | `burncd --split-long DIR` | Allow cutting a track that's longer than a disc |
 | `burncd --no-cdtext DIR` | Burn without CD-Text (fallback if the drive balks) |
@@ -138,14 +138,16 @@ names it in the summary.
 | `burncd --help` | Usage |
 
 `-n` is worth using the first time on any album. It costs nothing and shows you
-exactly what would land on which disc.
+exactly what would land on which disc. It's also the way to get the plan as plain
+text: a normal run opens the editor instead, and so does everything else that has
+a terminal to draw on.
 
 ### Environment overrides
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `BURNCD_SPEED` | `8` | Burn speed. Lower is safer on cheap media. |
-| `BURNCD_DEV` | `IOCompactDiscServices` | cdrecord device. See troubleshooting. |
+| `BURNCD_DEV` | `IOCompactDiscServices` | cdrecord device. A DVD-capable drive needs `IODVDServices` instead — see troubleshooting. |
 | `BURNCD_SECONDS` | `4797` | Disc capacity. 4797 = 79:57, see below. |
 | `BURNCD_MINUTES` | — | Same thing in whole minutes, if you prefer. |
 | `BURNCD_LEVEL` | `off` | `album`, `track` or `off` — leveling without the flag. |
@@ -217,10 +219,12 @@ for a full disc — and stops with a clear message rather than dying at 90%. Set
 
 ---
 
-## Changing the plan first: `--edit`
+## The plan screen
 
 Tags are often wrong, and the wrong ones are burned into the lead-in permanently.
-`--edit` puts the plan on screen and lets you fix it before anything is written:
+So the plan you see before every burn is not a printout — it is the editor. You
+notice the bad title on the same screen you fix it on, with no flag to decide on
+in advance:
 
 ```
   burncd — 6 tracks, 1:23, 1 disc
@@ -243,6 +247,10 @@ Tags are often wrong, and the wrong ones are burned into the lead-in permanently
   u undo   r reset   b burn   q quit
 ```
 
+**`b` is what starts the burn** — or `space`, whichever your hand finds first.
+Nothing is written, converted, or asked of the drive until then, so there is no
+cost to opening the screen, looking, and leaving with `q`.
+
 | Key | What it does |
 | --- | --- |
 | `↑` `↓` or `k` `j` | Move the selection. It runs through the three header fields and then the tracks. |
@@ -258,6 +266,11 @@ Tags are often wrong, and the wrong ones are burned into the lead-in permanently
 
 Nothing here touches your files. Edits apply to this burn only — to the CD-Text
 in the lead-in and to the cue sheet — and they are gone when the command exits.
+
+The editor needs a terminal and something to decide, so `-n` and any piped or
+redirected run skip it and print the static plan instead. After you press `b`,
+that same static plan is printed to the scrollback, so the burn log has the
+final running order sitting above it.
 
 The disc layout is recomputed after every change, so on a multi-disc set the
 `── disc N ──` separators and the capacity bar move as you reorder or drop
@@ -351,7 +364,10 @@ whether your ffmpeg has the `ebur128` filter this needs.
 
 ### The plan
 
-Printed before anything is burned, and the only thing `-n` does:
+What a normal run opens with. It is the editor described above — arrow around
+it, fix what's wrong, `b` when it's right — and this is the plain-text copy of
+the same thing, which is what `-n` prints and what lands in the scrollback next
+to the burn once the editor closes:
 
 ```
   Nonagon Infinity — King Gizzard
@@ -425,20 +441,34 @@ Run `burncd --demo` on any folder to see all of this without a disc in the drive
 
 **`cdrecord not found`** — `brew install cdrtools`.
 
-**cdrecord can't find the drive.** List what it sees:
+**cdrecord can't find the drive.** `--check` fails with `cannot open
+dev=IOCompactDiscServices`, usually while `drutil` still reports the drive fine.
+The default device name is the IOKit class for a **CD-only** drive; almost every
+USB drive sold now is a DVD combo, and those register as `IODVDServices`:
+
+```bash
+export BURNCD_DEV=IODVDServices
+```
+
+If that isn't it either, ask cdrecord what it can see:
 
 ```bash
 cdrecord -scanbus
 ```
 
-Then pass the device explicitly:
+and use the bus address it prints — `1,0,0` in the line
+`1,0,0  100) 'MATSHITA' 'DVD-RAM UJ8E2 S ' ...` — as `BURNCD_DEV=1,0,0`.
+
+What does **not** work is a `/dev/` path: cdrecord wants an IOKit class name or a
+bus address, and `dev=/dev/disk4` fails the same way the wrong class name does,
+which makes it easy to mistake for the same problem.
+
+This is the one thing that usually needs adjusting on a new machine. Once you
+know the right value, put it in your shell profile and forget it:
 
 ```bash
-BURNCD_DEV=/dev/disk4 burncd ~/Music/Album
+echo 'export BURNCD_DEV=IODVDServices' >> ~/.zshrc
 ```
-
-This is the one thing that occasionally needs adjusting on a new machine.
-Once you know the right value, put it in your shell profile and forget it.
 
 **The burn failed and mentioned CD-Text or the cue sheet.** Some drives and some
 cdrecord builds don't handle it. `burncd --check` says which of the two is the

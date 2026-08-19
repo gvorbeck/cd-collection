@@ -7,7 +7,6 @@
 #   burncd -n ~/Music/Album        dry run: show the plan, burn nothing
 #   burncd --dummy ~/Music/Album   rehearse the burn with the laser off
 #   burncd --verify ~/Music/Album  read the disc back afterwards and check it
-#   burncd --edit ~/Music/Album    reorder, rename and retag before burning
 #   burncd --level ~/Music/Album   raise a quiet album to normal CD loudness
 #   burncd --split-long ~/Music/X  cut tracks longer than a disc into parts
 #   burncd --no-cdtext ~/Music/X   burn without CD-Text (fallback path)
@@ -20,6 +19,11 @@
 # between tracks. Album, artist and track titles are written as CD-Text. Sets
 # too long for one disc are split across as many as it takes, balanced so the
 # last disc is not a stub.
+#
+# The plan shown before every burn is the editor, not a printout: arrow to any
+# row and press Enter to fix a title, a for the artist, shift-arrows to
+# reorder, x to drop a track, b to burn, q to walk away. Tags are wrong often
+# enough that spotting it on the preview has to be all it takes.
 #
 # Env overrides:
 #   BURNCD_SPEED   burn speed (default 8)
@@ -41,7 +45,6 @@ SPLIT_LONG=0
 CDTEXT=1
 DUMMY=0
 VERIFY=0
-EDIT=0
 FROM=1
 
 # Loudness matching. "album" applies one gain to the whole job so the relative
@@ -135,7 +138,6 @@ while [ $# -gt 0 ]; do
     --no-cdtext)    CDTEXT=0 ;;
     --dummy)        DUMMY=1 ;;
     --verify)       VERIFY=1 ;;
-    --edit|-e)      EDIT=1 ;;
     --level)        LEVEL=album ;;
     --level=*)      LEVEL="${1#--level=}" ;;
     --from-disc)    shift; FROM="${1:-}"
@@ -506,7 +508,7 @@ gain_for() {  # gain_for <playlist-index>
 P_FILE=(); P_DUR=(); P_TITLE=(); P_ARTIST=(); P_OFF=(); P_LEN=(); P_SRC=()
 SPLIT_NOTE=""
 
-# Rebuilt from scratch on every call, because --edit changes ORDER and the
+# Rebuilt from scratch on every call, because the edit screen changes ORDER and the
 # whole layout has to be derived again from the new order.
 build_playlist() {
   local k parts plen p off len
@@ -676,11 +678,11 @@ strip() {  # strip <disc-number>
     [ "$cell" -gt "$STRIP_WIDTH" ] && cell=$STRIP_WIDTH
     shade="\033[38;5;${SHADES[$(( n % 4 ))]}m"
     [ "$shade" != "$last" ] && { out="$out$shade"; last=$shade; }
-    while [ "$prev" -lt "$cell" ]; do out="$out█"; prev=$(( prev + 1 )); done
+    while [ "$prev" -lt "$cell" ]; do out="${out}█"; prev=$(( prev + 1 )); done
     n=$(( n + 1 ))
   done
   out="$out\033[2m"
-  while [ "$prev" -lt "$STRIP_WIDTH" ]; do out="$out·"; prev=$(( prev + 1 )); done
+  while [ "$prev" -lt "$STRIP_WIDTH" ]; do out="${out}·"; prev=$(( prev + 1 )); done
   out="$out\033[0m"
   printf '  %b  %s of %s\n' "$out" "$(mmss "$cum")" "$(mmss "$CAPACITY")"
 }
@@ -824,7 +826,9 @@ DROPPED=()
 tui_edit() {
   local cur=3 top=0 status="" n k tmp saved_stty
 
-  [ -t 0 ] && [ -t 1 ] || die "--edit needs a terminal"
+  # Guarded at the call site too, but returning is kinder than dying if that
+  # ever changes: the static plan below still says everything that matters.
+  [ -t 0 ] && [ -t 1 ] || return 0
 
   saved_stty=$(stty -g 2>/dev/null || true)
   # Alternate screen, so quitting leaves the scrollback exactly as it was.
@@ -968,7 +972,13 @@ show_plan() {
   return 0
 }
 
-[ "$EDIT" -eq 1 ] && tui_edit
+# The preview IS the editor. A wrong title or a bad order is noticed and fixed
+# on the same screen it was spotted on, so there is no flag to predict in
+# advance. A dry run has nothing to steer and a pipe has no one driving it;
+# both fall through to the static plan below.
+if [ "$DRY_RUN" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+  tui_edit
+fi
 
 # The plan is printed even after the edit screen: the alternate screen is gone
 # by now, so this is the copy that stays in the scrollback next to the burn.
@@ -1022,7 +1032,7 @@ disc_row() {  # disc_row <row> <pct>
     else                               want='\033[38;5;44m'   # burned
     fi
     [ "$want" != "$last" ] && { out="$out$want"; last=$want; }
-    out="$out█"
+    out="${out}█"
   done
   printf '%s\033[0m' "$out"
 }
@@ -1077,7 +1087,7 @@ render() {
     filled=$(( pct * barw / 100 ))
     bar=""
     for ((i = 0; i < barw; i++)); do
-      if [ "$i" -lt "$filled" ]; then bar="$bar█"; else bar="$bar░"; fi
+      if [ "$i" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar}░"; fi
     done
 
     pips=""

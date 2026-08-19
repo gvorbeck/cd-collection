@@ -8,13 +8,14 @@ published Google Sheet and renders it as a grid of album covers with search,
 genre/tag filters, sorting, and a shuffle. It installs as an app and works
 with no network.
 
-Three pages. Two read the sheet; the third is a print tool that doesn't:
+Four pages. Three read the sheet; the fourth is a print tool that doesn't:
 
-| Page          | What it's for                                                     |
-|---------------|-------------------------------------------------------------------|
-| `index.html`  | The collection itself — grid or compact list, search and filters.  |
-| `stats.html`  | Breakdowns by decade, genre, artist, and shelf.                    |
-| `labels.html` | Printable jewel-case inserts, typed by hand or sent over from a disc, kept in this browser. |
+| Page            | What it's for                                                     |
+|-----------------|-------------------------------------------------------------------|
+| `index.html`    | The collection itself — grid or compact list, search and filters.  |
+| `wishlist.html` | Records not on the shelf yet, and a shop check for whether one already is. |
+| `stats.html`    | Breakdowns by decade, genre, artist and shelf, and a tag cloud drawn in two tones — shelf and wishlist. |
+| `labels.html`   | Printable jewel-case inserts, typed by hand or sent over from a disc, kept in this browser. |
 
 ### Also in here: `burncd`
 
@@ -34,7 +35,11 @@ Full docs: [scripts/burncd/README.md](scripts/burncd/README.md).
 
 - **Data** lives in a Google Sheet, published to the web as CSV. The page
   fetches and parses that CSV at load time with [PapaParse]; there is no
-  server and no database.
+  server and no database. It's one spreadsheet with two published tabs — the
+  shelf and the wishlist — described by `CONFIG.SOURCES` in `js/collection.js`.
+  A page picks its tab with `data-source` on `<body>`, and that attribute is
+  very nearly the whole difference between `wishlist.html` and `index.html`;
+  see [The wishlist](#the-wishlist).
 - **Covers** use the `Art URL` column when present (an explicit URL always
   wins). For discs with a blank `Art URL`, the page looks up cover art
   automatically via [MusicBrainz] → the [Cover Art Archive] — chosen for its
@@ -132,6 +137,57 @@ it, and re-exporting keeps it. That's the price of an export that can't run
 anything, and it's the right way round. There's a UTF-8 BOM on the front too,
 so Excel opens accented names as written.
 
+### The wishlist
+
+`wishlist.html` is the other tab of the same spreadsheet: records not on the
+shelf yet. Everything described above works there unchanged — the search, the
+pills, the sort, the grid and list views, the detail dialog, Export CSV — because
+it is the same page. `<body data-source="wishlist">` is what makes it a
+different one, and `js/app.js` is the entry point for both.
+
+The two tabs share every column name, so the code that reads one reads the
+other. Past the two URLs, three things are allowed to differ per tab, and all
+three live together in `CONFIG.SOURCES`:
+
+| Per-tab      | Shelf                   | Wishlist                          |
+|--------------|-------------------------|-----------------------------------|
+| Blank `Title`| "Self-Titled"           | "Any release" — half the list was jotted down as an artist and nothing more |
+| A row is a   | disc                    | record                            |
+| Opens sorted | random                  | by artist                         |
+
+The default sort has to be per-tab rather than shared because `js/url.js` leaves
+the sort out of a link when it matches the default and puts it back on arrival —
+one shared default and the wishlist would write links that reopen in a different
+order than they were shared in.
+
+**Ownership marks.** The wishlist loads the shelf alongside itself and checks
+every row against it, so a record bought months ago and never crossed off says
+so instead of sitting there looking wanted. A match wears **Own it** stamped
+across the cover, and the corner that carries the catalog tag on the grid page
+carries the shelf position instead — `B2 · #219`, the part of the answer that
+stops you buying it twice. A weaker match — the artist is on the shelf but not
+this release — says so rather than claiming either: `2 on the shelf` on the
+card, and in the dialog the actual titles when there are few enough to read,
+because in a shop the useful form of "you have 2 of these" is which 2.
+
+The matching is in `js/owned.js`, and it is deliberately forgiving in the ways
+that don't change the answer and strict in the one that does. Case, accents,
+punctuation and a leading "The" all fold, because a sheet two people typed into
+over years has "The Clash" on one side and "clash" on the other, and "Vol. 2"
+against "Vol 2". Two different albums by one artist stay two different records.
+Barcodes match across UPC/EAN zero-padding.
+
+**The shop check.** One box, above the browse controls, because in a shop it is
+the thing you came for. Type or scan a barcode, artist, or title and it answers
+in the order that matters with a case in your hand: you own it (and where it
+is), you wanted it, or neither. It never touches the network — both tabs are
+already in memory by the time the box is wired up, which is what makes it work
+on a phone with no signal, and the whole reason the page exists.
+
+The shelf is allowed to fail on its own here. If the collection tab can't be
+reached, the wishlist still renders, just without ownership marks; a page that
+refused to draw because the *other* tab was down would be no wishlist at all.
+
 ### Labels
 
 `labels.html` prints jewel-case inserts. Labels get there two ways: typed into
@@ -169,12 +225,18 @@ can't answer, which the site hides perfectly until there's no signal.
 `node scripts/check-shell-assets.js` is what notices; CI runs it.
 
 When the discs on screen didn't come from the live sheet, the page says so —
-in the results bar on the grid, above the figures on the stats page — naming
+in the results bar on the grid and the wishlist, above the figures on the stats
+page — naming
 which copy it read (the one saved on this device, or the one published with the
 site) and dating it when the worker stamped one. What it never says is that the
 *sheet* is out of date: Google's published CSV can trail the spreadsheet all on
-its own, and nothing on this side can see that. All either page honestly knows
+its own, and nothing on this side can see that. All any page honestly knows
 is which copy it read.
+
+The wishlist carries a second line that reads similarly and means something
+else. The one above is "this copy of the sheet is old"; the one sitting with the
+shop check is "these rows are" — *n* records on this list are already on the
+shelf, which is the answer to "did I buy this and forget to cross it off".
 
 Icons are committed PNGs (there's no build step) generated by
 `node scripts/make-icons.js`; re-run that after changing the palette.
@@ -193,6 +255,13 @@ Edit the collection here:
 To add a disc, add a row. To edit one, change its cells. To remove one, delete
 the row. The first row is the header and must stay as-is — the column names
 below are what the site looks for.
+
+The same spreadsheet has a second tab for the wishlist, edited the same way and
+read by `wishlist.html`. Both tabs are published separately, and each one's
+published-CSV URL is an entry in `CONFIG.SOURCES` in `js/collection.js`. Adding
+a third tab is that block, a line in `SHELL_ASSETS`, and a page with the
+matching `data-source` — `scripts/snapshot.js` walks `CONFIG.SOURCES` and picks
+up the new one on its own.
 
 ### Columns
 
@@ -215,6 +284,11 @@ sheet header **and** the matching entry in `CONFIG.COLUMNS` in `js/collection.js
 
 `Barcode` is optional in a second sense too: a sheet that doesn't have the
 column at all parses exactly as it did before it existed.
+
+The wishlist tab uses the same columns, minus `Book` and `Number` — nothing on
+it has a shelf position yet — and reads a blank `Title` as "Any release" rather
+than "Self-Titled". Leaving the two columns out needs no code: `col()` answers
+`''` for a header that isn't there.
 
 ### Pinning a release with a barcode
 
@@ -282,9 +356,10 @@ detail view notes the disc count (e.g. "Catalog #42–43 (2 discs)"), searching
 any single number in the span finds the release, and sorting by catalog number
 places it at its first slot.
 
-### Refreshing the offline snapshot
+### Refreshing the offline snapshots
 
-`data/collection.csv` is the sheet frozen into the repo. The service worker
+`data/collection.csv` and `data/wishlist.csv` are the two sheet tabs frozen
+into the repo. The service worker
 only has a copy of the sheet after one successful *online* fetch, so without
 this file a fresh install opened for the first time with no signal has nothing
 real to show — the record-shop case the offline support was built for.
@@ -297,8 +372,10 @@ connection:
 node scripts/snapshot.js
 ```
 
-The script reads the sheet's URL out of `js/collection.js`, so there's nothing
-to configure, and it refuses to write anything whose header row doesn't name
+The script reads the URLs out of `CONFIG.SOURCES` in `js/collection.js` and
+writes every tab it finds there, so there's nothing to configure and nothing to
+add when a tab is. Name one (`node scripts/snapshot.js wishlist`) to do just
+that one. It refuses to write anything whose header row doesn't name
 both the Artist and Title columns — a login wall or a Google error page answers
 `200` with HTML, and that must never be able to overwrite a good snapshot.
 
@@ -309,13 +386,15 @@ has changed enough that an offline visitor would notice the difference.
 
 One side effect worth having on purpose: because every refresh is a commit,
 `git log -p data/collection.csv` becomes an acquisition log — every disc added
-to the shelf, in order, dated.
+to the shelf, in order, dated. `data/wishlist.csv` is the other half of it:
+what was wanted, and when it stopped being.
 
 ## Files
 
 | File                    | What it is                                                        |
 |-------------------------|-------------------------------------------------------------------|
 | `index.html`            | The grid page — markup and the loading/empty/error states.        |
+| `wishlist.html`         | The same page pointed at the wishlist tab, plus the shop check. See above. |
 | `stats.html`            | The breakdowns page.                                              |
 | `labels.html`           | The label generator.                                              |
 | `styles.css`            | All styling for every page (construction-paper / retro-infographic). |
@@ -324,14 +403,15 @@ to the shelf, in order, dated.
 | `sw.js`                 | Service worker — offline caching (see above).                     |
 | `manifest.webmanifest`  | PWA manifest: name, colors, icons, shortcuts.                     |
 | `icons/`                | App icons, generated and committed.                               |
-| `data/collection.csv`   | The sheet frozen into the repo, so a first-ever offline load has real discs. See above. |
+| `data/`                 | The sheet tabs frozen into the repo (`collection.csv`, `wishlist.csv`), so a first-ever offline load has real discs. See above, and `data/README.md`. |
 | `scripts/make-icons.js` | Regenerates `icons/` — Node stdlib only, run by hand.             |
-| `scripts/snapshot.js`   | Regenerates `data/collection.csv` — likewise Node stdlib, run by hand. |
+| `scripts/snapshot.js`   | Regenerates the snapshots in `data/` — likewise Node stdlib, run by hand. |
 | `scripts/check-shell-assets.js` | Checks `SHELL_ASSETS` in `sw.js` against the files actually in the tree. |
 | `scripts/burncd/`       | **[burncd](scripts/burncd/README.md)** — CLI that burns a folder of music to an audio CD. Nothing to do with the site; see below. |
 | `test/`                 | Unit tests for the pure helpers. See below.                       |
 | `.github/workflows/`    | Checks every push to `main` and every pull request; publishes `main` to Pages. See below. |
-| `sample.csv`            | Dummy data for local development (see below).                     |
+| `sample.csv`            | Dummy data for local development (see below). One file, read by both tabs. |
+| `vendor/`               | The one third-party dependency, committed rather than fetched: `papaparse.min.js`. |
 | `CNAME`                 | Custom-domain config for GitHub Pages (`cd.iamgarrett.com`).      |
 | `qr.svg` / `qr.png`     | QR code linking to the live site.                                 |
 
@@ -363,6 +443,8 @@ or let the lower module take a callback instead of importing the higher one
 | `collection.js`   | Shared data layer: `CONFIG`, sheet fetch, CSV parsing, disc model, `escapeHtml`. Imported by every page. |
 | `dom.js`          | The one cache of grid-page element references. |
 | `store.js`        | The discs and the current filter state, as data and nothing else. Separate from `state.js` so the modules below can read them without importing the ones above back. |
+| `owned.js`        | Is this record already in the books? Name and barcode matching between the wishlist and the shelf, forgiving about how two people typed the same album and strict about which album it is. Used by the stamps and by the shop check. |
+| `shop.js`         | The wishlist's one box: type a barcode, artist or title and get own it / want it / neither, shelf position first. Reads what is already in memory and never the network. |
 | `url.js`          | The URL as state: reading it on load, writing it on change. |
 | `color.js`        | Per-artist accent colors, hex/RGB math, contrast, dominant-color sampling from cover art. |
 | `art.js`          | Cover-art and tracklist resolution: MusicBrainz lookups, the Cover Art Archive, and the caches over both. |
@@ -371,13 +453,13 @@ or let the lower module take a callback instead of importing the higher one
 | `controls.js`     | The other direction: pushing `state` back out to the search box, the sort select, the pills and the view toggle, after a deep link or a Back/Forward. |
 | `state.js`        | Acting on the collection: filter, sort, view, shuffle, export. |
 | `detail.js`       | The disc dialog — opening, populating, and closing it, and its history entry. |
-| `app.js`          | **Entry point for `index.html`.** Wiring only — reads the URL, loads the sheet, binds the event listeners, and hands off. |
-| `stats.js`        | **Entry point for `stats.html`.** Counts the collection three ways and draws the bar charts. |
+| `app.js`          | **Entry point for `index.html` and `wishlist.html`.** Wiring only — reads the URL, loads the sheet, binds the event listeners, and hands off. On the wishlist it loads both tabs, letting the shelf half fail on its own. |
+| `stats.js`        | **Entry point for `stats.html`.** Counts the collection three ways, draws the bar charts, and loads the wishlist for the tag cloud's second tone — failing soft to a one-tone cloud if that tab doesn't answer. |
 | `labels.js`       | **Entry point for `labels.html`.** The label list, the form, the print sheet, and the JSON export/import. |
 
 ### The labels page's two layers
 
-`labels.html` wears the same chrome as the other two pages — paper, grain,
+`labels.html` wears the same chrome as the other three pages — paper, grain,
 masthead, the shared nav — and its form is built from the vocabulary in
 `styles.css`. Its own stylesheet, `labels.css`, exists for two reasons:
 
@@ -467,9 +549,10 @@ pushes and on pull requests both:
 - `node --check` over `js/*.js`, `scripts/*.js` and `sw.js`. A service worker
   that doesn't parse fails to install and takes offline support with it.
 - The unit tests above.
-- `node scripts/check-shell-assets.js`, which walks the imports out of all
-  three pages and the icons out of the manifest and fails if `SHELL_ASSETS` in
-  `sw.js` has drifted from what's in the tree. That list is hand-kept because
+- `node scripts/check-shell-assets.js`, which walks the imports out of every
+  `.html` in the tree — discovered rather than listed, so a new page is covered
+  the day it lands — and the icons out of the manifest, and fails if
+  `SHELL_ASSETS` in `sw.js` has drifted from what's in the tree. That list is hand-kept because
   there's no build step to generate it, and drift is invisible online and total
   offline.
 
