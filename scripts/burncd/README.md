@@ -59,7 +59,7 @@ line for each:
   ✓  drive --dummy        Does support test writing
   ✓  media                blank CD-R ready
   ✓  scratch space        54.1 GB free in /var/folders/...
-  ✓  terminal             UTF-8 locale, progress bar will render
+  ✓  terminal             UTF-8 locale (en_US.UTF-8), progress bar will render
 
   Ready to burn.
 ```

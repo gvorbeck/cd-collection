@@ -38,17 +38,36 @@ set -euo pipefail
 
 # Every rule, meter cell and track title on the edit screen is UTF-8, and ${#s}
 # counts bytes unless the ctype locale says otherwise — one accented title would
-# then shove the whole column grid sideways. Only LC_CTYPE is set, so collation
-# and number formatting elsewhere are left exactly as the user has them.
+# then shove the whole column grid sideways. Only the ctype category is changed,
+# so collation and number formatting are left exactly as the user has them.
+#
+# LC_ALL has to be dismantled first when it is what pins the locale: bash ignores
+# LC_CTYPE for as long as LC_ALL is set and non-empty, so exporting one under the
+# other looks like a fix and does nothing. Someone with LC_ALL=C in their profile
+# for reproducible sorting is exactly the person this block exists for. Handing
+# its value to the other five categories keeps every one of them where it was.
 case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
   *UTF-8*|*utf-8*|*UTF8*|*utf8*) ;;
-  *) LOCALES=$( (locale -a 2>/dev/null || true) | tr '\n' ' ' )
+  *) if [ -n "${LC_ALL:-}" ]; then
+       export LC_COLLATE="$LC_ALL"  LC_NUMERIC="$LC_ALL"  LC_TIME="$LC_ALL" \
+              LC_MONETARY="$LC_ALL" LC_MESSAGES="$LC_ALL"
+       unset LC_ALL
+     fi
+     LOCALES=$( (locale -a 2>/dev/null || true) | tr '\n' ' ' )
      case " $LOCALES " in
        *" en_US.UTF-8 "*) export LC_CTYPE=en_US.UTF-8 ;;
        *" C.UTF-8 "*)     export LC_CTYPE=C.UTF-8 ;;
        *)                 export LC_CTYPE=UTF-8 ;;   # BSD libc accepts the bare name
      esac ;;
 esac
+
+# Whether any of that worked, asked of the shell rather than of the locale's
+# name: this one comparison is the exact property every width calculation in the
+# file rests on. One character, two bytes. Everywhere else that wants to know
+# reads UTF8 instead of re-deriving it from the environment and getting a
+# slightly different answer.
+UTF8_PROBE='é'
+if [ "${#UTF8_PROBE}" -eq 1 ]; then UTF8=1; else UTF8=0; fi
 
 SPEED="${BURNCD_SPEED:-8}"
 DEV="${BURNCD_DEV:-IOCompactDiscServices}"
@@ -463,10 +482,16 @@ run_check() {
   fi
 
   # --- display --------------------------------------------------------------
-  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
-    *UTF-8*|*utf8*|*UTF8*) ck ok "terminal" "UTF-8 locale, progress bar will render" ;;
-    *) ck warn "terminal" "non-UTF-8 locale; bar characters may look wrong" ;;
-  esac
+  # The flag the rest of the file uses, not a second reading of the environment:
+  # this has to report what the width code will actually do, including the case
+  # where the preamble tried to fix the locale and the system had nothing to
+  # fix it with.
+  if [ "$UTF8" -eq 1 ]; then
+    ck ok "terminal" \
+      "UTF-8 locale (${LC_ALL:-${LC_CTYPE:-${LANG:-unset}}}), progress bar will render"
+  else
+    ck warn "terminal" "non-UTF-8 locale; bar characters may look wrong"
+  fi
 
   printf '\n'
   if [ "$CHECK_FAIL" -eq 1 ]; then
@@ -1224,13 +1249,43 @@ keys() {  # keys <key> <label> [<key> <label> ...]
   printf '  %b\n' "$line"
 }
 
+# One track, in the three columns that the editor and the disc prompt both lay
+# out. They are showing the same list on purpose — the prompt is where the
+# editor's work gets checked, and a listing you cannot compare at a glance is
+# not a check — so the widths live here and the two screens move together.
+#
+# Cells rather than a finished line, because the editor's selected row wraps the
+# same four cells in a single reverse-video bar and an inner colour reset would
+# punch a hole in the highlight partway along.
+ROW_NUM=''; ROW_TTL=''; ROW_ART=''; ROW_TM=''
+track_cells() {  # track_cells <n> <title> <artist> <seconds>
+  printf -v ROW_NUM '%02d' "$1"
+  fitv "$2" 34; ROW_TTL=$FIT
+  fitv "$3" 20; ROW_ART=$FIT
+  mmssv "$4"; printf -v ROW_TM '%5s' "$MMSS"
+  return 0
+}
+
+track_row() {  # track_row <n> <title> <artist> <seconds>
+  track_cells "$1" "$2" "$3" "$4"
+  printf '    %b%s%b  %s  %b%s%b  %b%s%b\n' \
+    "$ETCH" "$ROW_NUM" "$OFF" "$ROW_TTL" "$DIM" "$ROW_ART" "$OFF" "$ETCH" "$ROW_TM" "$OFF"
+  return 0
+}
+
+# What is below the fold, worded the same way wherever a list gets clamped.
+more_row() {  # more_row <count>
+  printf '    %b▾ %d MORE%b\n' "$ETCH" "$1" "$OFF"
+  return 0
+}
+
 TUI_ROWS=0
 
 # Everything the panel says, printed to stdout so tui_draw can capture the whole
 # frame and hand it to the terminal in one piece. Split out for that reason only.
 tui_frame() {  # tui_frame <cursor> <top> <visible-rows> <status>
   local cur=$1 top=$2 vis=$3 status=$4 i k row d lastd=0 meta
-  local num ttl art tm body ts='' ds='' last=$(( top + vis ))
+  local body ts='' ds='' last=$(( top + vis ))
 
   # DISC_AT is built by tui_fit_rows before this runs — it has to be, since the
   # row budget depends on where the disc rules fall.
@@ -1272,24 +1327,17 @@ tui_frame() {  # tui_frame <cursor> <top> <visible-rows> <status>
       printf '  %b━━ DISC %s %s%b\n' "$ETCH" "$d" "$REP" "$OFF"
       lastd=$d
     fi
-    printf -v num '%02d' $(( k + 1 ))
-    fitv "${TITLES[$i]}" 34; ttl=$FIT
-    fitv "${ARTISTS[$i]}" 20; art=$FIT
-    mmssv "${DURS[$i]}"; printf -v tm '%5s' "$MMSS"
     if [ "$cur" -eq "$row" ]; then
-      # One reversed bar, no colour inside it: an inner reset would punch a hole
-      # in the highlight partway along the row.
-      printf -v body '%s  %s  %s  %s' "$num" "$ttl" "$art" "$tm"
+      track_cells $(( k + 1 )) "${TITLES[$i]}" "${ARTISTS[$i]}" "${DURS[$i]}"
+      printf -v body '%s  %s  %s  %s' "$ROW_NUM" "$ROW_TTL" "$ROW_ART" "$ROW_TM"
       printf '  %b▶%b %b%s%b\n' "$AMBER" "$OFF" "$INV" "$body" "$OFF"
     else
-      printf '    %b%s%b  %s  %b%s%b  %b%s%b\n' \
-        "$ETCH" "$num" "$OFF" "$ttl" "$DIM" "$art" "$OFF" "$ETCH" "$tm" "$OFF"
+      track_row $(( k + 1 )) "${TITLES[$i]}" "${ARTISTS[$i]}" "${DURS[$i]}"
     fi
     k=$(( k + 1 ))
   done
 
-  [ $(( top + vis )) -lt "${#ORDER[@]}" ] && printf '    %b▾ %d MORE%b\n' \
-    "$ETCH" $(( ${#ORDER[@]} - top - vis )) "$OFF"
+  [ $(( top + vis )) -lt "${#ORDER[@]}" ] && more_row $(( ${#ORDER[@]} - top - vis ))
 
   printf '\n'
   # The meter for whichever disc the cursor is sitting on, so the effect of a
@@ -1666,7 +1714,7 @@ wait_key() {  # wait_key -> $KEY
 # whatever the log needs — up to four rows of it, since a disc prompt with the
 # last disc's result hidden is the one place the log has something to say.
 stage_insert() {  # stage_insert <disc-number>
-  local d=$1 body foot prompt rows reserve=0 n k i num ttl art tm
+  local d=$1 body foot prompt rows reserve=0 n k i
   n=${#IDX[@]}
   term_size
   [ "${#LOG[@]}" -gt 0 ] && reserve=$(( ${#LOG[@]} + 1 ))
@@ -1682,16 +1730,11 @@ stage_insert() {  # stage_insert <disc-number>
     k=0
     while [ "$k" -lt "$n" ] && [ "$k" -lt "$rows" ]; do
       i=${IDX[$k]}
-      printf -v num '%02d' $(( k + 1 ))
-      fitv "${P_TITLE[$i]}" 34; ttl=$FIT
-      fitv "${P_ARTIST[$i]}" 20; art=$FIT
-      mmssv "${P_DUR[$i]}"; printf -v tm '%5s' "$MMSS"
-      printf '    %b%s%b  %s  %b%s%b  %b%s%b\n' \
-        "$ETCH" "$num" "$OFF" "$ttl" "$DIM" "$art" "$OFF" "$ETCH" "$tm" "$OFF"
+      track_row $(( k + 1 )) "${P_TITLE[$i]}" "${P_ARTIST[$i]}" "${P_DUR[$i]}"
       k=$(( k + 1 ))
     done
     if [ "$k" -lt "$n" ]; then
-      printf '    %b▾ %d MORE%b\n' "$ETCH" $(( n - k )) "$OFF"
+      more_row $(( n - k ))
     fi
     printf '\n'
     strip "$d" "DISC $d"
@@ -1755,7 +1798,7 @@ stage_done() {  # stage_done <meta>
       shown=$(( shown + 1 )); d=$(( d + 1 ))
     done
     if [ "$d" -le "$NDISCS" ]; then
-      printf '    %b▾ %d MORE%b\n' "$ETCH" $(( NDISCS - d + 1 )) "$OFF"
+      more_row $(( NDISCS - d + 1 ))
     fi
   )
   stage "$1" "$body" "$(keys Q QUIT)"
