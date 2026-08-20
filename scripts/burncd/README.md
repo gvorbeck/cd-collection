@@ -229,10 +229,18 @@ outcome than one the drive won't write.
 
 The alphabet on a disc is ISO-8859-1, not Unicode, whatever your files are tagged
 in. Accented Latin text is converted and comes out right on the player: `Björk`
-is written as one byte, not as the two the panel drew it with. Anything with a
-close equivalent is transliterated — an em dash becomes a hyphen, `Tōkyō` becomes
-`Tokyo` — and anything with none, Japanese and Chinese and Cyrillic among them,
-cannot ride in a CD-Text pack at all and is dropped. burncd counts what it had to
+is written as one byte, not as the two the panel drew it with.
+
+Typographic punctuation is mapped before any of that, because it is the case that
+actually comes up — three of the eleven titles on *Santa Cruz* have a curly
+apostrophe in them, and left to iconv `Don’t` is written `Don´t`, an acute accent
+standing where the apostrophe was. Curly quotes become straight ones, en and em
+dashes become hyphens, `…` becomes three dots. These are exact stand-ins rather
+than approximations, so they are not counted as anything lost.
+
+What is left with a close equivalent is transliterated — `Tōkyō` becomes `Tokyo`
+— and anything with none, Japanese and Chinese and Cyrillic among them, cannot
+ride in a CD-Text pack at all and is dropped. burncd counts what it had to
 approximate and says so before the burn, once per disc. The panel and the plan go
 on showing the real titles; it is only the lead-in that is limited.
 

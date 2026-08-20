@@ -961,19 +961,12 @@ replan
 
 # ----------------------------------------------------------------- the plan --
 
-# How many of the breaks in BREAK_AT actually open a disc in the current running
-# order. Not the same as how many are set: dropping the track a break belongs to
-# leaves the break behind, harmless and unspent, and it should not be counted in
-# the reason the plan gives for a second disc.
-break_count() {  # break_count -> $NBREAKS
-  local i
-  NBREAKS=0
-  for i in $(seq 0 $(( N - 1 ))); do
-    breaks_here "$i" && NBREAKS=$(( NBREAKS + 1 ))
-  done
-  return 0
-}
-
+# The static plan, printed instead of the panel when there is no screen to draw
+# one on. Nothing here needs to account for a forced disc break: breaks are set
+# with the s key and nowhere else, the editor is the only thing that reads that
+# key, and it returns without doing anything unless SCREEN is 1 — which is the
+# one case this function is never called in. A run that prints this plan has an
+# empty BREAK_AT by construction.
 plan_header() {
   local why
   if [ -n "$ALBUM" ]; then
@@ -997,8 +990,6 @@ plan_header() {
   if [ "$NDISCS" -gt 1 ]; then
     # Say which limit was hit — runtime and the 99-track ceiling are very
     # different problems, and "too long" is wrong when the album is 9 minutes.
-    # So is either of them when nothing was hit at all and the break is one you
-    # set on the panel, which is why the reason can be empty here.
     why=""
     if [ "$N" -gt "$MAX_TRACKS" ] && [ "$TOTAL" -gt "$CAPACITY" ]; then
       why="too long and over $MAX_TRACKS tracks"
@@ -1006,12 +997,6 @@ plan_header() {
       why="over the $MAX_TRACKS track limit of a CD"
     elif [ "$TOTAL" -gt "$CAPACITY" ]; then
       why="too long for one disc"
-    fi
-    break_count
-    if [ "$NBREAKS" -gt 0 ]; then
-      if [ -n "$why" ]; then why="$why, and broken where you asked"
-      else why="broken where you asked"
-      fi
     fi
     if [ -n "$why" ]; then
       printf '  Splitting across %d discs — %s\n' "$NDISCS" "$why"
@@ -1307,6 +1292,12 @@ tui_prompt() {  # tui_prompt <label> <current>
   printf '\033[?25h\r\033[K  %b▶%b %b%-7s%b %b[%s]%b ' \
     "$AMBER" "$OFF" "$ETCH" "$1" "$OFF" "$DIM" "${2:-empty}" "$OFF" > /dev/tty
   IFS= read -r reply || reply=""
+  # Flattened here for the same reasons the tags are flattened as they are read,
+  # and this is the other way text gets in: cooked mode passes a tab straight
+  # through, and a paste can carry anything. A tab in a title bends the panel
+  # frame, and a tab in a header field splits its undo record into one field too
+  # many — album "Live\tAt Leeds" would come back from an undo as "Live".
+  reply=${reply//[$'\t\n\r']/ }
   printf '\033[?25l' > /dev/tty
   tui_block
   [ -n "$reply" ] && printf '%s' "$reply" || printf '%s' "$2"
@@ -2535,17 +2526,43 @@ patch_le32() {  # file offset value
 CUET=''
 CDTEXT_LOSSY=0
 
+# Printable ASCII, written out one character at a time rather than as the range
+# [\ -~]. A bracket range is resolved against the collating order, and under any
+# UTF-8 LANG that order is not the code-point order: en_US.UTF-8 sorts a A b B,
+# which puts every letter of the alphabet outside [\ -~] and makes the range
+# answer "not ASCII" for "Tokyo". A list is compared character by character and
+# has no order to be led astray by. ] comes first and - last, where a bracket
+# expression takes them literally.
+ASCII_PRINT='] !"#$%&'\''()*+,./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\^_`abcdefghijklmnopqrstuvwxyz{|}~-'
+
 cue_textv() {  # cue_textv <string> [max-bytes]
   local s max=${2:-120}
   s=$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177"\\')
   CUET=''
   [ -n "$s" ] || return 0
 
+  # The typographer's punctuation, which ISO-8859-1 has none of and no two
+  # iconvs agree about. A curly apostrophe is by a wide margin the most common
+  # non-Latin-1 character in a music tag — three of the eleven titles on a Pedro
+  # the Lion record have one — and Apple's iconv transliterates it to ´, an
+  # acute accent standing where the apostrophe was, on a display that cannot
+  # explain itself. These have exact ASCII equivalents and are simply what they
+  # are stand-ins for, so they are mapped here, before anything else looks at
+  # the string: it keeps them off the lossy count, where they were never really
+  # a loss, and it lets a title that was only ever ASCII with fancy quotes take
+  # the fast path below. Curly double quotes go the way the plain ones already
+  # have — out, because the cue parser reads them.
+  s=${s//[’‘′]/\'}
+  s=${s//[“”]/}
+  s=${s//[–—―]/-}
+  s=${s//…/...}
+
   # Most fields are plain ASCII, which is a subset of both alphabets: nothing to
-  # convert, and nothing that can be lost. Worth the test — it keeps the count
-  # honest on a machine whose iconv is missing or unhelpful.
+  # convert, and nothing that can be lost. Worth the test — it saves two forks a
+  # field on the common album, and it keeps the count below honest on a machine
+  # whose iconv is missing or unhelpful, where the round trip cannot answer.
   case $s in
-    *[!\ -~]*) ;;
+    *[!$ASCII_PRINT]*) ;;
     *) CUET=$(printf '%s' "$s" | LC_ALL=C cut -b"1-$max"); return 0 ;;
   esac
 
@@ -3037,13 +3054,16 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
     case $lvl in
       1) note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; dropped the per-track artists')" ;;
       2) note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; shortened the track titles')" ;;
-      3) note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; shortened the track titles further')" ;;
+      3) note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; cut the track titles again')" ;;
       4) note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; dropped the track titles')" ;;
       5) CDTEXT_THIS=0
-         note "$(printf '\033[33m!\033[0m CD-Text will not fit this disc'\''s lead-in; writing disc %d without it' "$d")" ;;
+         note "$(printf '\033[33m!\033[0m CD-Text will not fit the lead-in; writing disc %d without it' "$d")" ;;
     esac
+    # Kept inside the panel's 69 columns, like every other line of it: note()
+    # prints what it is given and a line too long for the frame wraps, which
+    # costs the frame a row it did not budget for and scrolls its top away.
     if [ "$CDTEXT_LOSSY" -gt 0 ]; then
-      note "$(printf '\033[33m!\033[0m CD-Text: %d field(s) are outside the disc'\''s character set (ISO-8859-1) and were approximated' \
+      note "$(printf '\033[33m!\033[0m CD-Text: %d field(s) approximated into the disc'\''s ISO-8859-1' \
         "$CDTEXT_LOSSY")"
     fi
   fi
