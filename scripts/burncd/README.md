@@ -81,8 +81,12 @@ They do different things and none of them replaces another:
 So: `--check` proves the hardware and tooling are there. `--demo` proves the
 *output* is right — it converts the audio and builds the real image and cue sheet,
 then runs the burn screen against them so you can see the whole thing land without
-a disc in the drive. `--dummy` proves the drive actually accepts that cue sheet
-and CD-Text, by doing the entire burn for real minus the laser.
+a disc in the drive. Its stand-in for the drive is deliberately as awkward as a
+real one: it goes quiet for the lead-in, stops short of every track boundary
+instead of landing on it, and goes quiet again for the lead-out, so the demo
+rehearses the parts of the display that have to work unaided. `--dummy` proves
+the drive actually accepts that cue sheet and CD-Text, by doing the entire burn
+for real minus the laser.
 
 ```bash
 burncd --check
@@ -550,9 +554,33 @@ a disc; and the write head is a partial block too, so on a bar this wide it
 creeps forward continuously instead of sitting still and then jumping a cell.
 
 The second line is a lamp sweeping a dark field, in the position the plan gives
-its minute scale. It moves on every message from the drive, which is the point: a
-burn is twenty minutes of a number that changes every few seconds, and a stalled
-write should look different from a slow one across the room.
+its minute scale. It runs on its own clock rather than on the drive's: a burn is
+twenty minutes of a number that changes every few seconds, and a panel with
+nothing moving on it looks like a panel that has died. Whether the write has
+actually stalled is a question for the numbers above it, which are the ones you
+would check to confirm it anyway.
+
+A drive only narrates the middle of a burn. It says nothing while it spins up,
+calibrates its laser and writes the lead-in, and nothing again while it empties
+its buffer and writes the lead-out — each of them seconds long, and on some
+drives the better part of a minute. Both get the panel above, said outright:
+
+```
+   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━ WRITING · DISC 1 OF 2 · LEAD-IN
+
+    ALBUM    Nonagon Infinity
+
+    TRACK    -- OF 11  —
+    WRITTEN  0 OF 605 MB AT --x
+    BUFFER   --%   ELAPSED 0:06   REMAINING --:--
+```
+
+Same layout, with `--` standing in for the fields the drive has not filled yet,
+so nothing on screen moves when a phase changes hands. The lamp sweeps and the
+clock runs throughout, which is the difference between a drive getting ready and
+a drive that has died. The lead-out ends the bar at 100%: the audio is down by
+then, and the panel used to stop a percent or two short and stay there until the
+disc was ejected out from under it.
 
 There used to be a disc filling in from the hub outward here, in cyan and white.
 It was a second, unrelated instrument bolted to the side of this one, and it said

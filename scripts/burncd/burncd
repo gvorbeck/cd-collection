@@ -110,6 +110,15 @@ STRIP_WIDTH=$(( PANEL - 2 ))
 # one thing it must not be mistaken for: the bar above it is the progress.
 SCAN_TICK=0.05
 SCAN_STEP=2
+# When the drive falling silent means the burn is finished rather than the drive
+# being slow. cdrecord's progress line stops with the last sector of audio and
+# says nothing at all through the lead-out, which is the buffer emptying and the
+# table of contents being written — tens of seconds on most drives, and the whole
+# of it used to be spent on a frozen panel that then ejected the disc. Silence
+# this far in is the lead-out; anywhere earlier it is a drive taking its time,
+# and the numbers above the lamp are the honest way to see that.
+TAIL_QUIET=3
+TAIL_PCT=95
 # Every row of the edit panel that is not a track, and the shortest window that
 # can still hold one. Up here rather than beside tui_fit_rows, which is what
 # counts with them, because the decision to open the screen at all is made before
@@ -1961,15 +1970,103 @@ scan_row() {  # scan_row <frame> <panel-height>
   return 0
 }
 
+# One frame of the burn panel. Split out of render()'s loop so the same drawing
+# can be laid down before the drive has said a word: bash scopes dynamically, so
+# every field below is read straight out of the render() that called it. One
+# layout with two callers rather than two copies of it, which is the mistake the
+# meter and the burn bar already made once between them.
+#
+# A burn has three phases and cdrecord narrates only the middle one. $phase is
+# which of them the panel is drawing:
+#
+#   lead   the drive spinning up, calibrating its laser power and writing the
+#          lead-in, before the first sector of audio reaches the disc
+#   write  the part with a progress line behind it
+#   tail   the buffer emptying and the lead-out going down, after the last
+#          sector of audio and before the disc is ejected
+#
+# The two silent ones are seconds long apiece — on some drives the better part of
+# a minute — and the panel used to spend both of them showing the last frame of
+# whatever had spoken most recently: the conversion, stopped at 95%, and then the
+# write, stopped at 97% until the disc came out. Both read as a hang. The layout
+# is identical in all three, with -- standing in for the fields the drive has not
+# filled in, so nothing on screen moves when a phase changes hands.
+burn_frame() {
+  local bar filled i title meta head pctf trkf
+  printf '%b' "$home"
+
+  # The two fields the drive alone can fill. Formatted once, here, rather than
+  # branched at each of the places they are printed — and into variables rather
+  # than command substitutions, because this is the redraw path and a $( ) in it
+  # is a fork per frame.
+  if [ "$phase" = lead ]; then
+    pctf='LEAD-IN'; trkf='--'
+  elif [ "$phase" = tail ]; then
+    pctf='LEAD-OUT'; printf -v trkf '%02d' "$trk"
+  else
+    printf -v pctf '%3d%%' "$pct"; printf -v trkf '%02d' "$trk"
+  fi
+
+  if [ "$wide" -eq 0 ]; then
+    filled=$(( pct * BAR_WIDTH / 100 ))
+    bar=''
+    for (( i = 0; i < BAR_WIDTH; i++ )); do
+      if [ "$i" -lt "$filled" ]; then bar="${bar}▓"; else bar="${bar}░"; fi
+    done
+    printf '\033[K  %b%s DISC %d OF %d%b\n' "$AMBER" "$verb" "$disc_no" "$disc_of" "$OFF"
+    printf '\033[K  %b▐%b%b%s%b%b▌%b %b%s%b\n' \
+      "$ETCH" "$OFF" "$AMBER" "$bar" "$OFF" "$ETCH" "$OFF" "$AMBER" "$pctf" "$OFF"
+    printf '\033[K  %bTRACK%b %s/%d  %bDATA%b %d/%d MB  %b%sx%b\n' \
+      "$ETCH" "$OFF" "$trkf" "$ntracks" "$ETCH" "$OFF" "$done_mb" "$total_mb" \
+      "$ETCH" "$spd" "$OFF"
+    printf '\033[K  %bBUFFER%b %s%%  %bELAPSED%b %s  %bLEFT%b %s\n%b' \
+      "$ETCH" "$OFF" "$buf" "$ETCH" "$OFF" "$el" "$ETCH" "$OFF" "$eta" "$tail"
+    return 0
+  fi
+
+  # Header, laid out exactly like every other stage's, and the album under it
+  # for the same reason: the thing on screen while a disc is being written
+  # should be recognisably the thing that was on screen while it was planned.
+  #
+  # %3d, not %d: the rule is sized from what is left after the meta, so a
+  # percentage that grows a digit would shorten the rule by one and the whole
+  # header would twitch sideways twice a burn.
+  printf -v meta '%s · DISC %d OF %d · %s' "$verb" "$disc_no" "$disc_of" "$pctf"
+  printf '\033[K'; faceplate "$meta"
+  printf '\033[K\n'
+  printf '\033[K    %b%-8s%b %s\n' "$ETCH" ALBUM "$OFF" "${ALBUM:-—}"
+  printf '\033[K\n'
+
+  title='—'
+  if [ "$phase" != lead ] && [ "$trk" -ge 1 ] && [ "$trk" -le "${#IDX[@]}" ]; then
+    title=${P_TITLE[${IDX[$(( trk - 1 ))]}]}
+  fi
+  fitv "$title" 46
+  printf '\033[K    %b%-8s%b %s OF %02d  %s\n' \
+    "$ETCH" TRACK "$OFF" "$trkf" "$ntracks" "$FIT"
+  printf '\033[K    %b%-8s%b %d OF %d MB AT %sx\n' \
+    "$ETCH" WRITTEN "$OFF" "$done_mb" "$total_mb" "$spd"
+  printf '\033[K    %b%-8s%b %s%%   %bELAPSED%b %s   %bREMAINING%b %s\n\033[K\n' \
+    "$ETCH" BUFFER "$OFF" "$buf" "$ETCH" "$OFF" "$el" \
+    "$ETCH" "$OFF" "$eta"
+
+  head=$(( total_mb > 0 ? done_mb * STRIP_WIDTH * 8 / total_mb : 0 ))
+  [ "$head" -gt $(( STRIP_WIDTH * 8 )) ] && head=$(( STRIP_WIDTH * 8 ))
+  bandbar "$head"; burn_scan "$frame"
+  printf '\033[K  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$BANDBAR" "$ETCH" "$OFF"
+  printf '\033[K  %b▐%b%b%b▌%b\n%b' "$ETCH" "$OFF" "$SCANBAR" "$ETCH" "$OFF" "$tail"
+  return 0
+}
+
 # Parses cdrecord's progress output and redraws the display in place.
 # cdrecord emits carriage-return-delimited lines like:
 #   Track 03:  12 of  45 MB written (fifo 100%) [buf  98%]  8.0x.
 render() {  # render <disc-no> <of> <ntracks> <total-mb>
   local disc_no=$1 disc_of=$2 ntracks=$3 total_mb=$4
-  local chunk trk mb_done buf spd title verb meta head frame=0
-  local base_mb=0 last_trk=1 done_mb=0 pct=0 eta="--:--" plain_trk=0
-  local elapsed el i tty=0 cols lines wide=0 bar filled home='' tail=''
-  local drawn=0 tick=''
+  local chunk trk=0 mb_done mb_trk buf="--" spd="--" verb frame=0
+  local base_mb=0 trk_mb=0 last_trk=1 done_mb=0 pct=0 eta="--:--" plain_trk=0
+  local elapsed el="0:00" i tty=0 cols lines wide=0 home='' tail=''
+  local drawn=0 tick='' phase=lead last_sec=0 last_msg=0
   local -a bdur
 
   [ -t 1 ] && tty=1
@@ -2017,36 +2114,83 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
     if [ "$SCREEN" -eq 0 ]; then
       for (( i = 0; i < lines; i++ )); do printf '\n'; done
     fi
+    # The panel goes up now, not when the drive first speaks. Every member of
+    # the pipeline this is the tail of starts at once, so "now" is the moment
+    # the burn is handed to cdrecord — the conversion is off the screen and the
+    # lead-in has a panel of its own to happen on, instead of several silent
+    # seconds spent looking at a conversion stopped at 95%.
+    burn_frame
+    drawn=1
   fi
 
-  # The drive's output and the lamp's clock, merged into one stream so the loop
-  # below has a single thing to block on. cat is what carries the drive's half of
-  # it; when that ends the ticker is killed, which is what closes the pipe and
-  # lets the loop see the end of the burn. No ticker unless there is a panel with
-  # a lamp on it to redraw — piped to a log, this is one process and no timers.
+  # The drive's output and the panel's own clock, merged into one stream so the
+  # loop below has a single thing to block on. cat is what carries the drive's
+  # half of it; when that ends the ticker is killed, which is what closes the
+  # pipe and lets the loop see the end of the burn. No ticker unless there is a
+  # panel to redraw — piped to a log, this is one process and no timers. There is
+  # one even without room for the lamp, because the lamp is not all it is for: it
+  # is also the only thing that moves the clock through the lead-in and the
+  # lead-out, and a narrow panel is stopped in those for exactly as long.
   {
-    if [ "$tty" -eq 1 ] && [ "$wide" -eq 1 ]; then scan_ticker & tick=$!; fi
+    if [ "$tty" -eq 1 ]; then scan_ticker & tick=$!; fi
     cat
     [ -n "$tick" ] && kill "$tick" 2>/dev/null
   } |
   while IFS= read -r -d $'\r' chunk || [ -n "$chunk" ]; do
     # A tick. Step the lamp, redraw its row, and go straight back to waiting —
     # every other number on the panel is still the number the drive last gave us.
-    # The guard on $drawn keeps the lamp from appearing on its own over whatever
-    # stage is still on screen during the lead-in, before the first frame exists.
+    # The guard on $drawn keeps the lamp off a terminal that has no panel to put
+    # it on.
     if [ "$chunk" = "$SCAN_MARK" ]; then
       frame=$(( frame + SCAN_STEP ))
-      [ "$drawn" -eq 1 ] && scan_row "$frame" "$lines"
+      [ "$drawn" -eq 1 ] || continue
+
+      # The drive has stopped talking with the disc all but full: the audio is
+      # down and this is the lead-out. Said outright, and the bar taken to the
+      # end, because the last thing cdrecord reports is a second or so short of
+      # the last track and it then spends half a minute saying nothing — which
+      # left the panel stopped just under 100% until the disc was ejected out
+      # from under it. Reversible on purpose: a drive that was only pausing
+      # takes the panel straight back to the figures in its next message.
+      if [ "$phase" = write ] && [ "$pct" -ge "$TAIL_PCT" ] \
+         && [ $(( SECONDS - last_msg )) -ge "$TAIL_QUIET" ]; then
+        phase=tail; done_mb=$total_mb; pct=100; eta='--:--'
+      fi
+
+      # Through both silences the clock is the one number that can move, and a
+      # clock that moves is the difference between a drive still working and a
+      # drive that has died. Once a second, not on every tick: a whole frame
+      # twenty times over to advance one digit is nineteen redraws wasted, and
+      # the lamp's own row is all the other nineteen ticks have to say.
+      if [ "$phase" != write ] && [ "$SECONDS" -ne "$last_sec" ]; then
+        last_sec=$SECONDS; mmssv "$SECONDS"; el=$MMSS; burn_frame
+      elif [ "$wide" -eq 1 ]; then
+        scan_row "$frame" "$lines"
+      fi
       continue
     fi
     [[ "$chunk" =~ Track[[:space:]]+0*([0-9]+):[[:space:]]+([0-9]+)[[:space:]]+of[[:space:]]+([0-9]+)[[:space:]]+MB ]] || continue
-    trk="${BASH_REMATCH[1]}"; mb_done="${BASH_REMATCH[2]}"
+    trk="${BASH_REMATCH[1]}"; mb_done="${BASH_REMATCH[2]}"; mb_trk="${BASH_REMATCH[3]}"
+    phase=write; last_msg=$SECONDS
 
-    # cdrecord counts MB per track; accumulate finished tracks for a disc total.
+    # cdrecord counts MB per track, so the disc total is the tracks already
+    # finished plus this one's progress. Finished means the whole of a track,
+    # not the last figure reported before the drive moved on to the next one:
+    # it speaks about once a second and stops a fraction of a megabyte short of
+    # every boundary, and carrying that shortfall forward is how a full disc
+    # arrived at 97% and stayed there — twenty-eight tracks, half a megabyte
+    # apiece, fifteen megabytes that were written and never counted.
     if [ "$trk" -ne "$last_trk" ]; then
-      base_mb=$done_mb; last_trk=$trk
+      base_mb=$(( base_mb + trk_mb )); last_trk=$trk
     fi
-    done_mb=$((base_mb + mb_done))
+    trk_mb=$mb_trk
+    done_mb=$(( base_mb + mb_done ))
+    # cdrecord's megabytes and ours are both roundings of the same bytes, but of
+    # different numbers of them — its per track, ours of the image in one piece —
+    # so the sum of its can land a little past our total. Clamped for the readout
+    # only: $base_mb keeps the unclamped running total, so a disc that overshoots
+    # here cannot lose the megabytes back again at the next track boundary.
+    [ "$done_mb" -gt "$total_mb" ] && done_mb=$total_mb
 
     buf="--"; spd="--"
     [[ "$chunk" =~ buf[[:space:]]+([0-9]+)% ]] && buf="${BASH_REMATCH[1]}"
@@ -2073,55 +2217,7 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
       continue
     fi
 
-    printf '%b' "$home"
-
-    if [ "$wide" -eq 0 ]; then
-      filled=$(( pct * BAR_WIDTH / 100 ))
-      bar=''
-      for (( i = 0; i < BAR_WIDTH; i++ )); do
-        if [ "$i" -lt "$filled" ]; then bar="${bar}▓"; else bar="${bar}░"; fi
-      done
-      printf '\033[K  %b%s DISC %d OF %d%b\n' "$AMBER" "$verb" "$disc_no" "$disc_of" "$OFF"
-      printf '\033[K  %b▐%b%b%s%b%b▌%b %b%3d%%%b\n' \
-        "$ETCH" "$OFF" "$AMBER" "$bar" "$OFF" "$ETCH" "$OFF" "$AMBER" "$pct" "$OFF"
-      printf '\033[K  %bTRACK%b %d/%d  %bDATA%b %d/%d MB  %b%sx%b\n' \
-        "$ETCH" "$OFF" "$trk" "$ntracks" "$ETCH" "$OFF" "$done_mb" "$total_mb" \
-        "$ETCH" "$spd" "$OFF"
-      printf '\033[K  %bBUFFER%b %s%%  %bELAPSED%b %s  %bLEFT%b %s\n%b' \
-        "$ETCH" "$OFF" "$buf" "$ETCH" "$OFF" "$el" "$ETCH" "$OFF" "$eta" "$tail"
-      continue
-    fi
-
-    # Header, laid out exactly like every other stage's, and the album under it
-    # for the same reason: the thing on screen while a disc is being written
-    # should be recognisably the thing that was on screen while it was planned.
-    #
-    # %3d, not %d: the rule is sized from what is left after the meta, so a
-    # percentage that grows a digit would shorten the rule by one and the whole
-    # header would twitch sideways twice a burn.
-    printf -v meta '%s · DISC %d OF %d · %3d%%' "$verb" "$disc_no" "$disc_of" "$pct"
-    printf '\033[K'; faceplate "$meta"
-    printf '\033[K\n'
-    printf '\033[K    %b%-8s%b %s\n' "$ETCH" ALBUM "$OFF" "${ALBUM:-—}"
-    printf '\033[K\n'
-
-    title='—'
-    [ "$trk" -ge 1 ] && [ "$trk" -le "${#IDX[@]}" ] && title=${P_TITLE[${IDX[$(( trk - 1 ))]}]}
-    fitv "$title" 46
-    printf '\033[K    %b%-8s%b %02d OF %02d  %s\n' \
-      "$ETCH" TRACK "$OFF" "$trk" "$ntracks" "$FIT"
-    printf '\033[K    %b%-8s%b %d OF %d MB AT %sx\n' \
-      "$ETCH" WRITTEN "$OFF" "$done_mb" "$total_mb" "$spd"
-    printf '\033[K    %b%-8s%b %s%%   %bELAPSED%b %s   %bREMAINING%b %s\n\033[K\n' \
-      "$ETCH" BUFFER "$OFF" "$buf" "$ETCH" "$OFF" "$el" \
-      "$ETCH" "$OFF" "$eta"
-
-    head=$(( total_mb > 0 ? done_mb * STRIP_WIDTH * 8 / total_mb : 0 ))
-    [ "$head" -gt $(( STRIP_WIDTH * 8 )) ] && head=$(( STRIP_WIDTH * 8 ))
-    bandbar "$head"; burn_scan "$frame"
-    printf '\033[K  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$BANDBAR" "$ETCH" "$OFF"
-    printf '\033[K  %b▐%b%b%b▌%b\n%b' "$ETCH" "$OFF" "$SCANBAR" "$ETCH" "$OFF" "$tail"
-    drawn=1
+    burn_frame
   done
 
   # Hand the cursor back only to a terminal that is about to get its prompt. On
@@ -2134,17 +2230,25 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
 
 # Stands in for cdrecord under --demo so the display can be previewed dry.
 # Sizes itself like a real disc rather than from the sample files.
+#
+# The silences are as much the point of it as the numbers are. A real drive says
+# nothing at all while it spins up, calibrates and writes the lead-in; it speaks
+# about once a second while writing, so it stops short of every track boundary
+# rather than landing on it; and it goes quiet again for the lead-out. Those
+# three are precisely what the panel has to cover out of its own pocket, so a
+# stand-in that streams tidily from nothing to the last megabyte would rehearse
+# the easy part of the display and none of the hard part.
 fake_cdrecord() {
   local ntracks=$1 mb_per=$2 t mb
+  sleep 6
   for ((t = 1; t <= ntracks; t++)); do
-    for ((mb = 0; mb <= mb_per; mb += 2)); do
+    for ((mb = 0; mb <= mb_per - 3; mb += 2)); do
       printf 'Track %02d: %4d of %4d MB written (fifo 100%%) [buf  97%%]  8.0x.\r' \
         "$t" "$mb" "$mb_per"
       sleep 0.03
     done
-    printf 'Track %02d: %4d of %4d MB written (fifo 100%%) [buf  97%%]  8.0x.\r' \
-      "$t" "$mb_per" "$mb_per"
   done
+  sleep 8
   printf '\n'
 }
 
@@ -2404,6 +2508,17 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
       dd if=/dev/zero bs=1 count=$(( SECTOR - rem )) status=none >> "$IMAGE" 2>/dev/null
     fi
   done
+
+  # The head reaches the end of the bar before the panel changes hands. Each
+  # frame above is drawn ahead of the track it names, so without this the last
+  # thing the conversion says is whatever it read when the final track started —
+  # 95% on a long album — and it says it for as long as that track and the cue
+  # sheet after it take. The bar the burn opens with starts from an empty disc,
+  # so this is the only place the conversion's own half of the wait can finish.
+  if [ "$SCREEN" -eq 1 ]; then
+    stage_convert "$d" "${#IDX[@]}" "${#IDX[@]}" \
+      "${P_TITLE[${IDX[$(( ${#IDX[@]} - 1 ))]}]}" $(( STRIP_WIDTH * 8 ))
+  fi
 
   DATA=$(( $(file_size "$IMAGE") - HDR ))
   patch_le32 "$IMAGE" 4  $(( DATA + 36 ))
