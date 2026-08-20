@@ -54,7 +54,7 @@ line for each:
   ✓  cdrecord             Cdrecord 3.02a09
   ✓  cue + CD-Text        cdrecord supports cuefile= and -text
   ✓  cdda2wav             present — --verify can read discs back
-  ✓  drive                cdrecord can open dev=IOCompactDiscServices
+  ✓  drive                cdrecord can open dev=IODVDServices/0
   ✓  drive CD-Text        Does write CD-Text
   ✓  drive --dummy        Does support test writing
   ✓  media                blank CD-R ready
@@ -148,7 +148,7 @@ a terminal to draw on.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `BURNCD_SPEED` | `8` | Burn speed. Lower is safer on cheap media. |
-| `BURNCD_DEV` | `IOCompactDiscServices` | cdrecord device. A DVD-capable drive needs `IODVDServices` instead — see troubleshooting. |
+| `BURNCD_DEV` | auto-detected | cdrecord device. Set it only to override the search — see troubleshooting. |
 | `BURNCD_SECONDS` | `4797` | Disc capacity. 4797 = 79:57, see below. |
 | `BURNCD_MINUTES` | — | Same thing in whole minutes, if you prefer. |
 | `BURNCD_LEVEL` | `off` | `album`, `track` or `off` — leveling without the flag. |
@@ -609,16 +609,15 @@ Run `burncd --demo` on any folder to see all of this without a disc in the drive
 
 **`cdrecord not found`** — `brew install cdrtools`.
 
-**cdrecord can't find the drive.** `--check` fails with `cannot open
-dev=IOCompactDiscServices`, usually while `drutil` still reports the drive fine.
-The default device name is the IOKit class for a **CD-only** drive; almost every
-USB drive sold now is a DVD combo, and those register as `IODVDServices`:
+**cdrecord can't find the drive.** `--check` fails with `no drive answered`,
+usually while `drutil` still reports the drive fine. burncd tries the three IOKit
+classes an optical drive can register as — `IODVDServices`, then
+`IOCompactDiscServices`, then `IOBDServices`, unit 0 and 1 of each — and keeps
+the first one cdrecord can open, so this should not need setting. (Almost every
+USB drive sold now is a DVD combo and comes up as `IODVDServices/0`, even when
+all you ever put in it is a CD-R.)
 
-```bash
-export BURNCD_DEV=IODVDServices
-```
-
-If that isn't it either, ask cdrecord what it can see:
+If none of them answered, ask cdrecord what it can see:
 
 ```bash
 cdrecord -scanbus
@@ -631,12 +630,14 @@ What does **not** work is a `/dev/` path: cdrecord wants an IOKit class name or 
 bus address, and `dev=/dev/disk4` fails the same way the wrong class name does,
 which makes it easy to mistake for the same problem.
 
-This is the one thing that usually needs adjusting on a new machine. Once you
-know the right value, put it in your shell profile and forget it:
+Once you know the right value, put it in your shell profile and forget it:
 
 ```bash
-echo 'export BURNCD_DEV=IODVDServices' >> ~/.zshrc
+echo 'export BURNCD_DEV=1,0,0' >> ~/.zshrc
 ```
+
+A device set by hand is never second-guessed: burncd skips the search entirely
+and reports failures against the name you gave it.
 
 **The burn failed and mentioned CD-Text or the cue sheet.** Some drives and some
 cdrecord builds don't handle it. `burncd --check` says which of the two is the

@@ -27,7 +27,7 @@
 #
 # Env overrides:
 #   BURNCD_SPEED   burn speed (default 8)
-#   BURNCD_DEV     cdrecord device (default IOCompactDiscServices)
+#   BURNCD_DEV     cdrecord device (default: whichever one the drive answers to)
 #   BURNCD_SECONDS disc capacity in seconds (default 4797 = 79:57, a real 80min blank)
 #   BURNCD_MINUTES same, in whole minutes, if you prefer
 #   BURNCD_LEVEL   album | track | off — default for --level (default off)
@@ -70,7 +70,7 @@ UTF8_PROBE='é'
 if [ "${#UTF8_PROBE}" -eq 1 ]; then UTF8=1; else UTF8=0; fi
 
 SPEED="${BURNCD_SPEED:-8}"
-DEV="${BURNCD_DEV:-IOCompactDiscServices}"
+DEV="${BURNCD_DEV:-}"
 DRY_RUN=0
 DEMO=0
 CHECK=0
@@ -310,6 +310,37 @@ file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
 # between a check that works and one that lies.
 qgrep() { grep "$@" >/dev/null; }
 
+# macOS names an optical drive after the richest media class its driver
+# publishes, not after what you intend to write: a SuperDrive that burns CD-Rs
+# all day comes up as IODVDServices because it can also read a DVD, and
+# IOCompactDiscServices exists only on drives that can do nothing else — which,
+# outside a museum, is none of them. Hard-coding one name is how a working drive
+# with a blank disc in it gets reported as no drive at all, so ask each name in
+# turn and keep the first one cdrecord can actually open. DVD first: it is what
+# every SuperDrive and USB burner still sold answers to.
+#
+# Memoised, because -checkdrive spins the disc up and both --check and the burn
+# want the answer. BURNCD_DEV skips the search entirely — a device that is set
+# by hand is not second-guessed, and its failure is reported against the name
+# that was asked for.
+detect_dev() {
+  [ -n "$DEV" ] && return 0
+  local class n cand
+  for class in IODVDServices IOCompactDiscServices IOBDServices; do
+    for n in 0 1; do
+      cand="$class/$n"
+      if cdrecord -checkdrive dev="$cand" >/dev/null 2>&1; then
+        DEV="$cand"
+        return 0
+      fi
+    done
+  done
+  # Nothing answered. Name the common case anyway so every message downstream
+  # has something concrete to print and -scanbus has something to contradict.
+  DEV="IODVDServices/0"
+  return 1
+}
+
 # Env values reach arithmetic contexts, so reject junk before it becomes a
 # confusing shell error mid-burn.
 numeric() {
@@ -435,9 +466,20 @@ run_check() {
     ck warn "cdda2wav" "missing; --verify will check the TOC only"
   fi
 
+  # Ask what is in the drive before cdrecord is allowed near it. -checkdrive and
+  # -prcap open the device exclusively, and for as long as that lasts macOS lets
+  # go of the media — drutil then reports "No Media Inserted" about a blank that
+  # never moved, and goes on reporting it until something makes the drive spin
+  # up again. Read first, print in place below, and the disc sitting in the tray
+  # is still there when the media line is written.
+  dstat=""
+  if command -v drutil >/dev/null; then
+    dstat=$(drutil status 2>/dev/null || true)
+  fi
+
   # --- drive ----------------------------------------------------------------
   if command -v cdrecord >/dev/null; then
-    if cdrecord -checkdrive dev="$DEV" >/dev/null 2>&1; then
+    if detect_dev; then
       ck ok "drive" "cdrecord can open dev=$DEV"
 
       # The drive itself has to be willing to write CD-Text. Most are; the
@@ -458,18 +500,19 @@ run_check() {
         ck warn "drive --dummy" "drive does not advertise test writing; --dummy may fail"
       fi
     else
-      ck fail "drive" "cannot open dev=$DEV — see 'cdrecord -scanbus'"
+      ck fail "drive" "no drive answered — see 'cdrecord -scanbus'"
     fi
   fi
 
   if command -v drutil >/dev/null; then
-    dstat=$(drutil status 2>/dev/null || true)
     if [ -z "$dstat" ]; then
       ck warn "media" "no optical drive visible to drutil"
     elif printf '%s' "$dstat" | qgrep -i 'no media'; then
       ck warn "media" "drive found, no disc inserted"
     else
-      mtype=$(printf '%s' "$dstat" | awk -F: '/Type:/ { gsub(/^ +/, "", $2); print $2; exit }')
+      # drutil packs two columns onto the Type line — "Type: CD-R  Name: /dev/disk8"
+      # — so take the first word after the label and leave the rest of the row.
+      mtype=$(printf '%s' "$dstat" | sed -n 's/.*Type:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
       blank=$(printf '%s' "$dstat" | grep -ci 'blank' || true)
       if [ "$blank" -gt 0 ]; then
         ck ok "media" "blank ${mtype:-disc} ready"
@@ -527,6 +570,11 @@ command -v ffmpeg  >/dev/null || die "ffmpeg not found. brew install ffmpeg"
 command -v ffprobe >/dev/null || die "ffprobe not found. brew install ffmpeg"
 if [ "$DRY_RUN" -eq 0 ] && [ "$DEMO" -eq 0 ]; then
   command -v cdrecord >/dev/null || die "cdrecord not found. brew install cdrtools"
+  # Find the drive now, before an hour of decoding and levelling goes into an
+  # image that has nowhere to be written. A drive that cannot be found here is
+  # not fatal on its own — the disc may simply not be in it yet, and the ask for
+  # media comes later — so this only settles which name the burn will use.
+  detect_dev || true
 fi
 
 # The screen opens here, before the first line of output, and does not close
@@ -2444,8 +2492,8 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
         | grep -v 'MB written' | grep -v '^[[:space:]]*$' \
         | tail -15 | sed 's/^/    /' >&2 || true
     fi
-    die "cdrecord failed on disc $d (exit $rc).
-  Drive not found?          cdrecord -scanbus   then set BURNCD_DEV.
+    die "cdrecord failed on disc $d (exit $rc), writing to dev=$DEV.
+  Wrong drive?              cdrecord -scanbus   then set BURNCD_DEV.
   Choked on CD-Text or cue? retry with --no-cdtext.
   Either way, burncd --check reports what this machine supports."
   fi
