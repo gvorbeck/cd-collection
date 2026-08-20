@@ -102,6 +102,14 @@ PANEL=69
 # tracks across a half-full disc had about two cells each, and at two cells the
 # difference between a 3:14 and a 2:58 is not a thing the bar can say.
 STRIP_WIDTH=$(( PANEL - 2 ))
+# The lamp under the burn meter keeps its own time rather than the drive's.
+# SCAN_TICK is how often it is redrawn and SCAN_STEP how far it travels each
+# time, so its speed in cells per second is STEP over TICK — forty of them here,
+# about a second and a half to cross the panel. Much faster and the trail smears
+# into a blur; much slower and it starts to read as a progress bar, which is the
+# one thing it must not be mistaken for: the bar above it is the progress.
+SCAN_TICK=0.05
+SCAN_STEP=2
 # Every row of the edit panel that is not a track, and the shortest window that
 # can still hold one. Up here rather than beside tui_fit_rows, which is what
 # counts with them, because the decision to open the screen at all is made before
@@ -567,8 +575,11 @@ while IFS= read -r f; do
 
   # Tags are often "3/12" — keep the part before the slash. Missing track
   # numbers sort last, so tagged files keep their album order regardless.
+  # 10# forces base ten: taggers write "08", and bash printf reads a leading
+  # zero as octal and rejects 08 and 09 outright.
   trk="${trk%%/*}";  case "$trk"  in ''|*[!0-9]*) trk=9999;  UNTAGGED=1 ;; esac
   disc="${disc%%/*}"; case "$disc" in ''|*[!0-9]*) disc=1 ;; esac
+  trk=$(( 10#$trk )); disc=$(( 10#$disc ))
 
   FILES+=("$f")
   # Round up, never down: underestimating runtime is how a burn dies at 99%.
@@ -1825,12 +1836,17 @@ stage_done() {  # stage_done <meta>
 # A lamp sweeping a dark field, under the bar where the plan puts its minute
 # scale. It exists because a burn is twenty minutes of a number that moves once
 # every few seconds, and a panel with nothing moving on it looks like a panel
-# that has died. This one moves on every message from the drive, so a stall in
-# the write is a stall on the screen — which is exactly the thing you want to be
-# able to see from across the room.
+# that has died.
+#
+# It used to step once per message from the drive, which made it an honest stall
+# indicator and a poor lamp: cdrecord speaks about once a second, so a crossing
+# of the panel took the better part of two minutes and the thing read as stuck
+# rather than alive — the exact impression it is there to prevent. It runs on its
+# own clock now (scan_ticker, below), and showing a stall falls to the numbers
+# above it, which are the ones you would read to confirm it anyway.
 #
 # Left in $SCANBAR rather than printed, for the same reason as bandbar: this is
-# redrawn on every message from the drive and a $( ) around it is a fork per frame.
+# redrawn twenty times a second and a $( ) around it is a fork per frame.
 SCANBAR=''
 burn_scan() {  # burn_scan <frame> -> $SCANBAR
   local f=$1 span p dir j dd out='' curfg='' curbg=''
@@ -1859,6 +1875,44 @@ burn_scan() {  # burn_scan <frame> -> $SCANBAR
   return 0
 }
 
+# The clock the lamp runs on. Rather than a second process drawing on the panel —
+# two writers to one screen is a race, and the loser is a frame torn down the
+# middle — the ticker writes records into the same stream the drive's output
+# arrives on, and render() treats a tick as simply another kind of message: one
+# that moves the lamp and touches nothing else. The loop stays a single blocking
+# read, which is the only reason any of this is safe.
+#
+# A tick is two bytes, far under the smallest atomic pipe write, so one can never
+# land inside a line from the drive. The marker is a control character for the
+# same reason it is short: nothing cdrecord says contains it.
+#
+# read -t would be the obvious alternative and is not available: bash 3.2, which
+# is the bash macOS ships and the one this script is written for, takes only
+# whole seconds there and drops whatever it had read when the timer fires.
+SCAN_MARK=$'\016'
+scan_ticker() {
+  trap - EXIT INT
+  while :; do
+    printf '%s\r' "$SCAN_MARK"
+    sleep "$SCAN_TICK"
+  done
+}
+
+# One frame of the lamp, in place, with the rest of the panel left alone — on a
+# tick it is the only thing that has changed. On the alternate screen the panel
+# starts at the home position, so the lamp's row is a fixed line number and can
+# be addressed outright; in a scrolling terminal the cursor is parked on the line
+# below the panel between frames, so it is one line up and straight back down.
+scan_row() {  # scan_row <frame> <panel-height>
+  burn_scan "$1"
+  if [ "$SCREEN" -eq 1 ]; then
+    printf '\033[%d;1H\033[K  %b▐%b%b%b▌%b' "$2" "$ETCH" "$OFF" "$SCANBAR" "$ETCH" "$OFF"
+  else
+    printf '\033[1A\r\033[K  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$SCANBAR" "$ETCH" "$OFF"
+  fi
+  return 0
+}
+
 # Parses cdrecord's progress output and redraws the display in place.
 # cdrecord emits carriage-return-delimited lines like:
 #   Track 03:  12 of  45 MB written (fifo 100%) [buf  98%]  8.0x.
@@ -1867,6 +1921,7 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
   local chunk trk mb_done buf spd title verb meta head frame=0
   local base_mb=0 last_trk=1 done_mb=0 pct=0 eta="--:--" plain_trk=0
   local elapsed el i tty=0 cols lines wide=0 bar filled home='' tail=''
+  local drawn=0 tick=''
   local -a bdur
 
   [ -t 1 ] && tty=1
@@ -1916,7 +1971,26 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
     fi
   fi
 
+  # The drive's output and the lamp's clock, merged into one stream so the loop
+  # below has a single thing to block on. cat is what carries the drive's half of
+  # it; when that ends the ticker is killed, which is what closes the pipe and
+  # lets the loop see the end of the burn. No ticker unless there is a panel with
+  # a lamp on it to redraw — piped to a log, this is one process and no timers.
+  {
+    if [ "$tty" -eq 1 ] && [ "$wide" -eq 1 ]; then scan_ticker & tick=$!; fi
+    cat
+    [ -n "$tick" ] && kill "$tick" 2>/dev/null
+  } |
   while IFS= read -r -d $'\r' chunk || [ -n "$chunk" ]; do
+    # A tick. Step the lamp, redraw its row, and go straight back to waiting —
+    # every other number on the panel is still the number the drive last gave us.
+    # The guard on $drawn keeps the lamp from appearing on its own over whatever
+    # stage is still on screen during the lead-in, before the first frame exists.
+    if [ "$chunk" = "$SCAN_MARK" ]; then
+      frame=$(( frame + SCAN_STEP ))
+      [ "$drawn" -eq 1 ] && scan_row "$frame" "$lines"
+      continue
+    fi
     [[ "$chunk" =~ Track[[:space:]]+0*([0-9]+):[[:space:]]+([0-9]+)[[:space:]]+of[[:space:]]+([0-9]+)[[:space:]]+MB ]] || continue
     trk="${BASH_REMATCH[1]}"; mb_done="${BASH_REMATCH[2]}"
 
@@ -1951,7 +2025,6 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
       continue
     fi
 
-    frame=$(( frame + 1 ))
     printf '%b' "$home"
 
     if [ "$wide" -eq 0 ]; then
@@ -2000,6 +2073,7 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
     bandbar "$head"; burn_scan "$frame"
     printf '\033[K  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$BANDBAR" "$ETCH" "$OFF"
     printf '\033[K  %b▐%b%b%b▌%b\n%b' "$ETCH" "$OFF" "$SCANBAR" "$ETCH" "$OFF" "$tail"
+    drawn=1
   done
 
   # Hand the cursor back only to a terminal that is about to get its prompt. On
@@ -2341,7 +2415,16 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
 
     # tee keeps the real output: render() drops every line it cannot parse,
     # which would otherwise hide the reason a burn failed.
-    ( cd "$WORK" && cdrecord "${OPTS[@]}" \
+    #
+    # The cd is silenced because of what bash says when it cannot work out the
+    # directory it is leaving — which happens whenever burncd was started from a
+    # shell whose cwd has since been moved into ~/.Trash, where macOS denies the
+    # walk up to the root. The chdir itself is fine, $WORK being absolute, but
+    # the complaint goes to stderr and lands in the middle of the panel. Nothing
+    # is lost by dropping it: a cd that genuinely fails still skips cdrecord,
+    # still leaves the subshell non-zero, and is still caught below, where the
+    # message is a better one than bash was going to give.
+    ( cd "$WORK" 2>/dev/null && cdrecord "${OPTS[@]}" \
         dev="$DEV" speed="$SPEED" driveropts=burnfree \
         cuefile="$(basename "$CUE")" 2>&1 ) \
       | tee "$WORK/cdrecord-$d.log" \
