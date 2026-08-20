@@ -117,6 +117,14 @@ SCAN_STEP=2
 # of it used to be spent on a frozen panel that then ejected the disc. Silence
 # this far in is the lead-out; anywhere earlier it is a drive taking its time,
 # and the numbers above the lamp are the honest way to see that.
+#
+# Measured against the last track as well as against the disc, because the disc
+# figure has a ceiling below 100 that no burn can reach. cdrecord rounds each
+# track down to a whole megabyte on its own; we round the image down once. The
+# sum of its roundings is short of ours by up to a megabyte a track — half of one
+# on average, fifteen across a twenty-eight track disc, and enough to hold a
+# forty-track disc of short pieces under ninety-three percent for the whole of
+# its burn. The last track's own progress carries no such arrears.
 TAIL_QUIET=3
 TAIL_PCT=95
 # Every row of the edit panel that is not a track, and the shortest window that
@@ -2066,7 +2074,7 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
   local chunk trk=0 mb_done mb_trk buf="--" spd="--" verb frame=0
   local base_mb=0 trk_mb=0 last_trk=1 done_mb=0 pct=0 eta="--:--" plain_trk=0
   local elapsed el="0:00" i tty=0 cols lines wide=0 home='' tail=''
-  local drawn=0 tick='' phase=lead last_sec=0 last_msg=0
+  local drawn=0 tick='' phase=lead last_sec=0 last_msg=0 trk_pct=0
   local -a bdur
 
   [ -t 1 ] && tty=1
@@ -2147,22 +2155,37 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
 
       # The drive has stopped talking with the disc all but full: the audio is
       # down and this is the lead-out. Said outright, and the bar taken to the
-      # end, because the last thing cdrecord reports is a second or so short of
-      # the last track and it then spends half a minute saying nothing — which
-      # left the panel stopped just under 100% until the disc was ejected out
-      # from under it. Reversible on purpose: a drive that was only pausing
-      # takes the panel straight back to the figures in its next message.
-      if [ "$phase" = write ] && [ "$pct" -ge "$TAIL_PCT" ] \
-         && [ $(( SECONDS - last_msg )) -ge "$TAIL_QUIET" ]; then
-        phase=tail; done_mb=$total_mb; pct=100; eta='--:--'
+      # end, because cdrecord's last word on a burn comes at the end of the last
+      # track and it then spends half a minute saying nothing — which left the
+      # panel stopped short of 100% until the disc was ejected out from under it.
+      # Either reading of "all but full" will do. The disc's own percentage is
+      # the plain one but it cannot be trusted to arrive, for the rounding
+      # arrears set out at TAIL_PCT; the last track finishing is the reading that
+      # holds on a disc of forty short ones. Both are wanted: a drive that stalls
+      # early in a long final track is on the last track and nowhere near done,
+      # and neither reading calls that a lead-out. Reversible on purpose besides
+      # — a drive that was only pausing takes the panel straight back to the
+      # figures in its next message.
+      if [ "$phase" = write ] && [ $(( SECONDS - last_msg )) -ge "$TAIL_QUIET" ] \
+         && { [ "$pct" -ge "$TAIL_PCT" ] \
+              || { [ "$trk" -ge "$ntracks" ] && [ "$trk_pct" -ge "$TAIL_PCT" ]; }; }; then
+        phase=tail; done_mb=$total_mb; pct=100
+        # Nothing is being written now: the buffer is draining and the table of
+        # contents is going down. A buffer percentage and a speed left over from
+        # the last track would be the panel's only two dishonest numbers, and
+        # the dashes are what it says everywhere else for a figure the drive has
+        # not given it.
+        eta='--:--'; buf='--'; spd='--'
       fi
 
-      # Through both silences the clock is the one number that can move, and a
+      # Through every silence the clock is the one number that can move, and a
       # clock that moves is the difference between a drive still working and a
-      # drive that has died. Once a second, not on every tick: a whole frame
+      # drive that has died — which is worth most in the middle of a burn, where
+      # silence is a buffer running dry or a head recalibrating rather than a
+      # disc that is nearly done. Once a second, not on every tick: a whole frame
       # twenty times over to advance one digit is nineteen redraws wasted, and
       # the lamp's own row is all the other nineteen ticks have to say.
-      if [ "$phase" != write ] && [ "$SECONDS" -ne "$last_sec" ]; then
+      if [ "$SECONDS" -ne "$last_sec" ]; then
         last_sec=$SECONDS; mmssv "$SECONDS"; el=$MMSS; burn_frame
       elif [ "$wide" -eq 1 ]; then
         scan_row "$frame" "$lines"
@@ -2174,12 +2197,12 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
     phase=write; last_msg=$SECONDS
 
     # cdrecord counts MB per track, so the disc total is the tracks already
-    # finished plus this one's progress. Finished means the whole of a track,
-    # not the last figure reported before the drive moved on to the next one:
-    # it speaks about once a second and stops a fraction of a megabyte short of
-    # every boundary, and carrying that shortfall forward is how a full disc
-    # arrived at 97% and stayed there — twenty-eight tracks, half a megabyte
-    # apiece, fifteen megabytes that were written and never counted.
+    # finished plus this one's progress. Finished means the track's own stated
+    # size rather than the last figure reported before the drive moved on. The
+    # two agree on the drives to hand — every track's closing line names the
+    # whole of it — but the stated size is the one that cannot quietly lose a
+    # megabyte to a drive that falls silent a moment early, and it costs a
+    # variable to prefer it.
     if [ "$trk" -ne "$last_trk" ]; then
       base_mb=$(( base_mb + trk_mb )); last_trk=$trk
     fi
@@ -2198,6 +2221,11 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
 
     [ "$total_mb" -gt 0 ] && pct=$(( done_mb * 100 / total_mb ))
     [ "$pct" -gt 100 ] && pct=100
+    # How far into this one track the drive is, kept for the lead-out test alone.
+    # Both its numbers come from the same line, so it is free of the rounding
+    # that keeps the disc's percentage off 100.
+    trk_pct=0
+    [ "$mb_trk" -gt 0 ] && trk_pct=$(( mb_done * 100 / mb_trk ))
 
     # No forks in the redraw path: $SECONDS is a builtin and mmssv leaves its
     # answer in a variable. This loop runs on every message from the drive, and a
@@ -2207,6 +2235,9 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
       mmssv $(( elapsed * (100 - pct) / pct )); eta=$MMSS
     fi
     mmssv "$elapsed"; el=$MMSS
+    # This frame is this second's frame. Claiming it keeps the tick that lands
+    # after it from drawing the same second over again.
+    last_sec=$elapsed
 
     if [ "$tty" -eq 0 ]; then
       # Piped or logged: one line per track instead of redraw escapes.
@@ -2232,21 +2263,30 @@ render() {  # render <disc-no> <of> <ntracks> <total-mb>
 # Sizes itself like a real disc rather than from the sample files.
 #
 # The silences are as much the point of it as the numbers are. A real drive says
-# nothing at all while it spins up, calibrates and writes the lead-in; it speaks
-# about once a second while writing, so it stops short of every track boundary
-# rather than landing on it; and it goes quiet again for the lead-out. Those
-# three are precisely what the panel has to cover out of its own pocket, so a
-# stand-in that streams tidily from nothing to the last megabyte would rehearse
-# the easy part of the display and none of the hard part.
+# nothing at all while it spins up, calibrates and writes the lead-in, and it
+# goes quiet again for the lead-out. Those two are precisely what the panel has
+# to cover out of its own pocket, so a stand-in that streamed tidily from nothing
+# to the last megabyte would rehearse the easy part of the display and none of
+# the hard part.
+#
+# What it does not do is stop short of a track. A real drive closes every track
+# on the track's full size, checked against a burn's own log, and the arrears
+# that keep the disc's bar off 100 are the per-track rounding described at
+# TAIL_PCT instead. The caller hands the panel a disc total a megabyte a track
+# larger than the tracks add up to, so the bar comes up short here the way it
+# does on a real burn and the lead-out has something real to paper over.
 fake_cdrecord() {
   local ntracks=$1 mb_per=$2 t mb
   sleep 6
   for ((t = 1; t <= ntracks; t++)); do
-    for ((mb = 0; mb <= mb_per - 3; mb += 2)); do
+    for ((mb = 0; mb < mb_per; mb += 2)); do
       printf 'Track %02d: %4d of %4d MB written (fifo 100%%) [buf  97%%]  8.0x.\r' \
         "$t" "$mb" "$mb_per"
       sleep 0.03
     done
+    printf 'Track %02d: %4d of %4d MB written (fifo 100%%) [buf  97%%]  8.0x.\r' \
+      "$t" "$mb_per" "$mb_per"
+    sleep 0.03
   done
   sleep 8
   printf '\n'
@@ -2562,8 +2602,10 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
   set +e
   if [ "$DEMO" -eq 1 ]; then
     demo_per=55
+    # One megabyte a track more than the tracks report, standing in for the
+    # rounding arrears of a real burn — see fake_cdrecord.
     fake_cdrecord "${#IDX[@]}" "$demo_per" \
-      | render "$d" "$NDISCS" "${#IDX[@]}" $(( demo_per * ${#IDX[@]} ))
+      | render "$d" "$NDISCS" "${#IDX[@]}" $(( (demo_per + 1) * ${#IDX[@]} ))
     rc=0
   else
     # -dao: disc-at-once, required for CD-Text and for zero gaps.

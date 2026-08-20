@@ -82,8 +82,8 @@ So: `--check` proves the hardware and tooling are there. `--demo` proves the
 *output* is right — it converts the audio and builds the real image and cue sheet,
 then runs the burn screen against them so you can see the whole thing land without
 a disc in the drive. Its stand-in for the drive is deliberately as awkward as a
-real one: it goes quiet for the lead-in, stops short of every track boundary
-instead of landing on it, and goes quiet again for the lead-out, so the demo
+real one: it goes quiet for the lead-in, reports a disc that adds up to less than
+the disc it was given, and goes quiet again for the lead-out, so the demo
 rehearses the parts of the display that have to work unaided. `--dummy` proves
 the drive actually accepts that cue sheet and CD-Text, by doing the entire burn
 for real minus the laser.
@@ -576,11 +576,24 @@ drives the better part of a minute. Both get the panel above, said outright:
 ```
 
 Same layout, with `--` standing in for the fields the drive has not filled yet,
-so nothing on screen moves when a phase changes hands. The lamp sweeps and the
-clock runs throughout, which is the difference between a drive getting ready and
-a drive that has died. The lead-out ends the bar at 100%: the audio is down by
-then, and the panel used to stop a percent or two short and stay there until the
-disc was ejected out from under it.
+so nothing on screen moves when a phase changes hands. The lead-out reads the
+same way at the other end — dashes for the speed and the buffer, because nothing
+is being written by then and a speed left over from the last track would be the
+one dishonest number on the panel.
+
+The lamp sweeps and the clock runs throughout, and that goes for a silence
+anywhere in a burn, not just the two at its ends. A drive that stops mid-disc to
+recalibrate or to let its buffer refill leaves every other number where it was,
+and a running clock is the difference between that and a drive that has died.
+
+The lead-out ends the bar at 100%, which the megabytes on their own never quite
+reach: the drive rounds each track down to a whole megabyte as it goes, we round
+the disc down once, and the difference is half a megabyte a track — fifteen of
+them across a twenty-eight track disc. The panel used to stop there and stay
+until the disc was ejected out from under it. It now treats the last track
+finishing as the end of the audio whatever the disc's percentage says, so a disc
+of forty short pieces, whose bar tops out in the low nineties, still gets its
+lead-out and its 100%.
 
 There used to be a disc filling in from the hub outward here, in cyan and white.
 It was a second, unrelated instrument bolted to the side of this one, and it said
