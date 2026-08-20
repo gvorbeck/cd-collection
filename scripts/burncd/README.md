@@ -68,6 +68,27 @@ It exits non-zero if anything is a hard failure, so it works in a script too.
 Warnings are usually fine — "no disc inserted" just means you haven't put one in
 yet.
 
+### The check before each disc
+
+`--check` is about the machine. Every burn also checks the disc, at the moment
+you press ⏎ at the INSERT prompt and before any audio is converted:
+
+- an empty tray, and it asks again;
+- a disc that isn't blank, and it says what kind it is and asks again;
+- a blank too short for what's planned for it — a 74-minute disc under a
+  79-minute plan — and it says both figures and asks again.
+
+The capacity comes from the disc's ATIP, which is the pre-groove's own record of
+where it ends; nothing else can tell a 74-minute blank from an 80-minute one.
+Two seconds, against the five minutes of converting that used to happen before
+cdrecord got a look at the disc and refused it.
+
+A drive that can't be read this way isn't held against the disc: if the ATIP
+can't be read after a couple of tries, burncd says so once and goes ahead. If
+yours reports nonsense, `--no-media-check` (or `BURNCD_NO_MEDIA_CHECK=1`) skips
+the lot. `--demo` never runs it — there's no drive involved. `--dummy` does: a
+rehearsal on a disc that can't take the job is a rehearsal of nothing.
+
 ### The three rehearsals, in order
 
 They do different things and none of them replaces another:
@@ -140,6 +161,7 @@ names it in the summary.
 | `burncd --split-long DIR` | Allow cutting a track that's longer than a disc |
 | `burncd --no-cdtext DIR` | Burn without CD-Text (fallback if the drive balks) |
 | `burncd --from-disc 3 DIR` | Resume a multi-disc job at disc 3 |
+| `burncd --no-media-check DIR` | Don't look at the disc before converting |
 | `burncd --help` | Usage |
 
 `-n` is worth using the first time on any album. It costs nothing and shows you
@@ -158,6 +180,8 @@ a terminal to draw on.
 | `BURNCD_LEVEL` | `off` | `album`, `track` or `off` — leveling without the flag. |
 | `BURNCD_LUFS` | `-11` | Loudness target. See leveling below. |
 | `BURNCD_PEAK` | `-1` | True-peak ceiling in dBTP. |
+| `BURNCD_NO_MEDIA_CHECK` | unset | Set to anything to skip the pre-burn look at the disc. |
+| `BURNCD_KEEP_WORK` | unset | Set to keep the image, cue sheet and drive logs, and print where they are. |
 
 ### Why 79:57 and not 80:00
 
@@ -191,9 +215,26 @@ tells you it did that — check the order before confirming.
 **CD-Text.** Album title, album artist, and per-track titles and artists are
 written into the disc's lead-in, so a car stereo or CD player that supports
 CD-Text shows names instead of "Track 01". This comes from the same tags used for
-ordering, so if the files are tagged you get it for free. CD-Text lives in a small
-area of the lead-in; if an album's metadata is too big for it, per-track artists
-are dropped automatically and you're told. `--no-cdtext` turns it off entirely.
+ordering, so if the files are tagged you get it for free. `--no-cdtext` turns it
+off entirely.
+
+CD-Text lives in a small area of the lead-in, and a drive handed more of it than
+fits refuses the whole burn. So the metadata is measured against that budget —
+the real one, in 18-byte packs, not the size of the cue sheet — and if it doesn't
+fit it is shed a step at a time, remeasuring after each, until it does: per-track
+artists first, then track titles cut to 60 characters and then to 30, then track
+titles altogether, and only if none of that is enough, CD-Text for that disc.
+Every step says so. A disc that arrives with fewer of its names on it is a better
+outcome than one the drive won't write.
+
+The alphabet on a disc is ISO-8859-1, not Unicode, whatever your files are tagged
+in. Accented Latin text is converted and comes out right on the player: `Björk`
+is written as one byte, not as the two the panel drew it with. Anything with a
+close equivalent is transliterated — an em dash becomes a hyphen, `Tōkyō` becomes
+`Tokyo` — and anything with none, Japanese and Chinese and Cyrillic among them,
+cannot ride in a CD-Text pack at all and is dropped. burncd counts what it had to
+approximate and says so before the burn, once per disc. The panel and the plan go
+on showing the real titles; it is only the lead-in that is limited.
 
 **No gaps between tracks.** Each disc is assembled as one continuous
 sector-aligned image and written disc-at-once, with track boundaries as index
@@ -256,7 +297,7 @@ in advance:
    0               20               40               60             80
 
    ↑↓  SELECT    ⇧↑↓  MOVE    ⏎  RENAME    A  ARTIST    X  DROP
-   U  UNDO    R  RESET    B  BURN    Q  QUIT
+   S  SPLIT    U  UNDO    R  RESET    B  BURN    Q  QUIT
 ```
 
 That is the screen with its colour stripped out. On the terminal the `BURNCD`
@@ -289,7 +330,8 @@ cost to opening the screen, looking, and leaving with `q`.
 | `⏎` | Rename whatever is selected — album, artist, year, or a track title. |
 | `a` | Edit the artist of the selected track, for compilations with a different name per track. |
 | `x` or `d` | Drop the selected track from the burn. The file is untouched. |
-| `u` | Undo the last drop, back into the position it came from. |
+| `s` | Start a new disc at the selected track. Press it again to clear the break. |
+| `u` | Undo the last edit, whatever it was — a rename, a move, a drop, a break, or `r`. |
 | `r` | Reset everything to the original tags and order. |
 | `b` or `space` | Accept the plan and burn. |
 | `q` | Quit without burning. |
@@ -310,6 +352,30 @@ The disc layout is recomputed after every change, so on a multi-disc set the
 see a disc boundary land somewhere better in real time. The meter always shows
 the disc the cursor is on, with a minute scale under it, so "where does this
 disc end?" and "how full is it?" are the same glance.
+
+When the balancer's idea of where a disc ends isn't yours — a set with an obvious
+seam, a double album whose sides are the point — `s` puts the break where you
+want it and the rest rebalances around it:
+
+```
+  ━━ DISC 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    01  Short 1                             Long Artist           10:00
+  ━━ DISC 2 · SPLIT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ▶ 02  The Long Piece                      Long Artist           85:00
+  ━━ DISC 3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    03  Short 3                             Long Artist           10:00
+```
+
+`· SPLIT` marks the boundaries you asked for, so a break of yours is never
+confused with one the arithmetic chose. Breaks only ever add discs — a disc can
+still fill up and break on its own before the next one you set — and under
+`--split-long` a track cut across discs won't take a second break on its later
+parts.
+
+Every one of these edits is undoable, one step at a time, including `r`: the
+stack holds the last hundred changes and `u` walks back through renames, moves,
+drops, breaks and resets alike. Pressing `⏎` on a title to read it in full and
+`⏎` again to keep it doesn't count as a change and doesn't cost an undo.
 
 The screen draws on the terminal's alternate buffer, and that buffer is opened
 before the first line of output rather than after — even "reading the folder"
@@ -691,6 +757,35 @@ burncd --no-cdtext ~/Music/Album
 That falls back to burning without names in the lead-in. Everything else —
 gapless, ordering, splitting — is unchanged. To find out which it is without
 spending discs, run the same album with `--dummy` twice, once each way.
+
+To see what was actually handed to the drive, keep the working files:
+
+```bash
+BURNCD_KEEP_WORK=1 burncd --demo ~/Music/Album
+```
+
+The path is printed when the run ends. In it are the WAV image, the cue sheet
+with the CD-Text exactly as it would be written, and cdrecord's own log for each
+disc — none of which normally survives the exit. `hexdump -C disc1.cue` is how to
+confirm an accented title went out as one byte per character rather than two.
+
+**It keeps asking for a disc that's already in the drive.** The pre-burn check
+believes the drive, and some report the tray as empty for a second after anything
+else has spoken to them — burncd reads twice before saying so, but a drive that
+insists can't be argued with. Confirm with `burncd --check`, and if that's happy
+while the burn isn't:
+
+```bash
+burncd --no-media-check ~/Music/Album
+```
+
+Same for a drive that reports a blank as too small: `--no-media-check` skips the
+capacity test with it, and cdrecord still refuses anything that genuinely won't
+fit — just five minutes later, after the audio has been converted.
+
+**"This blank holds 74:00 and disc 1 is 79:12."** The disc's own ATIP says it is a
+74-minute blank. Use an 80-minute one, or `BURNCD_MINUTES=73` to plan for what you
+have and start again.
 
 **A disc failed partway through a multi-disc job.** Don't restart from disc 1:
 

@@ -12,6 +12,7 @@
 #   burncd --no-cdtext ~/Music/X   burn without CD-Text (fallback path)
 #   burncd --from-disc 3 ~/Music/X resume a multi-disc job at disc 3
 #   burncd --demo ~/Music/Album    build everything and simulate the burn
+#   burncd --no-media-check ~/M/X  burn without looking at the disc first
 #
 # Takes aiff, flac, mp3, ogg, wav, m4a, opus — anything ffmpeg reads.
 # Track order comes from embedded metadata, not filenames. Audio is converted
@@ -22,8 +23,9 @@
 #
 # The plan shown before every burn is the editor, not a printout: arrow to any
 # row and press Enter to fix a title, a for the artist, shift-arrows to
-# reorder, x to drop a track, b to burn, q to walk away. Tags are wrong often
-# enough that spotting it on the preview has to be all it takes.
+# reorder, s to start a new disc at that track, x to drop it, u to undo any of
+# that, b to burn, q to walk away. Tags are wrong often enough that spotting it
+# on the preview has to be all it takes.
 #
 # Env overrides:
 #   BURNCD_SPEED   burn speed (default 8)
@@ -33,6 +35,8 @@
 #   BURNCD_LEVEL   album | track | off — default for --level (default off)
 #   BURNCD_LUFS    loudness target in LUFS (default -11, typical for a CD)
 #   BURNCD_PEAK    true-peak ceiling in dBTP (default -1)
+#   BURNCD_NO_MEDIA_CHECK  set to skip the pre-burn look at the disc
+#   BURNCD_KEEP_WORK       set to keep the image, cue sheet and drive logs
 
 set -euo pipefail
 
@@ -76,9 +80,15 @@ DEMO=0
 CHECK=0
 SPLIT_LONG=0
 CDTEXT=1
+CDTEXT_THIS=1          # CD-Text for the disc in the tray, after the budget ladder
 DUMMY=0
 VERIFY=0
 FROM=1
+# Look at the disc in the tray before spending minutes converting into an image
+# it cannot hold. Off by hand for the drive whose reporting lies — see
+# media_check, which would rather proceed than block a good burn.
+MEDIA_CHECK=1
+[ -n "${BURNCD_NO_MEDIA_CHECK:-}" ] && MEDIA_CHECK=0
 
 # Loudness matching. "album" applies one gain to the whole job so the relative
 # levels the mastering engineer chose survive; "track" levels each track on its
@@ -402,6 +412,7 @@ while [ $# -gt 0 ]; do
     --no-cdtext)    CDTEXT=0 ;;
     --dummy)        DUMMY=1 ;;
     --verify)       VERIFY=1 ;;
+    --no-media-check) MEDIA_CHECK=0 ;;
     --level)        LEVEL=album ;;
     --level=*)      LEVEL="${1#--level=}" ;;
     --from-disc)    shift; FROM="${1:-}"
@@ -646,6 +657,16 @@ while IFS= read -r f; do
   disc="${disc%%/*}"; case "$disc" in ''|*[!0-9]*) disc=1 ;; esac
   trk=$(( 10#$trk )); disc=$(( 10#$disc ))
 
+  # A tag with a tab or a newline in it is rare and entirely possible, and it
+  # breaks two things at once: a newline inside a panel row bends the frame the
+  # width code works so hard to keep square, and a tab is the field separator
+  # the undo stack encodes its records with. Flattened to a space here, once,
+  # rather than defended against at every place a title is printed or stored.
+  title=${title//[$'\t\n\r']/ }
+  artist=${artist//[$'\t\n\r']/ }
+  album=${album//[$'\t\n\r']/ }
+  aartist=${aartist//[$'\t\n\r']/ }
+
   FILES+=("$f")
   # Round up, never down: underestimating runtime is how a burn dies at 99%.
   DURS+=("$(awk -v d="$dur" 'BEGIN { printf "%d", (d == int(d) ? d : int(d) + 1) }')")
@@ -856,13 +877,33 @@ build_playlist() {
 
 # -------------------------------------------------------------- disc layout --
 
+# Where the disc has to change hands because someone said so. Keyed by source
+# track index — the track that starts the new disc — rather than by position in
+# the running order, so a break survives the reordering that happens around it.
+# Sparse, and read with :- everywhere, because bash 3.2 has no associative
+# arrays; DISC_AT is keyed the same way for the same reason.
+BREAK_AT=()
+
+# Does a new disc start at this playlist entry because it was asked for?
+#
+# Entry 0 never does: it starts disc 1 already, and counting it would open an
+# empty disc before it. Neither do the later parts of a track --split-long cut
+# up — the break belongs to the track, and the track begins at its first part.
+breaks_here() {  # breaks_here <playlist-index>
+  local i=$1
+  [ "$i" -gt 0 ] || return 1
+  [ -n "${BREAK_AT[${P_SRC[$i]}]:-}" ] || return 1
+  [ "${P_SRC[$i]}" != "${P_SRC[$(( i - 1 ))]}" ] || return 1
+  return 0
+}
+
 # Greedy fill: how many discs does a given per-disc capacity need?
 discs_needed() {
   local cap=$1 count=1 cur=0 ntrk=0 i d
   for i in $(seq 0 $(( N - 1 ))); do
     d=${P_DUR[$i]}
     [ "$d" -le "$cap" ] || { echo 0; return; }   # single track too long
-    if [ $((cur + d)) -gt "$cap" ] || [ "$ntrk" -ge "$MAX_TRACKS" ]; then
+    if breaks_here "$i" || [ $((cur + d)) -gt "$cap" ] || [ "$ntrk" -ge "$MAX_TRACKS" ]; then
       count=$((count + 1)); cur=$d; ntrk=1
     else
       cur=$((cur + d)); ntrk=$((ntrk + 1))
@@ -884,6 +925,11 @@ layout_discs() {
 
   # Using the fewest discs, find the smallest capacity that still fits in that
   # many. This balances the discs instead of cramming disc 1 and leaving a stub.
+  #
+  # A forced break needs nothing special here. Breaks only ever end a disc
+  # early, never overflow one, so every capacity the search tries still fits in
+  # the same number of discs it would have without them — and the tracks either
+  # side of a break go on balancing among themselves.
   LO=0
   for i in $(seq 0 $(( N - 1 ))); do [ "${P_DUR[$i]}" -gt "$LO" ] && LO=${P_DUR[$i]}; done
   HI=$CAPACITY
@@ -898,7 +944,7 @@ layout_discs() {
   # Must use the same rule as discs_needed() or the plan and the layout diverge.
   DISC_OF=(); cur=0; ntrk=0; disc=1
   for i in $(seq 0 $(( N - 1 ))); do
-    if [ $((cur + P_DUR[i])) -gt "$BALANCED" ] || [ "$ntrk" -ge "$MAX_TRACKS" ]; then
+    if breaks_here "$i" || [ $((cur + P_DUR[i])) -gt "$BALANCED" ] || [ "$ntrk" -ge "$MAX_TRACKS" ]; then
       disc=$((disc + 1)); cur=${P_DUR[$i]}; ntrk=1
     else
       cur=$((cur + P_DUR[i])); ntrk=$((ntrk + 1))
@@ -914,6 +960,19 @@ replan() { build_playlist; layout_discs; [ "$LEVEL" = album ] && compute_album_g
 replan
 
 # ----------------------------------------------------------------- the plan --
+
+# How many of the breaks in BREAK_AT actually open a disc in the current running
+# order. Not the same as how many are set: dropping the track a break belongs to
+# leaves the break behind, harmless and unspent, and it should not be counted in
+# the reason the plan gives for a second disc.
+break_count() {  # break_count -> $NBREAKS
+  local i
+  NBREAKS=0
+  for i in $(seq 0 $(( N - 1 ))); do
+    breaks_here "$i" && NBREAKS=$(( NBREAKS + 1 ))
+  done
+  return 0
+}
 
 plan_header() {
   local why
@@ -938,14 +997,27 @@ plan_header() {
   if [ "$NDISCS" -gt 1 ]; then
     # Say which limit was hit — runtime and the 99-track ceiling are very
     # different problems, and "too long" is wrong when the album is 9 minutes.
+    # So is either of them when nothing was hit at all and the break is one you
+    # set on the panel, which is why the reason can be empty here.
+    why=""
     if [ "$N" -gt "$MAX_TRACKS" ] && [ "$TOTAL" -gt "$CAPACITY" ]; then
       why="too long and over $MAX_TRACKS tracks"
     elif [ "$N" -gt "$MAX_TRACKS" ]; then
       why="over the $MAX_TRACKS track limit of a CD"
-    else
+    elif [ "$TOTAL" -gt "$CAPACITY" ]; then
       why="too long for one disc"
     fi
-    printf '  Splitting across %d discs — %s\n' "$NDISCS" "$why"
+    break_count
+    if [ "$NBREAKS" -gt 0 ]; then
+      if [ -n "$why" ]; then why="$why, and broken where you asked"
+      else why="broken where you asked"
+      fi
+    fi
+    if [ -n "$why" ]; then
+      printf '  Splitting across %d discs — %s\n' "$NDISCS" "$why"
+    else
+      printf '  Splitting across %d discs\n' "$NDISCS"
+    fi
   fi
   return 0
 }
@@ -1360,7 +1432,7 @@ TUI_ROWS=0
 # Everything the panel says, printed to stdout so tui_draw can capture the whole
 # frame and hand it to the terminal in one piece. Split out for that reason only.
 tui_frame() {  # tui_frame <cursor> <top> <visible-rows> <status>
-  local cur=$1 top=$2 vis=$3 status=$4 i k row d lastd=0 meta
+  local cur=$1 top=$2 vis=$3 status=$4 i k row d lastd=0 meta rlbl
   local body ts='' ds='' last=$(( top + vis ))
 
   # DISC_AT is built by tui_fit_rows before this runs — it has to be, since the
@@ -1399,8 +1471,13 @@ tui_frame() {  # tui_frame <cursor> <top> <visible-rows> <status>
     i=${ORDER[$k]}
     d=${DISC_AT[$i]:-1}
     if [ "$d" != "$lastd" ]; then
-      repv '━' $(( PANEL - 9 - ${#d} ))
-      printf '  %b━━ DISC %s %s%b\n' "$ETCH" "$d" "$REP" "$OFF"
+      # A boundary you set reads differently from one the balancer worked out,
+      # so it says so. The rule is shortened by exactly what the label costs,
+      # which keeps every disc rule the same 69 columns as the rest of the grid.
+      rlbl=''
+      [ "$k" -gt 0 ] && [ -n "${BREAK_AT[$i]:-}" ] && rlbl=' · SPLIT'
+      repv '━' $(( PANEL - 9 - ${#d} - ${#rlbl} ))
+      printf '  %b━━ DISC %s%s %s%b\n' "$ETCH" "$d" "$rlbl" "$REP" "$OFF"
       lastd=$d
     fi
     if [ "$cur" -eq "$row" ]; then
@@ -1426,7 +1503,7 @@ tui_frame() {  # tui_frame <cursor> <top> <visible-rows> <status>
 
   printf '\n'
   keys '↑↓' SELECT '⇧↑↓' MOVE '⏎' RENAME A ARTIST X DROP
-  keys U UNDO R RESET B BURN Q QUIT
+  keys S SPLIT U UNDO R RESET B BURN Q QUIT
   [ -n "$status" ] && printf '\n  %b%s%b\n' "$AMBER" "$status" "$OFF"
   return 0
 }
@@ -1511,7 +1588,59 @@ tui_disc_map() {
   done
 }
 
-DROPPED=()
+# Every edit the panel makes is reversible, which means every edit has to say
+# what things were before it happened. One stack, TAB-separated, kind first:
+#
+#   state <label> <order> <breaks>          the running order and the disc breaks
+#   text  <label> <title|artist> <i> <old>  one track's title or artist
+#   field <label> <album|aartist|year> <old>
+#
+# A snapshot rather than an inverse operation for anything structural. An order
+# is a hundred bytes, replan() re-derives everything else from it, and a stack
+# of snapshots cannot get the inverse of a move wrong the way a stack of moves
+# can. The label is what the status line says was restored, so undoing a drop
+# still reads "TRACK RESTORED" the way it always did.
+#
+# Splitting the record on a tab is safe because tags are stripped of tabs and
+# newlines as they are read — see the sanitising in the metadata loop.
+UNDO=()
+UNDO_MAX=100
+
+undo_push() {  # undo_push <record>
+  UNDO+=("$1")
+  # Bounded: an hour of nudging a running order should not grow a stack without
+  # end, and nobody is undoing ninety edits ago one keystroke at a time.
+  if [ "${#UNDO[@]}" -gt "$UNDO_MAX" ]; then
+    unset "UNDO[0]"
+    UNDO=(${UNDO[@]+"${UNDO[@]}"})
+  fi
+  return 0
+}
+
+undo_state()  { breaks_dump; undo_push "state	$1	${ORDER[*]}	$BREAKS_STR"; }
+undo_text()   { undo_push "text	$1	$2	$3	$4"; }
+undo_field()  { undo_push "field	$1	$2	$3"; }
+
+# The disc breaks as a list of source indices, and back again. Walked rather
+# than read out of the array's own keys, because ${!BREAK_AT[@]} on an empty
+# array under set -u is one of the places bash 3.2 gives up.
+BREAKS_STR=''
+breaks_dump() {
+  local i=0
+  BREAKS_STR=''
+  while [ "$i" -lt "${#FILES[@]}" ]; do
+    [ -n "${BREAK_AT[$i]:-}" ] && BREAKS_STR="$BREAKS_STR $i"
+    i=$(( i + 1 ))
+  done
+  return 0
+}
+breaks_load() {  # breaks_load <space-joined source indices>
+  local i
+  BREAK_AT=()
+  for i in $1; do BREAK_AT[$i]=1; done
+  return 0
+}
+
 tui_edit() {
   local cur=3 top=0 status="" n k tmp
 
@@ -1556,9 +1685,14 @@ tui_edit() {
       $'\033[6~')       cur=$(( cur + TUI_ROWS )) ;;
       $'\n'|$'\r')      tui_rename "$cur" ;;
       a|A)              tui_artist "$cur" ;;
+      s|S)              tui_break "$cur" ;;
       x|d)              tui_drop "$cur" && status="▪ TRACK DROPPED — PRESS U TO UNDO" ;;
-      u|U)              tui_undo && status="▪ TRACK RESTORED" ;;
-      r|R)              ORDER=("${ORDER_ORIG[@]}"); DROPPED=(); replan
+      # tui_undo and tui_break say what happened themselves: one of them has a
+      # different answer for every kind of edit and the other has three. bash
+      # scopes dynamically, so $status here is the one they assign to.
+      u|U)              tui_undo ;;
+      r|R)              undo_state PLAN
+                        ORDER=("${ORDER_ORIG[@]}"); BREAK_AT=(); replan
                         status="▪ ORIGINAL ORDER RESTORED" ;;
       b|B|$' ')         break ;;
       q|Q)              die "cancelled" ;;
@@ -1578,45 +1712,97 @@ tui_move() {  # tui_move <cursor> <delta>
   [ "$cur" -ge 3 ] || return 1
   k=$(( cur - 3 )); j=$(( k + delta ))
   [ "$j" -ge 0 ] && [ "$j" -lt "${#ORDER[@]}" ] || return 1
+  undo_state ORDER
   tmp=${ORDER[$k]}; ORDER[$k]=${ORDER[$j]}; ORDER[$j]=$tmp
   replan
   return 0
 }
 
+# Start a new disc at the selected track, or stop doing so. The break is
+# remembered against the track rather than against the row it is on, so it
+# travels with the track when the order changes around it — and survives being
+# dropped and undone, which a position would not.
+#
+# Two rows cannot take one: the header fields, which are not tracks, and the
+# first track, which opens disc 1 whatever anyone does. Both say so rather than
+# doing nothing, since a key that silently declines reads as a key that is
+# broken.
+# Always succeeds, including when it declines: the key dispatch calls this on
+# its own rather than as half of an && list, and under set -e a bare call that
+# answers "no" that way takes the whole editor with it. What happened is in
+# $status, which is where the panel reads it anyway.
+tui_break() {  # tui_break <cursor>
+  local cur=$1 k i
+  if [ "$cur" -lt 3 ]; then
+    status="▪ SELECT A TRACK TO START A DISC AT"
+    return 0
+  fi
+  k=$(( cur - 3 ))
+  if [ "$k" -eq 0 ]; then
+    status="▪ THE FIRST TRACK ALREADY STARTS DISC 1"
+    return 0
+  fi
+  i=${ORDER[$k]}
+  undo_state "DISC BREAK"
+  if [ -n "${BREAK_AT[$i]:-}" ]; then
+    unset "BREAK_AT[$i]"
+    status="▪ DISC BREAK CLEARED"
+  else
+    BREAK_AT[$i]=1
+    status="▪ DISC BREAK SET — A NEW DISC STARTS HERE"
+  fi
+  replan
+  return 0
+}
+
+# Nothing is pushed onto the undo stack for an edit that changed nothing.
+# Pressing Enter on a title and then Enter again to keep it is how anyone
+# checks what a row says in full, and it should not cost an undo that appears
+# to do nothing when it is spent.
 tui_rename() {  # tui_rename <cursor>
-  local cur=$1 i
+  local cur=$1 i new
   case "$cur" in
-    0) ALBUM=$(tui_prompt "ALBUM" "$ALBUM") ;;
-    1) ALBUM_ARTIST=$(tui_prompt "ARTIST" "$ALBUM_ARTIST") ;;
-    2) YEAR=$(tui_prompt "YEAR" "$YEAR") ;;
+    0) new=$(tui_prompt "ALBUM" "$ALBUM")
+       [ "$new" = "$ALBUM" ] || { undo_field ALBUM album "$ALBUM"; ALBUM=$new; } ;;
+    1) new=$(tui_prompt "ARTIST" "$ALBUM_ARTIST")
+       [ "$new" = "$ALBUM_ARTIST" ] || {
+         undo_field ARTIST aartist "$ALBUM_ARTIST"; ALBUM_ARTIST=$new; } ;;
+    2) new=$(tui_prompt "YEAR" "$YEAR")
+       [ "$new" = "$YEAR" ] || { undo_field YEAR year "$YEAR"; YEAR=$new; } ;;
     *) i=${ORDER[$(( cur - 3 ))]}
-       TITLES[$i]=$(tui_prompt "TITLE" "${TITLES[$i]}")
+       new=$(tui_prompt "TITLE" "${TITLES[$i]}")
+       [ "$new" = "${TITLES[$i]}" ] || {
+         undo_text TITLE title "$i" "${TITLES[$i]}"; TITLES[$i]=$new; }
        replan ;;
   esac
   return 0
 }
 
 tui_artist() {  # tui_artist <cursor>
-  local cur=$1 i
+  local cur=$1 i new
   if [ "$cur" -lt 3 ]; then
-    ALBUM_ARTIST=$(tui_prompt "ARTIST" "$ALBUM_ARTIST")
+    new=$(tui_prompt "ARTIST" "$ALBUM_ARTIST")
+    [ "$new" = "$ALBUM_ARTIST" ] || {
+      undo_field ARTIST aartist "$ALBUM_ARTIST"; ALBUM_ARTIST=$new; }
   else
     i=${ORDER[$(( cur - 3 ))]}
-    ARTISTS[$i]=$(tui_prompt "ARTIST" "${ARTISTS[$i]}")
+    new=$(tui_prompt "ARTIST" "${ARTISTS[$i]}")
+    [ "$new" = "${ARTISTS[$i]}" ] || {
+      undo_text ARTIST artist "$i" "${ARTISTS[$i]}"; ARTISTS[$i]=$new; }
     replan
   fi
   return 0
 }
 
-# Dropping keeps the removed entry and its position, so undo puts it back
-# where it was rather than on the end.
+# The whole order goes on the undo stack first, so a track comes back where it
+# was rather than on the end — and so does everything else the drop moved.
 tui_drop() {  # tui_drop <cursor>
   local cur=$1 k j
   local -a rest; rest=()
   [ "$cur" -ge 3 ] || return 1
   [ "${#ORDER[@]}" -gt 1 ] || return 1
   k=$(( cur - 3 ))
-  DROPPED+=("$k:${ORDER[$k]}")
+  undo_state TRACK
   for j in $(seq 0 $(( ${#ORDER[@]} - 1 ))); do
     [ "$j" -eq "$k" ] || rest+=("${ORDER[$j]}")
   done
@@ -1625,21 +1811,35 @@ tui_drop() {  # tui_drop <cursor>
   return 0
 }
 
+# One step back, whatever the last step was. $status is tui_edit's, reached the
+# way burn_frame reaches render()'s locals — the message is different for every
+# kind of record and the record is the only thing that knows which. Succeeds
+# even with nothing to undo, for the reason given above tui_break.
 tui_undo() {
-  local last k i j placed=0
-  local -a out; out=()
-  [ "${#DROPPED[@]}" -gt 0 ] || return 1
-  last=${DROPPED[$(( ${#DROPPED[@]} - 1 ))]}
-  k=${last%%:*}; i=${last#*:}
-  for j in $(seq 0 $(( ${#ORDER[@]} - 1 ))); do
-    [ "$j" -eq "$k" ] && { out+=("$i"); placed=1; }
-    out+=("${ORDER[$j]}")
-  done
-  [ "$placed" -eq 1 ] || out+=("$i")
-  ORDER=("${out[@]}")
-  unset "DROPPED[$(( ${#DROPPED[@]} - 1 ))]"
-  DROPPED=(${DROPPED[@]+"${DROPPED[@]}"})
+  local rec kind label a b c
+  if [ "${#UNDO[@]}" -eq 0 ]; then
+    status="▪ NOTHING TO UNDO"
+    return 0
+  fi
+  rec=${UNDO[$(( ${#UNDO[@]} - 1 ))]}
+  unset "UNDO[$(( ${#UNDO[@]} - 1 ))]"
+  UNDO=(${UNDO[@]+"${UNDO[@]}"})
+
+  IFS=$'\t' read -r kind label a b c <<< "$rec"
+  case "$kind" in
+    state) ORDER=($a); breaks_load "$b" ;;
+    text)  case "$a" in
+             title)  TITLES[$b]=$c ;;
+             artist) ARTISTS[$b]=$c ;;
+           esac ;;
+    field) case "$a" in
+             album)   ALBUM=$b ;;
+             aartist) ALBUM_ARTIST=$b ;;
+             year)    YEAR=$b ;;
+           esac ;;
+  esac
   replan
+  status="▪ $label RESTORED"
   return 0
 }
 
@@ -2324,9 +2524,132 @@ patch_le32() {  # file offset value
 }
 
 # CD-Text fields are plain text in the lead-in. Quotes and control characters
-# break the cue parser, and very long strings overflow the packs.
-cue_text() {
-  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177"\\' | cut -c1-120
+# break the cue parser, very long strings overflow the packs — and the alphabet
+# on the disc is ISO-8859-1, not UTF-8. The panel goes to real trouble to draw
+# "Björk" correctly; handing the drive the UTF-8 bytes behind it puts two
+# characters of mojibake on every player in the house.
+#
+# The answer comes back in $CUET rather than on stdout, because the callers sit
+# inside the cue sheet's redirection and a command substitution there would fork
+# away the lossy count along with everything else it learned.
+CUET=''
+CDTEXT_LOSSY=0
+
+cue_textv() {  # cue_textv <string> [max-bytes]
+  local s max=${2:-120}
+  s=$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177"\\')
+  CUET=''
+  [ -n "$s" ] || return 0
+
+  # Most fields are plain ASCII, which is a subset of both alphabets: nothing to
+  # convert, and nothing that can be lost. Worth the test — it keeps the count
+  # honest on a machine whose iconv is missing or unhelpful.
+  case $s in
+    *[!\ -~]*) ;;
+    *) CUET=$(printf '%s' "$s" | LC_ALL=C cut -b"1-$max"); return 0 ;;
+  esac
+
+  # Best effort into the disc's alphabet: transliterate what has a near
+  # equivalent (— becomes -), drop what has none, and if that leaves nothing at
+  # all — a title written entirely in kana — fall back to ASCII and then to a
+  # plain strip, so an iconv that is missing or unhelpful still returns
+  # something rather than an error message.
+  CUET=$(printf '%s' "$s" | iconv -c -f UTF-8 -t 'ISO-8859-1//TRANSLIT' 2>/dev/null || true)
+  [ -n "$CUET" ] || CUET=$(printf '%s' "$s" | iconv -c -f UTF-8 -t 'ASCII//TRANSLIT' 2>/dev/null || true)
+  [ -n "$CUET" ] || CUET=$(printf '%s' "$s" | LC_ALL=C tr -d '\200-\377')
+
+  # Whether anything was given up, decided by taking it back: convert the result
+  # to UTF-8 again and see whether it is still the title we were handed. This is
+  # the only test that holds on both iconvs — exit status does not. Apple's
+  # transliterates as a matter of course and reports success for "Tōkyō" it has
+  # quietly turned into "Tokyo", and reports failure for every character -c
+  # correctly dropped from a line it otherwise converted perfectly well.
+  if [ "$(printf '%s' "$CUET" | iconv -f ISO-8859-1 -t UTF-8 2>/dev/null || true)" != "$s" ]; then
+    CDTEXT_LOSSY=$(( CDTEXT_LOSSY + 1 ))
+  fi
+
+  # Cut last, where it is safe. One ISO-8859-1 byte is one character, so a byte
+  # count is a character count and cannot leave half of one behind; cutting the
+  # UTF-8 first would hand iconv a broken tail to choke on.
+  CUET=$(printf '%s' "$CUET" | LC_ALL=C cut -b"1-$max")
+
+  # Whatever was dropped took its spacing with it: "東京 Nights" arrives here as
+  # " Nights", and a title indented by one space on the player's display is a
+  # worse answer than the same title without it. Trimmed with expansions rather
+  # than another fork.
+  CUET=${CUET#"${CUET%%[! ]*}"}
+  CUET=${CUET%"${CUET##*[! ]}"}
+  return 0
+}
+
+# What a field costs in the lead-in. CD-Text rides in 18-byte packs carrying 12
+# bytes of payload each, and a field is stored with a terminating NUL, so a
+# 12-character title takes two packs rather than one. Measuring the cue sheet
+# instead — which is what the budget check used to do — counts TRACK, INDEX and
+# FILE lines that never reach the lead-in at all, and misses the packs' own
+# overhead in both directions.
+CDTEXT_BYTES=0
+cdtext_add() {  # cdtext_add <converted-field>
+  local n=${#1}
+  [ "$n" -gt 0 ] || return 0
+  CDTEXT_BYTES=$(( CDTEXT_BYTES + ( (n + 12) / 12 ) * 18 ))
+  return 0
+}
+
+# The cue sheet for the disc being built, at a given amount of CD-Text. Written
+# again a rung lower whenever what it holds will not fit in the lead-in:
+#
+#   0  everything
+#   1  no per-track artists
+#   2  track titles cut to 60 characters
+#   3  track titles cut to 30
+#   4  no track titles — the disc's own title and artist only
+#   5  no CD-Text at all
+#
+# The redirection is on a group rather than a subshell, so the byte and loss
+# counts the conversions gather are still here when it returns.
+write_cue() {  # write_cue <level>
+  local lvl=$1 n i tmax=120 text=$CDTEXT
+  [ "$lvl" -ge 2 ] && tmax=60
+  [ "$lvl" -ge 3 ] && tmax=30
+  [ "$lvl" -ge 5 ] && text=0
+  CDTEXT_BYTES=0
+  CDTEXT_LOSSY=0
+  {
+    # CD-Text has no year field, so the date can only be a cue comment. Some
+    # rippers and players read REM DATE; a CD player's display never will.
+    # A field that came back empty is one nothing survived — a title written
+    # entirely in an alphabet the disc has no room for. It is left out rather
+    # than written as an empty string: the player shows the same nothing either
+    # way, and the cue sheet stays honest about what it carries.
+    [ -n "$YEAR" ] && { cue_textv "$YEAR"; printf 'REM DATE %s\n' "$CUET"; }
+    if [ "$text" -eq 1 ]; then
+      if [ -n "$ALBUM_ARTIST" ]; then
+        cue_textv "$ALBUM_ARTIST"; cdtext_add "$CUET"
+        [ -n "$CUET" ] && printf 'PERFORMER "%s"\n' "$CUET"
+      fi
+      if [ -n "$ALBUM" ]; then
+        cue_textv "$ALBUM"; cdtext_add "$CUET"
+        [ -n "$CUET" ] && printf 'TITLE "%s"\n' "$CUET"
+      fi
+    fi
+    printf 'FILE "%s" WAVE\n' "$(basename "$IMAGE")"
+    n=0
+    for i in "${IDX[@]}"; do
+      n=$((n + 1))
+      printf '  TRACK %02d AUDIO\n' "$n"
+      if [ "$text" -eq 1 ] && [ "$lvl" -lt 4 ]; then
+        cue_textv "${P_TITLE[$i]}" "$tmax"; cdtext_add "$CUET"
+        [ -n "$CUET" ] && printf '    TITLE "%s"\n' "$CUET"
+        if [ "$lvl" -lt 1 ] && [ -n "${P_ARTIST[$i]}" ]; then
+          cue_textv "${P_ARTIST[$i]}"; cdtext_add "$CUET"
+          [ -n "$CUET" ] && printf '    PERFORMER "%s"\n' "$CUET"
+        fi
+      fi
+      printf '    INDEX 01 %s\n' "$(msf "${STARTS[$((n - 1))]}")"
+    done
+  } > "$CUE"
+  return 0
 }
 
 # --------------------------------------------------------------- verifying --
@@ -2389,6 +2712,113 @@ verify_disc() {  # verify_disc <disc-number> <expected-track-count>
   return "$bad"
 }
 
+# ------------------------------------------------------------------- media --
+
+# Look at the disc in the tray before anything expensive happens because of it.
+#
+# Pressing ⏎ at the INSERT prompt used to be an act of faith: an empty tray, a
+# disc with last year's album already on it, or a 74-minute blank under an
+# 80-minute plan all looked identical from here, and the way you found out was
+# cdrecord refusing the job after five minutes of converting. The drive can
+# answer all three questions in about two seconds.
+#
+# Returns 0 to go ahead, 1 to ask for another disc.
+ATIP_WARNED=0
+media_check() {  # media_check <disc-number>
+  local d=$1 dstat mtype atip lba secs want=0 i tries
+
+  [ "$MEDIA_CHECK" -eq 1 ] || return 0
+  # --demo never goes near a drive; --dummy does, and a rehearsal on a disc that
+  # is too small tells you nothing, so it is checked like any other burn.
+  [ "$DEMO" -eq 0 ] || return 0
+
+  for i in ${IDX[@]+"${IDX[@]}"}; do want=$(( want + P_DUR[i] )); done
+
+  # drutil first, cdrecord second, always. An exclusive open by cdrecord makes
+  # macOS let go of the media, and drutil then reports "No Media Inserted" about
+  # a disc that never moved — the same hazard --check is written around.
+  #
+  # Here that is not enough on its own, because this runs in a loop: the ATIP
+  # read below is exactly such an open, so the reading that follows a refused
+  # disc is taken while the drive is still disowning it, and burncd would tell
+  # you the tray was empty while you were looking straight at the disc in it.
+  # The state clears in about a second, so an empty drive has to say so twice
+  # before it is believed. A tray that really is empty pays a second for that,
+  # once, at a prompt that was already waiting on a human.
+  if command -v drutil >/dev/null; then
+    tries=0
+    while :; do
+      dstat=$(drutil status 2>/dev/null || true)
+      printf '%s' "$dstat" | qgrep -i 'no media' || break
+      [ "$tries" -ge 2 ] && break
+      tries=$(( tries + 1 ))
+      sleep 1
+    done
+    if [ -z "$dstat" ]; then
+      : # no drive visible to drutil; cdrecord below is the authority anyway
+    elif printf '%s' "$dstat" | qgrep -i 'no media'; then
+      note "$(printf '\033[33m!\033[0m The drive is empty — put a blank CD-R in it and press %b ⏎ %b again' \
+        "$CAP" "$OFF")"
+      return 1
+    else
+      # drutil packs two columns onto the Type line — "Type: CD-R  Name: /dev/disk8".
+      mtype=$(printf '%s' "$dstat" | sed -n 's/.*Type:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
+      if ! printf '%s' "$dstat" | qgrep -i 'blank'; then
+        note "$(printf '\033[33m!\033[0m That %s is not blank — burncd writes blanks only. Swap it and press %b ⏎ %b again' \
+          "${mtype:-disc}" "$CAP" "$OFF")"
+        return 1
+      fi
+    fi
+  fi
+
+  # ATIP is the pre-groove's own account of where the disc ends, and the only
+  # honest capacity there is: a 74-minute blank and an 80-minute blank are the
+  # same object to everything else. Lead-out lba / 75 is the length in seconds —
+  # a standard 80-minute blank reads 359849, which is 4797, exactly the default
+  # CAPACITY, so a parse that has gone wrong tends to say so loudly.
+  #
+  # Read up to three times. A drive that has just been asked something else, or
+  # that has been sitting idle long enough to stop the disc, answers the first
+  # request with everything it knows about itself and nothing about the disc,
+  # and is perfectly forthcoming a second later. Taking that first answer at
+  # face value would put "could not read the capacity" in front of half the
+  # burns on this machine.
+  tries=0
+  while :; do
+    atip=$(cdrecord -atip dev="$DEV" 2>&1 || true)
+    lba=$(printf '%s' "$atip" | sed -n 's/.*lead out:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+    [ -n "$lba" ] && break
+    [ "$tries" -ge 2 ] && break
+    tries=$(( tries + 1 ))
+    sleep 1
+  done
+  case ${lba:-x} in
+    ''|*[!0-9]*)
+      # A false negative that blocks a good burn is worse than the problem being
+      # solved, so an unreadable ATIP goes ahead — once, and quietly after that.
+      if [ "$ATIP_WARNED" -eq 0 ]; then
+        ATIP_WARNED=1
+        note "$(printf '\033[33m!\033[0m Could not read the disc'\''s capacity from its ATIP; going ahead on trust')"
+      fi
+      return 0 ;;
+  esac
+
+  secs=$(( lba / 75 ))
+  if [ "$secs" -lt "$want" ]; then
+    note "$(printf '\033[33m!\033[0m This blank holds %s and disc %d is %s. Use an 80-minute disc, or set BURNCD_MINUTES and start again' \
+      "$(mmss "$secs")" "$d" "$(mmss "$want")")"
+    return 1
+  fi
+  # A longer blank than the plan assumed is not a problem, only a waste: the
+  # layout is fixed by now and renumbering discs under a job in progress is the
+  # thing --from-disc exists to avoid.
+  if [ "$secs" -gt $(( CAPACITY + 60 )) ]; then
+    note "$(printf '\033[33m!\033[0m This blank holds %s, more than the %s burncd planned for — BURNCD_MINUTES would use all of it' \
+      "$(mmss "$secs")" "$(mmss "$CAPACITY")")"
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------- burn loop --
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/burncd.XXXXXX")
@@ -2398,7 +2828,21 @@ STARTED=$(date +%s)
 # screen and does not step off it leaves the terminal in raw mode with no cursor.
 # The show-cursor escape is for the unscreened path, and only to a real terminal,
 # so piped output and log files stay clean.
-cleanup() { screen_off; rm -rf "$WORK"; [ -t 1 ] && printf '\033[?25h'; return 0; }
+#
+# BURNCD_KEEP_WORK leaves the image, the cue sheet and the drive's own log where
+# they were written and says where that is. It is how a cue sheet gets read with
+# hexdump rather than guessed at, and how a burn that failed keeps the evidence
+# it failed with instead of having it deleted a second later.
+cleanup() {
+  screen_off
+  if [ -n "${BURNCD_KEEP_WORK:-}" ] && [ -d "$WORK" ]; then
+    printf '\n  work kept in %s\n' "$WORK"
+  else
+    rm -rf "$WORK"
+  fi
+  [ -t 1 ] && printf '\033[?25h'
+  return 0
+}
 trap cleanup EXIT
 trap 'int_nl; cleanup; exit 130' INT
 
@@ -2443,31 +2887,43 @@ for d in $(seq "$FROM" "$NDISCS"); do
   # Wait for a blank disc. On the panel that is a stage of its own, showing this
   # disc exactly as it will be written and offering the way back to the editor;
   # without it, the prompt it always was.
+  #
+  # The prompt is a loop now: media_check says whether what was inserted can
+  # take this disc, and a no puts the question again with the reason above it.
+  # note() has already redrawn the stage around that reason by the time we get
+  # back here, so the retry costs no display machinery of its own.
   if [ "$SCREEN" -eq 1 ]; then
-    stage_insert "$d"
     while :; do
-      # Without this guard, a closed stdin makes the loop exit silently partway
-      # through a multi-disc job, which looks exactly like a successful finish.
-      wait_key || die "stdin closed — burncd needs a terminal to confirm each disc"
-      case "$KEY" in
-        q|Q)          die "cancelled" ;;
-        e|E)          if [ "$d" -eq 1 ] && [ "$FROM" -eq 1 ]; then REEDIT=1; break; fi ;;
-        $'\n'|$' ')   break ;;
-      esac
+      stage_insert "$d"
+      while :; do
+        # Without this guard, a closed stdin makes the loop exit silently partway
+        # through a multi-disc job, which looks exactly like a successful finish.
+        wait_key || die "stdin closed — burncd needs a terminal to confirm each disc"
+        case "$KEY" in
+          q|Q)          die "cancelled" ;;
+          e|E)          if [ "$d" -eq 1 ] && [ "$FROM" -eq 1 ]; then REEDIT=1; break; fi ;;
+          $'\n'|$' ')   break ;;
+        esac
+      done
+      [ "$REEDIT" -eq 1 ] && break
+      media_check "$d" && break
     done
     if [ "$REEDIT" -eq 1 ]; then
       tui_edit
       break
     fi
   else
-    if [ "$NDISCS" -gt 1 ]; then
-      printf '  %bINSERT%b a blank CD-R for disc %d of %d, then press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
-        "$AMBER" "$OFF" "$d" "$NDISCS" "$CAP" "$OFF" "$DIM" "$OFF"
-    else
-      printf '  %bINSERT%b a blank CD-R and press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
-        "$AMBER" "$OFF" "$CAP" "$OFF" "$DIM" "$OFF"
-    fi
-    read -r _ || die "stdin closed — burncd needs a terminal to confirm each disc"
+    while :; do
+      if [ "$NDISCS" -gt 1 ]; then
+        printf '  %bINSERT%b a blank CD-R for disc %d of %d, then press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
+          "$AMBER" "$OFF" "$d" "$NDISCS" "$CAP" "$OFF" "$DIM" "$OFF"
+      else
+        printf '  %bINSERT%b a blank CD-R and press %b ⏎ %b %b(Ctrl-C to stop)%b ' \
+          "$AMBER" "$OFF" "$CAP" "$OFF" "$DIM" "$OFF"
+      fi
+      read -r _ || die "stdin closed — burncd needs a terminal to confirm each disc"
+      media_check "$d" && break
+    done
   fi
 
   IMAGE="$WORK/disc$d.wav"
@@ -2565,32 +3021,31 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
   patch_le32 "$IMAGE" 40 "$DATA"
 
   # --- cue sheet ------------------------------------------------------------
-  {
-    # CD-Text has no year field, so the date can only be a cue comment. Some
-    # rippers and players read REM DATE; a CD player's display never will.
-    [ -n "$YEAR" ] && printf 'REM DATE %s\n' "$(cue_text "$YEAR")"
-    if [ "$CDTEXT" -eq 1 ]; then
-      [ -n "$ALBUM_ARTIST" ] && printf 'PERFORMER "%s"\n' "$(cue_text "$ALBUM_ARTIST")"
-      [ -n "$ALBUM" ]        && printf 'TITLE "%s"\n'     "$(cue_text "$ALBUM")"
-    fi
-    printf 'FILE "%s" WAVE\n' "$(basename "$IMAGE")"
-    n=0
-    for i in "${IDX[@]}"; do
-      n=$((n + 1))
-      printf '  TRACK %02d AUDIO\n' "$n"
-      if [ "$CDTEXT" -eq 1 ]; then
-        printf '    TITLE "%s"\n' "$(cue_text "${P_TITLE[$i]}")"
-        [ -n "${P_ARTIST[$i]}" ] && printf '    PERFORMER "%s"\n' "$(cue_text "${P_ARTIST[$i]}")"
-      fi
-      printf '    INDEX 01 %s\n' "$(msf "${STARTS[$((n - 1))]}")"
+  # CD-Text lives in the lead-in, which is small, and a drive that is handed
+  # more of it than fits rejects the whole burn. Shed it a rung at a time,
+  # measuring again after each — the ladder is in write_cue — and stop at the
+  # first one that fits. A disc that arrives with fewer of its names on it beats
+  # one the drive refuses to write.
+  CDTEXT_THIS=$CDTEXT
+  lvl=0
+  write_cue "$lvl"
+  if [ "$CDTEXT" -eq 1 ]; then
+    while [ "$CDTEXT_BYTES" -gt "$CDTEXT_BUDGET" ] && [ "$lvl" -lt 5 ]; do
+      lvl=$(( lvl + 1 ))
+      write_cue "$lvl"
     done
-  } > "$CUE"
-
-  # CD-Text lives in the lead-in, which is small. If the metadata is enormous
-  # the drive rejects the whole burn, so shed per-track artists first.
-  if [ "$CDTEXT" -eq 1 ] && [ "$(file_size "$CUE")" -gt "$CDTEXT_BUDGET" ]; then
-    note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; dropping per-track artists')"
-    grep -v '^    PERFORMER' "$CUE" > "$CUE.trim" && mv "$CUE.trim" "$CUE"
+    case $lvl in
+      1) note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; dropped the per-track artists')" ;;
+      2) note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; shortened the track titles')" ;;
+      3) note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; shortened the track titles further')" ;;
+      4) note "$(printf '\033[33m!\033[0m CD-Text too large for the lead-in; dropped the track titles')" ;;
+      5) CDTEXT_THIS=0
+         note "$(printf '\033[33m!\033[0m CD-Text will not fit this disc'\''s lead-in; writing disc %d without it' "$d")" ;;
+    esac
+    if [ "$CDTEXT_LOSSY" -gt 0 ]; then
+      note "$(printf '\033[33m!\033[0m CD-Text: %d field(s) are outside the disc'\''s character set (ISO-8859-1) and were approximated' \
+        "$CDTEXT_LOSSY")"
+    fi
   fi
 
   total_mb=$(( DATA / 1048576 ))
@@ -2614,7 +3069,7 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
     # -eject: pop the disc when done, which also cues the next one — but not
     #         when we still have to read it back, or when this was a rehearsal.
     OPTS=(-v -dao)
-    [ "$CDTEXT" -eq 1 ] && OPTS+=(-text)
+    [ "$CDTEXT_THIS" -eq 1 ] && OPTS+=(-text)
     [ "$DUMMY"  -eq 1 ] && OPTS+=(-dummy)
     [ "$VERIFY" -eq 0 ] && [ "$DUMMY" -eq 0 ] && OPTS+=(-eject)
 
@@ -2655,7 +3110,10 @@ $(tail -8 "$FFLOG" | sed 's/^/    /')"
   Either way, burncd --check reports what this machine supports."
   fi
 
-  rm -f "$IMAGE"
+  # 800 MB a disc, so it goes as soon as the drive is done with it — unless the
+  # run was asked to keep its workings, in which case a disc that sounds wrong
+  # can be listened to as an image.
+  [ -n "${BURNCD_KEEP_WORK:-}" ] || rm -f "$IMAGE"
 
   # The disc is done, and the panel says so on a stage of its own: the meter it
   # was planned against, and the log of everything that has happened up to here.
