@@ -1,0 +1,2275 @@
+#!/usr/bin/env bash
+#
+# player — play an album from a zip, a folder, or the CD in the drive.
+#
+#   player                         pick a source from what is to hand
+#   player ~/Downloads/Album.zip   play a zip without unpacking it yourself
+#   player ~/Music/Album           play a folder
+#   player --cd                    play the disc in the drive
+#   player --check                 check this machine can play anything
+#   player -n ~/Music/Album        read it, show the album, play nothing
+#   player --no-mb --cd            play the disc without asking MusicBrainz
+#
+# Takes aiff, flac, mp3, ogg, wav, m4a, opus — anything ffmpeg reads, in a zip
+# or loose in a folder. Track order comes from embedded metadata, not filenames.
+# A zip is unpacked into a scratch directory that is destroyed when the app
+# closes, so what is left on disk afterwards is the zip you started with.
+#
+# An audio CD is read off the disc's own table of contents: CD-Text when the
+# disc carries it, MusicBrainz when it does not and the network is up, and
+# plain track numbers when neither can say. Which of the three you got is
+# printed on the panel, because a track list is only as good as its source.
+#
+# Transport is where your hands already are: space to pause, ←→ to seek and
+# shift-←→ to seek further, ↑↓ to walk the list, enter to play what you are
+# looking at, n and p for the next and previous track.
+#
+# Env overrides:
+#   PLAYER_DIRS    colon-separated dirs the picker scans (default ~/Music:~/Downloads)
+#   PLAYER_DEV     cdrecord device for CD-Text (default: whichever the drive answers to)
+#   PLAYER_MB      set to 0 to never ask MusicBrainz about a disc
+#   PLAYER_KEEP    set to keep the scratch directory instead of destroying it
+
+set -euo pipefail
+
+# Every rule, meter cell and track title on the panel is UTF-8, and ${#s} counts
+# bytes unless the ctype locale says otherwise — one accented title would then
+# shove the whole column grid sideways. Only the ctype category is changed, so
+# collation and number formatting are left exactly as the user has them.
+#
+# LC_ALL has to be dismantled first when it is what pins the locale: bash ignores
+# LC_CTYPE for as long as LC_ALL is set and non-empty, so exporting one under the
+# other looks like a fix and does nothing. Handing its value to the other five
+# categories keeps every one of them where it was.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *UTF-8*|*utf-8*|*UTF8*|*utf8*) ;;
+  *) if [ -n "${LC_ALL:-}" ]; then
+       export LC_COLLATE="$LC_ALL"  LC_NUMERIC="$LC_ALL"  LC_TIME="$LC_ALL" \
+              LC_MONETARY="$LC_ALL" LC_MESSAGES="$LC_ALL"
+       unset LC_ALL
+     fi
+     LOCALES=$( (locale -a 2>/dev/null || true) | tr '\n' ' ' )
+     case " $LOCALES " in
+       *" en_US.UTF-8 "*) export LC_CTYPE=en_US.UTF-8 ;;
+       *" C.UTF-8 "*)     export LC_CTYPE=C.UTF-8 ;;
+       *)                 export LC_CTYPE=UTF-8 ;;   # BSD libc accepts the bare name
+     esac ;;
+esac
+
+UTF8_PROBE='é'
+if [ "${#UTF8_PROBE}" -eq 1 ]; then UTF8=1; else UTF8=0; fi
+
+DEV="${PLAYER_DEV:-}"
+DRY_RUN=0
+CHECK=0
+WANT_CD=0
+SOURCE_ARG=""
+USE_MB="${PLAYER_MB:-1}"
+
+# The panel is a fixed 71 columns: 2 of margin plus a 69-column grid that the
+# faceplate, the track rows and both meters share. Fixed rather than fluid
+# because every column here has a job — 34 for a title, 20 for an artist — and a
+# grid that reflows is a grid you cannot learn. Same figure as burncd, on
+# purpose: the two are the same instrument at two moments of the same disc.
+PANEL=69
+STRIP_WIDTH=$(( PANEL - 2 ))
+
+# How often the panel redraws while something is playing. Twenty frames a second
+# is enough for the analyser to read as motion rather than as a stutter, and
+# cheap because almost every one of those frames redraws the analyser's own rows
+# and not the panel.
+TICK=0.05
+
+# The analyser. Sixteen bands is the most that still leaves a bar wide enough to
+# read at this panel width -- three columns each, one column between them, which
+# lands at 63 of the 67 inside the rules with two to spare either side.
+#
+# Five rows of eight eighths gives a column forty steps of travel, which is the
+# range the falling trail needs to actually be seen falling: fewer and a column
+# is at the floor before the eye has followed it down.
+SPEC_BANDS=16
+SPEC_ROWS=5
+SPEC_TOP=$(( SPEC_ROWS * 8 ))
+SPEC_BAR=3
+SPEC_HZ=10             # analysis frames a second, and so the table's row rate
+SPEC_WINDOW=6          # narrowest scale a band is allowed, in dB
+SPEC_FALL=2            # eighths a frame that an abandoned trail sinks by
+# Sixteen bands log-spaced across the audible range: even steps in octaves, not
+# in hertz, because that is how the ear divides it and how the low end earns
+# enough bands to move independently instead of as one lump.
+SPEC_FREQS='40 59 88 132 197 294 439 655 976 1456 2171 3237 4827 7197 10731 16000'
+
+# Every row of the now-playing panel that is not a track, and the shortest window
+# that can still hold one. Counted rather than guessed, for the reason set out at
+# np_fit_rows: a frame one line taller than the window scrolls the panel's own
+# top row away for good. The analyser stands where the lamp's single row did, so
+# it costs the chrome the four rows it gained.
+NP_CHROME=$(( 18 + SPEC_ROWS - 1 ))
+NP_MIN_LINES=$(( NP_CHROME + 3 ))
+PICK_CHROME=10
+PICK_MIN_LINES=$(( PICK_CHROME + 3 ))
+
+# Panel palette, lifted whole from burncd. The screen is dressed as the faceplate
+# of a deck that never existed: amber silkscreen on black, backlit keycaps, a
+# tape-counter readout. Amber is the chrome — rules, labels, the badge — and
+# never the data, so the titles stay the brightest thing on the screen.
+AMBER='\033[38;5;214m'      # lit amber, for the readout and keycap legends
+ETCH='\033[38;5;172m'       # the darker amber of paint on a metal panel
+BADGE='\033[48;5;214m\033[38;5;232m'   # engraved plate: black on amber
+CAP='\033[48;5;236m\033[38;5;214m'     # a keycap, backlit from behind
+OFF='\033[0m'
+DIM='\033[2m'
+INV='\033[7m'
+# Four steps around the panel's own amber rather than four cool hues, zigzagging
+# light/dark/light/dark so neighbouring bands separate on brightness even where
+# the hues are cousins, and the edges survive without colour vision.
+SHADES=(214 130 220 166)
+RUNOUT=94              # the darkest amber on the ramp: everything not yet played
+HEAD=231               # the playhead, the brightest thing on the screen
+
+# ------------------------------------------------------------------ plumbing --
+
+SPACES='                                                                                '
+pad() {  # pad <count> -> $PAD
+  PAD=''
+  [ "$1" -gt 0 ] || return 0
+  while [ "$1" -gt "${#SPACES}" ]; do SPACES="$SPACES$SPACES"; done
+  PAD=${SPACES:0:$1}
+}
+repv() {  # repv <char> <count> -> $REP
+  REP=''
+  [ "$2" -gt 0 ] || return 0
+  pad "$2"
+  REP=${PAD// /$1}
+}
+rep() { repv "$1" "$2"; printf '%s' "$REP"; }
+
+# How big the window actually is. Not plain `tput lines`: tput measures the
+# terminal attached to its own stdout, and inside $( ) that is a pipe, so it
+# falls back to whatever static size the terminfo entry declares. stty asks the
+# kernel for the real window size off /dev/tty, which no redirection can move.
+TERM_LINES='' TERM_COLS=''
+term_size() {  # term_size -> $TERM_LINES, $TERM_COLS
+  local sz
+  [ -n "$TERM_LINES" ] && [ -n "$TERM_COLS" ] && return 0
+  sz=$( (stty size </dev/tty) 2>/dev/null || true )
+  TERM_LINES=${sz%% *}
+  TERM_COLS=${sz##* }
+  case "$TERM_LINES" in ''|*[!0-9]*|0) TERM_LINES=$(tput lines 2>/dev/null || true) ;; esac
+  case "$TERM_COLS"  in ''|*[!0-9]*|0) TERM_COLS=$(tput cols 2>/dev/null || true) ;; esac
+  case "$TERM_LINES" in ''|*[!0-9]*|0) TERM_LINES=24 ;; esac
+  case "$TERM_COLS"  in ''|*[!0-9]*|0) TERM_COLS=80 ;; esac
+  return 0
+}
+
+mmss()  { printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
+mmssv() { printf -v MMSS '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
+
+# mpv reports every time in float seconds. Everything on this panel is counted in
+# whole ones, and a bare ${x%%.*} on "1.2e-05" or on an empty property would put
+# a non-number into an arithmetic context and take the whole loop down with it.
+intsec() {  # intsec <float> -> $ISEC
+  ISEC=${1%%.*}
+  case "$ISEC" in ''|*[!0-9]*) ISEC=0 ;; esac
+  return 0
+}
+
+qgrep() { grep "$@" >/dev/null; }
+
+# ---------------------------------------------------------------- the screen --
+
+# player is one instrument for as long as it runs, not a program that prints.
+#
+# The picker, the loading stage and the now-playing panel are stages of one
+# display on the alternate screen, each laid over the last from the home
+# position. Nothing scrolls, nothing stacks, and the scrollback underneath is
+# untouched — when the app closes the terminal is exactly as it was found.
+SCREEN=0
+SCREEN_STTY=''
+
+screen_on() {
+  [ "$SCREEN" -eq 1 ] && return 0
+  [ -t 0 ] && [ -t 1 ] || return 1
+  SCREEN_STTY=$(stty -g 2>/dev/null || true)
+  # Erase on the way in only. Every frame after this one is laid over its
+  # predecessor rather than drawn on a cleared screen — see paint().
+  printf '\033[?1049h\033[?25l\033[H\033[2J'
+  SCREEN=1
+  trap 'TERM_LINES=; TERM_COLS=' WINCH
+  return 0
+}
+
+# Idempotent, and called from die() and from the exit trap as much as from the
+# ordinary end of a session: whatever goes wrong, the terminal is handed back
+# with its cursor visible, its modes as they were, and the scrollback intact.
+screen_off() {
+  [ "$SCREEN" -eq 1 ] || return 0
+  SCREEN=0
+  [ -n "$SCREEN_STTY" ] && stty "$SCREEN_STTY" 2>/dev/null || true
+  printf '\033[?25h\033[?1049l'
+  return 0
+}
+
+# Lay one frame over the screen from the home position.
+#
+# No erase first, and one write for the whole frame. Clearing and then drawing is
+# two pictures the terminal genuinely paints, so the blank one shows through as a
+# flash. Instead: end every line with an erase-to-end-of-line so a line that got
+# shorter cannot leave the tail of the old one behind, and \033[J at the bottom
+# to clear whatever the previous frame had below this one.
+#
+# The frame must be at most one line shorter than the window. \033[H is absolute,
+# so a frame that scrolls the terminal loses its own top row permanently.
+paint() {  # paint <frame> [overlay]
+  local nl=$'\n' eol=$'\033[K\n'
+  # The overlay is written in the same printf as the frame rather than after it,
+  # so a rebuilt panel reaches the terminal as one write and there is no instant
+  # where the screen holds the frame without it. It comes through %b because it
+  # is escape sequences written as text, where the frame arrives already escaped.
+  printf '\033[H%s\033[K\n\033[J%b' "${1//$nl/$eol}" "${2:-}"
+  return 0
+}
+
+# The faceplate every screen wears: engraved badge, a rule across the panel, and
+# the state of the machine stamped at the far end the way a deck prints its mode.
+faceplate() {  # faceplate <meta>
+  local rule=$(( PANEL - 10 - ${#1} ))
+  [ "$rule" -lt 2 ] && rule=2
+  repv '━' "$rule"
+  printf '  %b PLAYER %b %b%s%b %b%s%b\n' \
+    "$BADGE" "$OFF" "$ETCH" "$REP" "$OFF" "$ETCH" "$1" "$OFF"
+  return 0
+}
+
+die() { screen_off; printf '\nplayer: %s\n' "$1" >&2; exit 1; }
+
+usage() {
+  awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
+  exit "${1:-0}"
+}
+
+# ------------------------------------------------------------------ scratch --
+
+# Where a zip is unpacked to, and the promise that it does not outlive the app.
+#
+# Made once, lazily, and destroyed by the exit trap however the app ends — a
+# clean quit, a die(), or a Ctrl-C. mktemp -d gives a directory nothing else is
+# in, which is what makes the rm -rf at the end safe to write at all: it is only
+# ever pointed at a path this process created.
+WORK=''
+MPV_PID=''
+scratch() {
+  [ -n "$WORK" ] && return 0
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/player.XXXXXX") || die "cannot make a scratch directory"
+  # The analyser's tables live here too, and go the same way at the end.
+  mkdir -p "$WORK/spec" || die "cannot make a scratch directory"
+  return 0
+}
+
+# Whether the analyser can have real levels to show. Not fatal if it cannot:
+# ffmpeg is what reads the audio, and without it the columns fall back to the
+# waves and everything else about the player works exactly the same.
+SPEC_OK=0
+command -v ffmpeg >/dev/null && SPEC_OK=1
+
+cleanup() {
+  local rc=$?
+  local p pid
+  # set -e is still in force inside a trap, and every step here is something that
+  # is allowed to fail: the screen may never have been on, and mpv has usually
+  # quit already, which makes kill fail. Any one of those failing would abandon
+  # the rest of the handler -- and the rest of the handler is the promise this
+  # program makes about your disk, so nothing below is allowed to be skipped.
+  set +e
+  # Torn down in the order it was built: the screen first, so a message from
+  # anything below lands on a terminal that can show it.
+  screen_off
+  [ -n "$MPV_PID" ] && kill "$MPV_PID" 2>/dev/null
+  # The analyser decodes a whole track through sixteen bandpasses, and it is
+  # started from inside the event loop's subshell — so nothing it knows comes
+  # back here in a variable, and quitting two seconds into a track would leave
+  # ffmpeg running on a machine with no player on it, writing into a scratch
+  # directory the next few lines are about to delete out from under it.
+  if [ -n "$WORK" ]; then
+    for p in "$WORK"/spec/*.pid; do
+      [ -f "$p" ] || continue
+      pid=''
+      read -r pid < "$p" 2>/dev/null
+      case "$pid" in ''|*[!0-9]*) continue ;; esac
+      kill "$pid" 2>/dev/null
+    done
+  fi
+  if [ -n "$WORK" ] && [ -d "$WORK" ]; then
+    if [ -n "${PLAYER_KEEP:-}" ]; then
+      printf 'player: scratch kept at %s\n' "$WORK" >&2
+    else
+      rm -rf "$WORK"
+    fi
+  fi
+  return $rc
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# ---------------------------------------------------------------- arguments --
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    --check)      CHECK=1 ;;
+    --cd)         WANT_CD=1 ;;
+    --no-mb)      USE_MB=0 ;;
+    -h|--help)    usage 0 ;;
+    -*)           die "unknown option: $1 (try --help)" ;;
+    *)            [ -n "$SOURCE_ARG" ] && die "one source at a time, got: $1"
+                  SOURCE_ARG="$1" ;;
+  esac
+  shift
+done
+
+# ------------------------------------------------------------- health check --
+
+ck() {   # ck <ok|warn|fail> <label> <detail>
+  case "$1" in
+    ok)   printf '  \033[32m✓\033[0m  %-20s %s\n' "$2" "$3" ;;
+    warn) printf '  \033[33m!\033[0m  %-20s %s\n' "$2" "$3" ;;
+    fail) printf '  \033[31m✗\033[0m  %-20s %s\n' "$2" "$3"; CK_FAIL=1 ;;
+  esac
+}
+
+run_check() {
+  local v dev=''
+  CK_FAIL=0
+  printf '\n  player health check\n\n'
+
+  if v=$(mpv --version 2>/dev/null | head -1 | cut -c1-40); then
+    ck ok mpv "$v"
+  else
+    ck fail mpv "not found. brew install mpv"
+  fi
+
+  if mpv --list-protocols 2>/dev/null | qgrep '^ *archive://'; then
+    ck ok "mpv archives" "libarchive present"
+  else
+    ck warn "mpv archives" "no archive:// — zips are unpacked to scratch anyway"
+  fi
+
+  if v=$(ffprobe -version 2>/dev/null | head -1 | cut -c1-40); then
+    ck ok ffprobe "${v}"
+  else
+    ck fail ffprobe "not found. brew install ffmpeg"
+  fi
+
+  # ffmpeg itself, not ffprobe: the analyser measures a track's spectrum ahead
+  # of playing it. Same brew formula, so a machine with one usually has both,
+  # and a machine with neither still plays — the columns just stop meaning
+  # anything, which is worth a warning and not a failure.
+  if [ "$SPEC_OK" -eq 1 ]; then
+    ck ok analyser "$(ffmpeg -version 2>/dev/null | head -1 | cut -c1-40)"
+  else
+    ck warn analyser "no ffmpeg — the columns fall back to a pattern"
+  fi
+
+  command -v unzip >/dev/null \
+    && ck ok unzip "$(unzip -v 2>/dev/null | head -1 | cut -c1-40)" \
+    || ck fail unzip "not found — zips cannot be opened"
+
+  if command -v nc >/dev/null && nc -h 2>&1 | qgrep -- '-U'; then
+    ck ok "unix sockets" "nc -U present — mpv can be driven"
+  elif command -v nc >/dev/null; then
+    # Apple's nc documents -U poorly but has it; only a truly missing nc is fatal.
+    ck warn "unix sockets" "nc present, -U undocumented — probably fine"
+  else
+    ck fail "unix sockets" "nc not found — mpv cannot be driven"
+  fi
+
+  if command -v drutil >/dev/null; then
+    v=$(drutil status 2>/dev/null | awk -F: '/Type:/ { print $2; exit }' | awk '{ $1=$1; print }')
+    [ -n "$v" ] && ck ok "optical drive" "media: $v" || ck warn "optical drive" "no disc, or no drive"
+  else
+    ck warn "optical drive" "drutil not found — CDs cannot be detected"
+  fi
+
+  if command -v cdda2wav >/dev/null || command -v cdrecord >/dev/null; then
+    ck ok "CD-Text" "$( command -v cdda2wav >/dev/null && echo cdda2wav || echo cdrecord ) present"
+  else
+    ck warn "CD-Text" "no cdrtools — discs fall back to MusicBrainz or numbers"
+  fi
+
+  # Both, not either: the disc ID is fetched with curl and the answer is a lump
+  # of JSON that jq reads. Missing either one means the same thing on screen.
+  if [ "$USE_MB" != 1 ]; then
+    ck warn "MusicBrainz" "disabled with --no-mb — untitled discs stay untitled"
+  elif command -v curl >/dev/null && command -v jq >/dev/null; then
+    ck ok "MusicBrainz" "curl and jq present — untitled discs can be looked up"
+  else
+    v=$( command -v curl >/dev/null || printf 'curl '; command -v jq >/dev/null || printf 'jq' )
+    ck warn "MusicBrainz" "no ${v% } — untitled discs stay untitled. brew install ${v% }"
+  fi
+
+  # Where a zip is unpacked to. A read-only or full $TMPDIR is the one failure
+  # that would otherwise not show up until an album was half open.
+  v="${TMPDIR:-/tmp}"
+  if dev=$(mktemp -d "$v/player.check.XXXXXX" 2>/dev/null); then
+    rmdir "$dev" 2>/dev/null
+    ck ok "scratch space" "$(df -h "$v" 2>/dev/null | awk 'NR==2 { print $4 }') free in $v"
+  else
+    ck fail "scratch space" "cannot write to $v — zips cannot be opened"
+  fi
+
+  term_size
+  if [ "$UTF8" -eq 1 ]; then
+    ck ok terminal "UTF-8 (${LC_CTYPE:-${LANG:-?}}), ${TERM_COLS}x${TERM_LINES}"
+  else
+    ck warn terminal "not UTF-8 — the meters will render as mojibake"
+  fi
+  if [ "$TERM_LINES" -lt "$NP_MIN_LINES" ] || [ "$TERM_COLS" -lt $(( PANEL + 2 )) ]; then
+    ck warn "window size" "need ${NP_MIN_LINES} rows x $(( PANEL + 2 )) cols for the panel"
+  else
+    ck ok "window size" "room for the panel"
+  fi
+
+  printf '\n'
+  if [ "$CK_FAIL" -eq 1 ]; then
+    printf '  Not ready.\n\n'
+    return 1
+  fi
+  printf '  Ready to play.\n\n'
+  return 0
+}
+
+if [ "$CHECK" -eq 1 ]; then
+  run_check || exit 1
+  exit 0
+fi
+
+# ------------------------------------------------------------- requirements --
+
+command -v mpv     >/dev/null || die "mpv not found. brew install mpv"
+command -v ffprobe >/dev/null || die "ffprobe not found. brew install ffmpeg"
+command -v nc      >/dev/null || die "nc not found — mpv cannot be driven"
+
+# ------------------------------------------------------------ the meters --
+
+# Exactly burncd's capacity meter, and deliberately so: the picture you approved
+# before burning a disc is the picture you watch while playing it back. Bands are
+# tracks, in four alternating ambers; the head is where the laser was and is now
+# where the playhead is; the run-out is everything not yet reached.
+#
+# Largest-remainder rather than a running total, so a longer track can never be
+# drawn narrower than a shorter one — which is the one comparison the meter
+# exists to support.
+BEND=(); BCOL=()
+bands() {  # bands <total-units> <duration>...  -> $BEND, $BCOL
+  local units=$1 n=0 cum=0 used=0 left=0 best bi i pos=0 nb=0
+  local -a D HC REM
+  BEND=(); BCOL=(); D=(); HC=(); REM=()
+  shift
+
+  for i in "$@"; do
+    D[$n]=$i
+    cum=$(( cum + i ))
+    n=$(( n + 1 ))
+  done
+  [ "$n" -gt 0 ] && [ "$cum" -gt 0 ] && [ "$units" -gt 0 ] || return 0
+
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    HC[$i]=$(( D[i] * units / cum ))
+    REM[$i]=$(( D[i] * units % cum ))
+    used=$(( used + HC[i] ))
+    i=$(( i + 1 ))
+  done
+  left=$(( units - used ))
+  while [ "$left" -gt 0 ]; do
+    best=-1; bi=-1
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      [ "${REM[$i]}" -gt "$best" ] && { best=${REM[$i]}; bi=$i; }
+      i=$(( i + 1 ))
+    done
+    [ "$bi" -lt 0 ] && break
+    HC[$bi]=$(( HC[bi] + 1 ))
+    REM[$bi]=-1
+    left=$(( left - 1 ))
+  done
+
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ "${HC[$i]}" -gt 0 ]; then
+      pos=$(( pos + HC[i] ))
+      BEND[$nb]=$pos
+      BCOL[$nb]=${SHADES[$(( nb % 4 ))]}
+      nb=$(( nb + 1 ))
+    fi
+    i=$(( i + 1 ))
+  done
+  return 0
+}
+
+# One meter cell's colour, appended to $out only when it differs from what is
+# already in effect — a fresh pair of escapes per cell would treble the size of
+# the frame for nothing. Reads and writes the caller's locals, on purpose.
+strip_sgr() {  # strip_sgr <fg> <bg-or-empty>
+  [ "$1" = "$curfg" ] || { out="$out\033[38;5;$1m"; curfg=$1; }
+  if [ -n "$2" ]; then
+    [ "$2" = "$curbg" ] || { out="$out\033[48;5;$2m"; curbg=$2; }
+  elif [ -n "$curbg" ]; then
+    out="$out\033[49m"; curbg=''
+  fi
+}
+
+# One row of meter, in $BANDBAR. A column wholly inside a band is a shaded block,
+# a column a boundary runs through is a partial block of the outgoing colour laid
+# over the incoming one as background, and anything past the head is run-out.
+#
+# Not returned on stdout: a $( ) here is a fork, and this is redrawn several
+# times a second for as long as something is playing.
+BANDBAR=''
+bandbar() {  # bandbar <head-units> -- reads $BEND/$BCOL -> $BANDBAR
+  local head=$1 j=0 b=0 nb=${#BEND[@]} cs ce t nxt
+  local out='' curfg='' curbg=''
+  # Unicode has a full set of left-aligned partial blocks, and a cell can show
+  # two colours — foreground for the left part, background for the right — so a
+  # boundary is drawn where it actually falls rather than snapped to the nearest
+  # whole character.
+  local PARTS=('' '▏' '▎' '▍' '▌' '▋' '▊' '▉')
+
+  while [ "$j" -lt "$STRIP_WIDTH" ]; do
+    cs=$(( j * 8 )); ce=$(( cs + 8 ))
+    while [ "$b" -lt "$nb" ] && [ "${BEND[$b]}" -le "$cs" ]; do b=$(( b + 1 )); done
+    if [ "$head" -gt "$cs" ] && [ "$head" -lt "$ce" ]; then
+      strip_sgr "$HEAD" ''; out="${out}${PARTS[$(( head - cs ))]}"
+    elif [ "$head" -le "$cs" ] || [ "$b" -ge "$nb" ]; then
+      strip_sgr "$RUNOUT" ''; out="${out}░"
+    elif [ "${BEND[$b]}" -ge "$ce" ]; then
+      strip_sgr "${BCOL[$b]}" ''; out="${out}▓"
+    else
+      t=$(( BEND[b] - cs ))
+      nxt=$(( b + 1 ))
+      if [ "$nxt" -lt "$nb" ]; then
+        strip_sgr "${BCOL[$b]}" "${BCOL[$nxt]}"
+      else
+        strip_sgr "${BCOL[$b]}" ''
+      fi
+      out="${out}${PARTS[$t]}"
+    fi
+    j=$(( j + 1 ))
+  done
+  BANDBAR="$out\033[0m"
+  return 0
+}
+
+# A plain single-band bar, for the one track playing now. Same cells and the same
+# partial blocks as the album meter so the two read as one family, but one colour
+# and one head: a track has no internal structure worth banding.
+TRACKBAR=''
+trackbar() {  # trackbar <done> <total> -> $TRACKBAR
+  local done=$1 total=$2 units head j=0 cs ce
+  local out='' curfg='' curbg=''
+  local PARTS=('' '▏' '▎' '▍' '▌' '▋' '▊' '▉')
+  units=$(( STRIP_WIDTH * 8 ))
+  head=0
+  [ "$total" -gt 0 ] && head=$(( done * units / total ))
+  [ "$head" -gt "$units" ] && head=$units
+  while [ "$j" -lt "$STRIP_WIDTH" ]; do
+    cs=$(( j * 8 )); ce=$(( cs + 8 ))
+    if [ "$head" -ge "$ce" ]; then
+      strip_sgr 214 ''; out="${out}▓"
+    elif [ "$head" -gt "$cs" ]; then
+      strip_sgr "$HEAD" ''; out="${out}${PARTS[$(( head - cs ))]}"
+    else
+      strip_sgr "$RUNOUT" ''; out="${out}░"
+    fi
+    j=$(( j + 1 ))
+  done
+  TRACKBAR="$out\033[0m"
+  return 0
+}
+
+# The analyser, under the album meter where burncd puts its minute scale. It
+# exists because an album is forty minutes of a number that moves once a second,
+# and a panel with nothing moving on it looks like a panel that has died — but
+# unlike a lamp sweeping a dark field it is telling you something, because the
+# columns are the band levels of the sound actually coming out of the deck. It
+# stops dead when the music is paused, which is the one thing it has to say that
+# the numbers do not say faster.
+
+# What the columns are doing right now, in eighths of a row, 0 to $SPEC_TOP.
+# SPEC_H is where each column stands; SPEC_G is the trail it left above itself
+# on the way down; SPEC_A is how many frames that trail has been abandoned for,
+# which is what fades it out.
+SPEC_H=(); SPEC_G=(); SPEC_A=()
+SPECROWS=()
+
+spec_reset() {
+  local b=0
+  while [ "$b" -lt "$SPEC_BANDS" ]; do
+    SPEC_H[$b]=0; SPEC_G[$b]=0; SPEC_A[$b]=99
+    b=$(( b + 1 ))
+  done
+  return 0
+}
+spec_reset
+
+# Advance every column to where the table says it should be, and let the trails
+# fall. A column jumps to its new level the instant the level arrives — an
+# analyser that eased upward would read as a slow analyser, not a smooth one —
+# and only the falling is slowed, because that is the part the eye follows.
+spec_step() {  # spec_step <band-heights...>
+  local b=0 h
+  while [ "$b" -lt "$SPEC_BANDS" ]; do
+    h=$1; shift
+    [ -z "$h" ] && h=0
+    SPEC_H[$b]=$h
+    if [ "$h" -ge "${SPEC_G[$b]}" ]; then
+      # Caught up with its own trail: there is nothing left up there to dissipate.
+      SPEC_G[$b]=$h; SPEC_A[$b]=0
+    else
+      SPEC_G[$b]=$(( SPEC_G[b] - SPEC_FALL ))
+      [ "${SPEC_G[$b]}" -lt "$h" ] && SPEC_G[$b]=$h
+      SPEC_A[$b]=$(( SPEC_A[b] + 1 ))
+    fi
+    b=$(( b + 1 ))
+  done
+  return 0
+}
+
+# One row of the analyser, top row first. Each row covers eight eighths of every
+# column, so which glyph a cell gets is just where this row's slice sits relative
+# to the column's height and the trail above it.
+#
+# Filled cells are graded by row rather than by band: the top of the panel is the
+# brightest, so a column that reaches the ceiling arrives there rather than
+# merely being tall. The trail is graded by age instead, down the same amber
+# ramp the meters use, so it reads as the same light going out.
+spec_row_str() {  # spec_row_str <row-from-top> -> $SPECROW
+  local r=$1 b=0 lo fill g pad
+  local out='' curfg='' curbg=''
+  local PARTS=('' '▁' '▂' '▃' '▄' '▅' '▆' '▇')
+  local ROWFG
+  # Brightest at the top of the travel, so height reads as intensity.
+  case $r in
+    0) ROWFG=$HEAD ;;
+    1) ROWFG=220 ;;
+    2) ROWFG=214 ;;
+    3) ROWFG=172 ;;
+    *) ROWFG=130 ;;
+  esac
+  lo=$(( (SPEC_ROWS - 1 - r) * 8 ))
+
+  # Two columns of margin either side: sixteen bars of three with a column
+  # between them is 63 of the 67 inside the rules.
+  strip_sgr 236 ''; out="${out}  "
+  while [ "$b" -lt "$SPEC_BANDS" ]; do
+    [ "$b" -gt 0 ] && { strip_sgr 236 ''; out="${out} "; }
+    fill=$(( SPEC_H[b] - lo ))
+    g=$(( SPEC_G[b] - lo ))
+    if [ "$fill" -ge 8 ]; then
+      strip_sgr "$ROWFG" ''
+      out="${out}███"
+    elif [ "$fill" -gt 0 ]; then
+      strip_sgr "$ROWFG" ''
+      out="${out}${PARTS[$fill]}${PARTS[$fill]}${PARTS[$fill]}"
+    elif [ "$g" -gt 0 ]; then
+      # Above the column but inside its trail: the light that has not gone out
+      # yet. Older trails are dimmer, and the oldest are a shade off the field.
+      case ${SPEC_A[$b]} in
+        0|1) strip_sgr 220 ''; out="${out}▓▓▓" ;;
+        2|3) strip_sgr 214 ''; out="${out}▒▒▒" ;;
+        4|5) strip_sgr 172 ''; out="${out}▒▒▒" ;;
+        6|7) strip_sgr 130 ''; out="${out}░░░" ;;
+        *)   strip_sgr "$RUNOUT" ''; out="${out}░░░" ;;
+      esac
+    else
+      strip_sgr 236 ''; out="${out}···"
+    fi
+    b=$(( b + 1 ))
+  done
+  strip_sgr 236 ''; out="${out}  "
+  SPECROW="$out\033[0m"
+  return 0
+}
+
+# The whole analyser as $SPEC_ROWS finished strings, so a tick can put them on
+# the screen without rebuilding the panel around them.
+spec_render() {
+  local r=0
+  SPECROWS=()
+  while [ "$r" -lt "$SPEC_ROWS" ]; do
+    spec_row_str "$r"
+    SPECROWS[$r]="$SPECROW"
+    r=$(( r + 1 ))
+  done
+  return 0
+}
+
+# The analyser with the power still on but nothing moving: what a paused deck
+# shows. Not blank, because blank is what a broken one shows.
+spec_idle() {
+  local r=0 b line
+  SPECROWS=()
+  while [ "$r" -lt "$SPEC_ROWS" ]; do
+    if [ "$r" -eq $(( SPEC_ROWS - 1 )) ]; then
+      line=''; b=0
+      while [ "$b" -lt "$SPEC_BANDS" ]; do
+        [ "$b" -gt 0 ] && line="${line} "
+        # Braced, and so is every other one of these: bash 3.2 reading $line▁
+        # takes the bytes of the ▁ to be part of the variable's name, and the
+        # panel comes apart with an unbound variable rather than a bad glyph.
+        line="${line}▁▁▁"
+        b=$(( b + 1 ))
+      done
+      SPECROWS[$r]="\033[38;5;130m  ${line}  \033[0m"
+    else
+      line=''; b=0
+      while [ "$b" -lt "$SPEC_BANDS" ]; do
+        [ "$b" -gt 0 ] && line="${line} "
+        line="${line}···"
+        b=$(( b + 1 ))
+      done
+      SPECROWS[$r]="\033[38;5;236m  ${line}  \033[0m"
+    fi
+    r=$(( r + 1 ))
+  done
+  return 0
+}
+
+# The rendered analyser as one string of cursor moves and rows, addressed to
+# wherever the last panel rebuild left it.
+#
+# It is built as a string rather than printed row by row because five printfs
+# are five writes, and a terminal is free to draw between any two of them: the
+# columns come out visibly a step apart. One write cannot be caught halfway.
+SPECSTR=''
+printf -v SPEC_BLANK '%*s' "$STRIP_WIDTH" ''
+spec_str() {
+  local r=0
+  SPECSTR=''
+  [ "$spec_row" -gt 0 ] || return 0
+  [ "$paused" = true ] && spec_idle
+  while [ "$r" -lt "$SPEC_ROWS" ]; do
+    SPECSTR="${SPECSTR}\033[$(( spec_row + r ));1H\033[K  ${ETCH}▐${OFF}${SPECROWS[$r]}${ETCH}▌${OFF}"
+    r=$(( r + 1 ))
+  done
+  return 0
+}
+
+# -------------------------------------------------------------- the analysis --
+
+# Sixteen band levels every tenth of a second, for one file, written where the
+# panel can find them. This is the only part of the program that looks at the
+# audio itself rather than at what mpv says about it.
+#
+# One decode feeds all sixteen bandpasses, because decoding the file sixteen
+# times would cost sixteen times as much. ffmpeg has no way to say "give me the
+# spectrum", so the levels come back as sixteen separate files of RMS readings
+# and awk has to put them side by side afterwards.
+#
+# Written to a temporary name and moved into place, so a table that exists is
+# always a table that is finished: the player tests for the file and nothing
+# else, and a half-written one would be read as gospel.
+spectrum_analyse() {  # spectrum_analyse <audio-file> <table> <pid-file>
+  local src=$1 tab=$2 pidf=$3 d fc split f i n ff
+  local -a MAPS
+  d="$tab.d"
+  rm -rf "$d"; mkdir -p "$d" || return 1
+  n=$(( 44100 / SPEC_HZ ))
+
+  # Resampled to a known rate first, because the window that makes one row of
+  # the table is counted in samples and a 48 kHz file would otherwise land at a
+  # different row rate than a 44.1 kHz one.
+  split="[0:a]aresample=44100,asplit=$SPEC_BANDS"
+  i=0
+  for f in $SPEC_FREQS; do split="$split[s$i]"; i=$(( i + 1 )); done
+  fc="$split;"
+  i=0
+  MAPS=()
+  for f in $SPEC_FREQS; do
+    # Just over an octave wide: enough overlap that no frequency falls in a gap
+    # between two bands, tight enough that neighbours still move independently.
+    fc="$fc[s$i]bandpass=f=$f:width_type=o:w=1.1,asetnsamples=n=$n,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=$d/b$i[o$i];"
+    MAPS[${#MAPS[@]}]='-map'
+    MAPS[${#MAPS[@]}]="[o$i]"
+    MAPS[${#MAPS[@]}]='-f'
+    MAPS[${#MAPS[@]}]='null'
+    MAPS[${#MAPS[@]}]='-'
+    i=$(( i + 1 ))
+  done
+  fc=${fc%;}
+
+  # -nostdin because this runs in the background behind a program that has the
+  # terminal in raw mode, and ffmpeg would otherwise eat the keystrokes.
+  #
+  # Backgrounded and waited on rather than run in the foreground, only so that
+  # its pid can be written down. This whole function is already a background
+  # subshell of the event loop, so a pid kept in a variable cannot reach the
+  # exit trap — and the exit trap is the one thing that knows the app is over.
+  # The file is removed the moment the decode is done, so what cleanup finds is
+  # a pid that was still running a moment ago rather than one long recycled.
+  ffmpeg -v error -nostdin -i "$src" -filter_complex "$fc" "${MAPS[@]}" \
+    >/dev/null 2>&1 &
+  ff=$!
+  printf '%s\n' "$ff" > "$pidf"
+  wait "$ff" || { rm -f "$pidf"; rm -rf "$d"; return 1; }
+  rm -f "$pidf"
+
+  awk -v dir="$d" -v nb="$SPEC_BANDS" -v top="$SPEC_TOP" -v win="$SPEC_WINDOW" '
+  BEGIN {
+    N = 0
+    for (b = 0; b < nb; b++) {
+      i = 0; file = dir "/b" b
+      while ((getline line < file) > 0) {
+        if (index(line, "RMS_level")) {
+          split(line, p, "=")
+          # Digital silence comes back as -inf, which would read as 0 dB — the
+          # loudest thing there is — if it were simply added to a number.
+          if (p[2] ~ /inf/ || p[2] == "") v = -90; else v = p[2] + 0
+          if (v < -90) v = -90
+          V[b, i] = v; i++
+        }
+      }
+      close(file)
+      if (N == 0 || i < N) N = i
+    }
+    if (N == 0) exit 1
+
+    # Each band is scaled by what that band actually does over the track, not by
+    # one scale for all sixteen: the bass of a record runs tens of decibels above
+    # its top octave, and a single scale would leave half the panel flat all
+    # night. A column spans the quiet-to-loud of its own band, which is what
+    # makes every column worth looking at instead of just the loud ones.
+    #
+    # No apostrophes anywhere in here, incidentally: this whole program is one
+    # single-quoted argument, and one of them ends it early.
+    #
+    # The scale is anchored at the quarter and ninety-percent marks of what that
+    # band actually did, and those two are placed a quarter and six-sevenths of
+    # the way up the column. Not the extremes, and this is the whole trick:
+    # a record mastered in this century spends its life within a few decibels of
+    # its own ceiling, with a long thin tail down into the gaps between songs.
+    # Scale that tail into the column and the tail gets the column — every band
+    # sits pinned near the top and twitches, which is what this did at first.
+    # Throw the tail away and scale the part the music actually occupies, and the
+    # columns use their whole height: a quarter of the time at the floor, a sixth
+    # at the ceiling, and the rest of it moving between.
+    for (b = 0; b < nb; b++) {
+      # Half-decibel bins. A whole one is too coarse to divide a scale that can
+      # come out six decibels wide.
+      for (k = 0; k <= 180; k++) hist[k] = 0
+      for (i = 0; i < N; i++) {
+        k = int((V[b, i] + 90) * 2); if (k < 0) k = 0; if (k > 180) k = 180
+        hist[k]++
+      }
+      c = 0; qa = -90; qb = 0; gota = 0
+      wa = int(N * 0.25); wb = int(N * 0.90)
+      for (k = 0; k <= 180; k++) {
+        c += hist[k]
+        if (!gota && c >= wa) { qa = k / 2 - 90; gota = 1 }
+        if (c >= wb) { qb = k / 2 - 90; break }
+      }
+      span = (qb - qa) / 0.60
+      # A band that genuinely does not move — a constant hiss, a held tone — gets
+      # a scale wide enough that it stays honestly flat a quarter of the way up,
+      # rather than having its own noise magnified to fill the column.
+      if (span < win) span = win
+      LO[b] = qa - 0.25 * span
+      HI[b] = LO[b] + span
+    }
+
+    for (i = 0; i < N; i++) {
+      s = ""
+      for (b = 0; b < nb; b++) {
+        h = int((V[b, i] - LO[b]) / (HI[b] - LO[b]) * top + 0.5)
+        if (h < 0) h = 0; if (h > top) h = top
+        s = s (b ? " " : "") h
+      }
+      print s
+    }
+  }' > "$tab.tmp" || { rm -rf "$d" "$tab.tmp"; return 1; }
+
+  rm -rf "$d"
+  mv -f "$tab.tmp" "$tab" || { rm -f "$tab.tmp"; return 1; }
+  return 0
+}
+
+# Analyse a track if it has not been analysed and nothing is already analysing
+# it. The lock is a file rather than a variable because the analysis runs in a
+# background subshell and a variable set there would not come back.
+spectrum_want() {  # spectrum_want <row>
+  local row=$1 tab i
+  [ "$SPEC_OK" -eq 1 ] || return 0
+  [ "$row" -ge 0 ] && [ "$row" -lt "${#ORDER[@]}" ] || return 0
+  tab="$WORK/spec/$row.tab"
+  [ -f "$tab" ] && return 0
+  [ -f "$tab.lock" ] && return 0
+  : > "$tab.lock"
+  i=${ORDER[$row]}
+  ( spectrum_analyse "${FILES[$i]}" "$tab" "$tab.pid"
+    rm -f "$tab.lock" "$tab.pid" ) >/dev/null 2>&1 &
+  return 0
+}
+
+# The table for one track, read in whole. One `read` rather than a loop over the
+# lines: a four minute track is two and a half thousand rows, and reading those
+# one at a time costs a tenth of a second of silence at every track change.
+SPEC=(); SPEC_N=0; SPEC_FOR=-1
+spectrum_load() {  # spectrum_load <row>
+  local tab="$WORK/spec/$1.tab"
+  [ -s "$tab" ] || return 1
+  SPEC=()
+  IFS=$'\n' read -d '' -r -a SPEC < "$tab" || :
+  SPEC_N=${#SPEC[@]}
+  [ "$SPEC_N" -gt 0 ] || { SPEC_FOR=-1; return 1; }
+  SPEC_FOR=$1
+  return 0
+}
+
+# What the analyser shows while the analysis is still running, or when there is
+# no ffmpeg to run it. Two travelling waves at rates that do not divide into one
+# another, so the columns keep drifting out of step instead of settling into a
+# pattern you can see repeating. It is honest about being decoration: it never
+# claims to be the music, it only says the deck is running.
+SPEC_WAVE=(4 8 14 20 26 32 36 39 40 39 36 32 26 20 14 8)
+spec_synth() {  # spec_synth <frame>
+  local f=$1 b=0
+  local -a H
+  H=()
+  while [ "$b" -lt "$SPEC_BANDS" ]; do
+    H[$b]=$(( ( SPEC_WAVE[ (f / 2 + b * 3) % 16 ] + SPEC_WAVE[ (f / 3 + b * 5) % 16 ] ) / 2 ))
+    b=$(( b + 1 ))
+  done
+  spec_step "${H[@]}"
+  return 0
+}
+
+# ------------------------------------------------------------------ widths --
+
+# How many columns one character takes. A CJK ideograph, a kana, a Hangul
+# syllable, a fullwidth form or an emoji is drawn two columns wide, so ${#s} —
+# which counts characters — is half the truth for a Japanese title, and the grid
+# built on it comes out bent.
+#
+# Testing by glob range rather than by code point because there is no code point
+# to test: bash 3.2 is what ships with macOS, and printf '%d' "'字" there gives
+# the first byte as a signed char, not the code point.
+CW=1
+cwidth() {  # cwidth <character> -> $CW
+  case "$1" in
+    [⺀-〿]|[぀-ヿ]|[一-鿿]|[가-힣]|[！-｠]|[🀀-🿿]) CW=2 ;;
+    *) CW=1 ;;
+  esac
+}
+
+WCOLS=0
+wcols() {  # wcols <string> -> $WCOLS
+  local s=$1 i=0 n=0
+  case "$s" in
+    *[⺀-〿]*|*[぀-ヿ]*|*[一-鿿]*|*[가-힣]*|*[！-｠]*|*[🀀-🿿]*) ;;
+    *) WCOLS=${#s}; return 0 ;;
+  esac
+  while [ "$i" -lt "${#s}" ]; do
+    cwidth "${s:$i:1}"
+    n=$(( n + CW ))
+    i=$(( i + 1 ))
+  done
+  WCOLS=$n
+  return 0
+}
+
+# Pad or truncate to an exact column count. Not printf's own width and precision:
+# those are counted in bytes even under a UTF-8 locale. A cut title ends in … so
+# the truncation is visible.
+FIT=''
+fitv() {  # fitv <string> <columns> -> $FIT
+  local s=$1 i=0 w=0 keep='' lim
+  wcols "$s"
+  if [ "$WCOLS" -gt "$2" ]; then
+    lim=$(( $2 - 1 ))
+    while [ "$i" -lt "${#s}" ]; do
+      cwidth "${s:$i:1}"
+      [ $(( w + CW )) -gt "$lim" ] && break
+      keep="$keep${s:$i:1}"
+      w=$(( w + CW ))
+      i=$(( i + 1 ))
+    done
+    # Braces are not optional: bash 3.2 reads "$keep…" as one name.
+    s="${keep}…"
+    WCOLS=$(( w + 1 ))
+  fi
+  pad $(( $2 - WCOLS ))
+  FIT="$s$PAD"
+}
+fit() { fitv "$1" "$2"; printf '%s' "$FIT"; }
+
+# One row of backlit keycaps, given as key/label pairs.
+keys() {  # keys <key> <label> [<key> <label> ...]
+  local line='' sep=''
+  while [ "$#" -gt 1 ]; do
+    line="$line$sep$CAP $1 $OFF $2"
+    sep='   '
+    shift 2
+  done
+  printf '  %b\n' "$line"
+}
+
+# What is below the fold, worded the same way wherever a list gets clamped.
+more_row() {  # more_row <count>
+  printf '    %b▾ %d MORE%b\n' "$ETCH" "$1" "$OFF"
+  return 0
+}
+
+# ------------------------------------------------------------------- input --
+
+tui_block()  { stty -echo -icanon min 1 time 0 2>/dev/null || true; }
+tui_cooked() { stty echo icanon 2>/dev/null || true; }
+
+# Every read here blocks. bash 3.2 has no sub-second read timeout, and flipping
+# the terminal between blocking and polling around each keystroke is worse than
+# useless: stty flushes input that has already arrived, so a fast escape sequence
+# loses bytes and arrow keys go missing. Staying in one mode means the three
+# bytes of an arrow key are always read together. The cost is that a bare ESC
+# waits for another key, which is why ESC is not bound to anything.
+KEY=""
+read_key() {  # read_key [fd-redirected by caller] -> $KEY
+  local k c
+  KEY=""
+  IFS= read -rsn1 k 2>/dev/null || return 1
+  # read discards its delimiter, so Return comes back as an empty string rather
+  # than as a newline. Reading exactly one byte makes that unambiguous.
+  [ -z "$k" ] && { KEY=$'\n'; return 0; }
+  if [ "$k" = $'\033' ]; then
+    IFS= read -rsn1 c 2>/dev/null || c=""
+    k="$k$c"
+    # CSI and SS3 sequences run until the first letter or tilde.
+    if [ "$c" = "[" ] || [ "$c" = "O" ]; then
+      while :; do
+        IFS= read -rsn1 c 2>/dev/null || break
+        [ -z "$c" ] && break
+        k="$k$c"
+        case "$c" in [A-Za-z~]) break ;; esac
+      done
+    fi
+  fi
+  KEY="$k"
+  return 0
+}
+
+# ------------------------------------------------------------------ sources --
+
+# What there is to play, gathered from three unrelated places into one list. Each
+# entry is a tab-separated record so a title with a space in it survives being
+# put in an array:
+#
+#   <kind>\t<path>\t<label>\t<detail>
+#
+# kind is zip, dir or cd. path is what open_source is later handed. label is what
+# the picker prints, detail the dim column on its right.
+SRC=()
+
+# An audio CD, as macOS presents one: mounted as a volume of .aiff tracks by the
+# CDDA filesystem, which is what makes a disc playable with no ripping step at
+# all. drutil is asked first because it knows about a disc that has not finished
+# mounting, and it is what tells a blank CD-R apart from an album.
+CD_VOLUME=''
+
+# Whether the drive has anything in it at all. drutil answers for the drive
+# rather than for the filesystem, so it is the one thing that can tell an empty
+# bay from a disc that has not finished mounting.
+optical_media() {
+  local t
+  command -v drutil >/dev/null || return 1
+  t=$( (drutil status 2>/dev/null || true) | awk -F: '/Type:/ { print $2; exit }' )
+  t=$( printf '%s' "$t" | tr -d ' ' )
+  case "$t" in ''|[Nn]o*) return 1 ;; esac
+  return 0
+}
+
+find_cd() {
+  local line dev rest mp opts v n
+  CD_VOLUME=''
+
+  # The answer that comes from the kernel rather than from what a directory
+  # happens to hold: macOS mounts an audio CD with the CDDA filesystem, and
+  # nothing else on the machine uses it.
+  #
+  # Split off the device on the first " on " and the options on the last " (":
+  # a device node has no spaces in it, so the front is exact, and taking the
+  # last bracket leaves a volume called "Live (Remastered)" with its own name.
+  while IFS= read -r line; do
+    case "$line" in *' on '*) ;; *) continue ;; esac
+    dev=${line%% on *}; rest=${line#* on }
+    mp=${rest% (*}; opts=${rest##* (}
+    case "$opts" in cddafs,*|cddafs\)*) ;; *) continue ;; esac
+    [ -d "$mp" ] || continue
+    CD_VOLUME="$mp"; return 0
+  done < <(mount 2>/dev/null || true)
+
+  # Some discs mount as a plain volume of named tracks instead, so a volume of
+  # nothing but .aiff files is still worth offering — but only once the drive
+  # has said it has a disc in it. A directory listing cannot tell an album from
+  # an external drive of field recordings; the drive can, and without asking it
+  # that drive gets announced as "in the drive" and then has CD-Text and
+  # MusicBrainz answers about some entirely other disc applied to its files.
+  optical_media || return 1
+
+  for v in /Volumes/*; do
+    [ -d "$v" ] || continue
+    n=$( (ls "$v" 2>/dev/null || true) | grep -ic '\.aiff\?$' || true )
+    [ "${n:-0}" -gt 0 ] || continue
+    if (ls "$v" 2>/dev/null || true) | qgrep -i 'Audio Track'; then
+      CD_VOLUME="$v"; return 0
+    fi
+    [ "${n:-0}" -ge 2 ] && { CD_VOLUME="$v"; return 0; }
+  done
+  return 1
+}
+
+scan_sources() {
+  local d z n dirs
+  SRC=()
+
+  if find_cd; then
+    n=$( (ls "$CD_VOLUME" 2>/dev/null || true) | grep -ic '\.aiff\?$' || true )
+    SRC+=("cd	$CD_VOLUME	$(basename "$CD_VOLUME")	${n:-0} tracks · in the drive")
+  fi
+
+  dirs="${PLAYER_DIRS:-$HOME/Music:$HOME/Downloads}"
+  # A colon-separated path list, walked without an IFS change that would then
+  # have to be put back before anything else in this function ran.
+  while [ -n "$dirs" ]; do
+    d="${dirs%%:*}"
+    case "$dirs" in *:*) dirs="${dirs#*:}" ;; *) dirs='' ;; esac
+    [ -n "$d" ] && [ -d "$d" ] || continue
+
+    while IFS= read -r z; do
+      [ -n "$z" ] || continue
+      SRC+=("zip	$z	$(basename "$z")	$(du -h "$z" 2>/dev/null | cut -f1 | tr -d ' ') · zip")
+    done < <(find "$d" -maxdepth 1 -type f -iname '*.zip' 2>/dev/null | LC_ALL=C sort)
+
+    while IFS= read -r z; do
+      [ -n "$z" ] || continue
+      n=$(audio_count "$z")
+      [ "$n" -gt 0 ] || continue
+      SRC+=("dir	$z	$(basename "$z")	$n tracks · folder")
+    done < <(find "$d" -maxdepth 1 -type d ! -path "$d" 2>/dev/null | LC_ALL=C sort)
+  done
+  return 0
+}
+
+AUDIO_GLOB=( -iname '*.aif' -o -iname '*.aiff' -o -iname '*.flac' -o -iname '*.mp3'
+             -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' -o -iname '*.m4a'
+             -o -iname '*.wma' -o -iname '*.ape'  -o -iname '*.alac' -o -iname '*.mp4' )
+
+audio_count() {  # audio_count <dir>
+  find "$1" -maxdepth 1 -type f \( "${AUDIO_GLOB[@]}" \) 2>/dev/null | wc -l | tr -d ' '
+}
+
+# ------------------------------------------------------------------ picker --
+
+# The first screen: everything playable this machine can see, on one panel, in
+# the order it was found — the disc in the drive first, because if there is one
+# in there it is almost certainly what you came to play.
+pick_frame() {  # pick_frame <cursor> <top> <rows> <status>
+  local cur=$1 top=$2 vis=$3 status=$4 k rec kind path label detail mark meta body
+  local last=$(( top + vis ))
+
+  printf -v meta '%d SOURCE%s' "${#SRC[@]}" "$( [ "${#SRC[@]}" -eq 1 ] || printf S )"
+  faceplate "$meta"
+  printf '\n'
+  printf '    %b%s%b\n' "$ETCH" "SELECT A SOURCE" "$OFF"
+  printf '\n'
+
+  k=$top
+  while [ "$k" -lt "$last" ] && [ "$k" -lt "${#SRC[@]}" ]; do
+    rec=${SRC[$k]}
+    IFS=$'\t' read -r kind path label detail <<< "$rec"
+    case "$kind" in
+      cd)  mark='⊙' ;;
+      zip) mark='▤' ;;
+      *)   mark='▸' ;;
+    esac
+    fitv "$label" 44
+    if [ "$cur" -eq "$k" ]; then
+      printf -v body '%s  %s  %s' "$mark" "$FIT" "$(fit "$detail" 18)"
+      printf '  %b▶%b %b%s%b\n' "$AMBER" "$OFF" "$INV" "$body" "$OFF"
+    else
+      printf '    %b%s%b  %s  %b%s%b\n' \
+        "$ETCH" "$mark" "$OFF" "$FIT" "$DIM" "$(fit "$detail" 18)" "$OFF"
+    fi
+    k=$(( k + 1 ))
+  done
+  [ "$last" -lt "${#SRC[@]}" ] && more_row $(( ${#SRC[@]} - last ))
+
+  printf '\n'
+  keys '↑↓' SELECT '⏎' OPEN R RESCAN Q QUIT
+  [ -n "$status" ] && printf '\n  %b%s%b\n' "$AMBER" "$status" "$OFF"
+  return 0
+}
+
+# The picker's own row budget. Same reasoning as np_fit_rows: the frame must stay
+# under the window or \033[H loses the panel's top row for good.
+pick_rows() {  # pick_rows <status> -> $PICK_ROWS
+  local budget
+  term_size
+  budget=$(( TERM_LINES - PICK_CHROME ))
+  [ -n "$1" ] && budget=$(( budget - 2 ))
+  [ "${#SRC[@]}" -gt "$budget" ] && budget=$(( budget - 1 ))
+  [ "$budget" -lt 1 ] && budget=1
+  PICK_ROWS=$budget
+  return 0
+}
+
+# Returns the chosen record in $PICKED, or nonzero if the user walked away.
+PICKED=''
+pick_source() {
+  local cur=0 top=0 status='' frame
+  PICKED=''
+  [ "${#SRC[@]}" -gt 0 ] || die "nothing to play. Put an album in ${PLAYER_DIRS:-~/Music or ~/Downloads}, or a CD in the drive"
+
+  # One source and no argument is not a choice, it is the answer.
+  if [ "${#SRC[@]}" -eq 1 ]; then PICKED=${SRC[0]}; return 0; fi
+  [ "$SCREEN" -eq 1 ] || { PICKED=${SRC[0]}; return 0; }
+
+  tui_block
+  while :; do
+    [ "$cur" -lt 0 ] && cur=0
+    [ "$cur" -ge "${#SRC[@]}" ] && cur=$(( ${#SRC[@]} - 1 ))
+    pick_rows "$status"
+    [ "$cur" -lt "$top" ] && top=$cur
+    [ "$cur" -ge $(( top + PICK_ROWS )) ] && top=$(( cur - PICK_ROWS + 1 ))
+    [ "$top" -lt 0 ] && top=0
+
+    frame=$(pick_frame "$cur" "$top" "$PICK_ROWS" "$status")
+    paint "$frame"
+    status=''
+
+    read_key || { tui_cooked; return 1; }
+    case "$KEY" in
+      $'\033[A'|k)  cur=$(( cur - 1 )) ;;
+      $'\033[B'|j)  cur=$(( cur + 1 )) ;;
+      $'\033[5~')   cur=$(( cur - PICK_ROWS )) ;;
+      $'\033[6~')   cur=$(( cur + PICK_ROWS )) ;;
+      $'\n'|$'\r')  PICKED=${SRC[$cur]}; tui_cooked; return 0 ;;
+      r|R)          scan_sources; status='▪ RESCANNED' ;;
+      q|Q)          tui_cooked; return 1 ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------------ loading --
+
+# A stage of the same display, for the seconds a zip takes to come out of its
+# archive. The bar is the album meter with no bands yet — one per file as they
+# land, which is the honest picture of the wait.
+LAST_STAGE=''
+load_stage() {  # load_stage <title> <done> <total> <line>
+  local frame head=0
+  # Without a panel there is nowhere to redraw, so a per-file line would just be
+  # the file list twice over. One line per stage, when the stage changes.
+  if [ "$SCREEN" -ne 1 ]; then
+    if [ "${1%% ·*}" != "$LAST_STAGE" ]; then
+      LAST_STAGE=${1%% ·*}
+      printf '  %s %s\n' "$LAST_STAGE" "$SRC_LABEL" >&2
+    fi
+    return 0
+  fi
+  [ "$3" -gt 0 ] && head=$(( $2 * STRIP_WIDTH * 8 / $3 ))
+  bands $(( STRIP_WIDTH * 8 )) 1
+  trackbar "$2" "$3"
+  frame=$(
+    faceplate "$1"
+    printf '\n'
+    printf '    %b%-8s%b %s\n' "$ETCH" SOURCE "$OFF" "$SRC_LABEL"
+    printf '\n'
+    printf '    %b%-8s%b %s\n' "$ETCH" READING "$OFF" "$(fit "$4" 52)"
+    printf '\n'
+    printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$TRACKBAR" "$ETCH" "$OFF"
+  )
+  paint "$frame"
+  return 0
+}
+
+# Open whatever was picked and leave a directory of playable files in $AUDIO_DIR.
+#
+# A zip is unpacked entry by entry rather than in one unzip run, which costs a
+# fork per file and buys the only progress report there is: the central directory
+# is read once per entry, and on an album that is a dozen reads of a few hundred
+# bytes. Everything in the zip is taken, not just the audio — the cover art is
+# worth having on the panel, and a zip of an album is not big enough to be worth
+# being clever about.
+AUDIO_DIR=''
+SRC_KIND=''; SRC_PATH=''; SRC_LABEL=''; SRC_DETAIL=''
+open_source() {  # open_source <record>
+  local rec=$1 n=0 total=0 entry esc
+  IFS=$'\t' read -r SRC_KIND SRC_PATH SRC_LABEL SRC_DETAIL <<< "$rec"
+
+  case "$SRC_KIND" in
+    dir|cd)
+      AUDIO_DIR="$SRC_PATH"
+      ;;
+    zip)
+      command -v unzip >/dev/null || die "unzip not found — cannot open $SRC_LABEL"
+      scratch
+      AUDIO_DIR="$WORK/album"
+      mkdir -p "$AUDIO_DIR"
+      total=$( (unzip -Z1 "$SRC_PATH" 2>/dev/null || true) | grep -vc '/$' || true )
+      [ "${total:-0}" -gt 0 ] || die "nothing inside $SRC_LABEL"
+      load_stage "OPENING" 0 "$total" "$SRC_LABEL"
+      while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        case "$entry" in */) continue ;; esac
+        # unzip reads the name it is handed as a pattern, not as a filename, so
+        # the brackets in "Track [Live].mp3" are a character class that matches
+        # one of L, i, v, e — and the track is silently not there afterwards.
+        # Escaping the three metacharacters is what makes it a literal name.
+        esc=${entry//\\/\\\\}
+        esc=${esc//\[/\\[}; esc=${esc//\*/\\*}; esc=${esc//\?/\\?}
+        # -o overwrites without asking, -qq says nothing, and a failure on one
+        # entry is not a reason to abandon an album — a zip with one corrupt
+        # booklet scan in it still has twelve good tracks.
+        unzip -qq -o "$SRC_PATH" "$esc" -d "$AUDIO_DIR" 2>/dev/null || true
+        n=$(( n + 1 ))
+        load_stage "OPENING · $(( n * 100 / total ))%" "$n" "$total" "$(basename "$entry")"
+      done < <(unzip -Z1 "$SRC_PATH" 2>/dev/null || true)
+      ;;
+    *)
+      die "cannot open a source of kind: $SRC_KIND"
+      ;;
+  esac
+  return 0
+}
+
+# ------------------------------------------------------------ read metadata --
+
+FILES=(); DURS=(); TITLES=(); ARTISTS=(); TRKNOS=(); DISCNOS=()
+ALBUM=""; ALBUM_ARTIST=""; YEAR=""; UNTAGGED=0; META_SOURCE="tags"
+TOTAL=0
+
+read_metadata() {
+  local f dur trk disc title album artist aartist year key val n=0 total
+  FILES=(); DURS=(); TITLES=(); ARTISTS=(); TRKNOS=(); DISCNOS=()
+  ALBUM=""; ALBUM_ARTIST=""; YEAR=""; UNTAGGED=0; TOTAL=0
+
+  total=$(find "$AUDIO_DIR" -type f \( "${AUDIO_GLOB[@]}" \) 2>/dev/null | wc -l | tr -d ' ')
+  [ "${total:-0}" -gt 0 ] || die "no audio in $SRC_LABEL"
+
+  while IFS= read -r f; do
+    # One ffprobe call per file for duration and the tags we sort and label by.
+    dur=""; trk=""; disc=""; title=""; album=""; artist=""; aartist=""; year=""
+    while IFS='=' read -r key val; do
+      case "$key" in
+        duration)                         dur="$val" ;;
+        TAG:track|TAG:tracknumber)        trk="$val" ;;
+        TAG:disc|TAG:discnumber)          disc="$val" ;;
+        TAG:title)                        title="$val" ;;
+        TAG:album)                        album="$val" ;;
+        TAG:artist)                       artist="$val" ;;
+        TAG:album_artist|TAG:albumartist) aartist="$val" ;;
+        TAG:date|TAG:year|TAG:originalyear) [ -z "$year" ] && year="$val" ;;
+      esac
+    done < <(ffprobe -v error -show_entries \
+        'format=duration:format_tags=track,tracknumber,disc,discnumber,title,album,artist,album_artist,albumartist,date,year,originalyear' \
+        -of default=nw=1 "$f" 2>/dev/null || true)
+
+    # A file ffprobe cannot read is skipped rather than fatal: it is one bad
+    # track in a zip, and eleven good ones are still an album worth playing.
+    [ -n "$dur" ] && [ "$dur" != "N/A" ] || { n=$(( n + 1 )); continue; }
+
+    # Tags are often "3/12" — keep the part before the slash. Missing track
+    # numbers sort last, so tagged files keep their album order regardless.
+    # 10# forces base ten: taggers write "08", and bash reads a leading zero as
+    # octal and rejects 08 and 09 outright.
+    trk="${trk%%/*}";   case "$trk"  in ''|*[!0-9]*) trk=9999; UNTAGGED=1 ;; esac
+    disc="${disc%%/*}"; case "$disc" in ''|*[!0-9]*) disc=1 ;; esac
+
+    # A CDDA volume has no tags on it at all, so the track number has to come off
+    # the name macOS gave the file — "1 Audio Track.aiff". It matters more than
+    # ordering: CD-Text and MusicBrainz both answer in track numbers, and without
+    # this every one of them would be applied to the wrong row, because a plain
+    # sort puts track 10 between 1 and 2.
+    if [ "$SRC_KIND" = cd ] && [ "$trk" = 9999 ]; then
+      lead=$(basename "$f"); lead=${lead%%[!0-9]*}
+      case "$lead" in
+        ''|*[!0-9]*) ;;
+        *) trk=$lead; UNTAGGED=0 ;;
+      esac
+    fi
+    trk=$(( 10#$trk )); disc=$(( 10#$disc ))
+
+    # A tag with a tab or a newline in it is rare and entirely possible, and it
+    # breaks two things at once: a newline inside a panel row bends the frame the
+    # width code works to keep square, and a tab is the separator every record in
+    # this file is split on. Flattened to a space here, once.
+    title=${title//[$'\t\n\r']/ }
+    artist=${artist//[$'\t\n\r']/ }
+    album=${album//[$'\t\n\r']/ }
+    aartist=${aartist//[$'\t\n\r']/ }
+
+    FILES+=("$f")
+    # Round up, never down: a track that ends before the meter says it does looks
+    # like a skip.
+    DURS+=("$(awk -v d="$dur" 'BEGIN { printf "%d", (d == int(d) ? d : int(d) + 1) }')")
+    TITLES+=("${title:-$(basename "$f")}")
+    ARTISTS+=("$artist")
+    TRKNOS+=("$trk")
+    DISCNOS+=("$disc")
+    [ -z "$ALBUM" ] && ALBUM="$album"
+    [ -z "$ALBUM_ARTIST" ] && ALBUM_ARTIST="${aartist:-$artist}"
+    # Dates are often full ISO stamps; the year is the only part anyone labels with.
+    [ -z "$YEAR" ] && YEAR="${year%%-*}"
+
+    n=$(( n + 1 ))
+    load_stage "READING · $(( n * 100 / total ))%" "$n" "$total" "$(basename "$f")"
+  done < <(find "$AUDIO_DIR" -type f \( "${AUDIO_GLOB[@]}" \) 2>/dev/null | LC_ALL=C sort)
+
+  [ "${#FILES[@]}" -gt 0 ] || die "no readable audio in $SRC_LABEL"
+
+  # Fall back to the folder or zip's own name, which is nearly always the album.
+  [ -z "$ALBUM" ] && ALBUM="${SRC_LABEL%.zip}"
+  return 0
+}
+
+# Sort by disc, then track number, then filename. Files without track tags all
+# share key 9999 and fall back to a natural filename sort among themselves.
+ORDER=()
+order_tracks() {
+  local i
+  ORDER=()
+  while IFS= read -r i; do ORDER+=("$i"); done < <(
+    for i in $(seq 0 $(( ${#FILES[@]} - 1 ))); do
+      printf '%04d\t%04d\t%s\t%d\n' \
+        "${DISCNOS[$i]}" "${TRKNOS[$i]}" "$(basename "${FILES[$i]}")" "$i"
+    done | LC_ALL=C sort -t"$(printf '\t')" -k1,1n -k2,2n -k3,3V | cut -f4
+  )
+  TOTAL=0
+  for i in "${ORDER[@]}"; do TOTAL=$(( TOTAL + DURS[i] )); done
+  return 0
+}
+
+# Track number -> the row that holds it, echoed. CD-Text and MusicBrainz both
+# answer in track numbers while the arrays are in the order the files were
+# scanned, and those are not the same thing, so nothing may index by "n - 1".
+row_of_track() {
+  local i
+  for i in $(seq 0 $(( ${#TRKNOS[@]} - 1 ))); do
+    [ "${TRKNOS[$i]}" -eq "$1" ] && { printf '%d' "$i"; return 0; }
+  done
+  return 1
+}
+
+# --------------------------------------------------------------- CD metadata --
+
+# macOS mounts an audio CD as a volume of files called "1 Audio Track.aiff",
+# which is a track list with no titles in it. There are two better answers and
+# this tries both, in the order of how much they can be trusted.
+#
+# CD-Text is written on the disc itself by whoever pressed it, so when it is
+# there it is the answer. Most discs do not carry it.
+#
+# MusicBrainz is asked with a disc ID computed from the table of contents, which
+# identifies a pressing rather than an album — so it distinguishes the 1984 CD
+# from the 2011 remaster with the bonus tracks, and gets the track list right for
+# whichever one is actually in the drive. It needs the network, and it is only
+# asked when CD-Text has already come up empty.
+#
+# Whichever answered is printed on the faceplate. A track list is only as good as
+# its source, and "CD-TEXT" and "MUSICBRAINZ" are different degrees of certain.
+detect_dev() {
+  [ -n "$DEV" ] && return 0
+  local class n cand
+  # macOS names an optical drive after the richest media class its driver
+  # publishes: a SuperDrive that reads CDs all day comes up as IODVDServices
+  # because it can also read a DVD. Ask each name in turn.
+  for class in IODVDServices IOCompactDiscServices IOBDServices; do
+    for n in 0 1; do
+      cand="$class/$n"
+      if cdrecord -checkdrive dev="$cand" >/dev/null 2>&1; then
+        DEV="$cand"; return 0
+      fi
+    done
+  done
+  DEV="IODVDServices/0"
+  return 1
+}
+
+# CD-Text off the disc, into TITLES/ARTISTS/ALBUM. cdrtools prints it in a couple
+# of shapes depending on version, so both are matched and neither is required.
+#
+# Every value on the disc arrives inside single quotes, and the quote that ends
+# one is the one before " from '" or the one at the end of the line — not simply
+# the next one along. Matching to the next one along cuts "Don't Stop Me Now"
+# down to "Don", which is a title the disc does not have and no way to tell that
+# from a disc that really is called that.
+cd_text() {
+  local out line name n i got=0 titles=0
+  command -v cdrecord >/dev/null || command -v cdda2wav >/dev/null || return 1
+  detect_dev || true
+
+  out=''
+  if command -v cdda2wav >/dev/null; then
+    out=$( (cdda2wav dev="$DEV" -J -v titles 2>&1) || true )
+  fi
+  if ! printf '%s' "$out" | qgrep -i 'title'; then
+    command -v cdrecord >/dev/null && out=$( (cdrecord dev="$DEV" -toc -v 2>&1) || true )
+  fi
+  [ -n "$out" ] || return 1
+
+  # "Album title: 'Nonagon Infinity' from 'King Gizzard'"
+  line=$(printf '%s\n' "$out" \
+    | sed -n -e "s/^Album title:[ ]*'\(.*\)'[ ]*from[ ]*'.*'[ ]*\$/\1/p" \
+             -e "s/^Album title:[ ]*'\(.*\)'[ ]*\$/\1/p" | head -1)
+  [ -n "$line" ] && { ALBUM="$line"; got=1; }
+  line=$(printf '%s\n' "$out" \
+    | sed -n "s/^Album title:.*'[ ]*from[ ]*'\(.*\)'[ ]*\$/\1/p" | head -1)
+  [ -n "$line" ] && { ALBUM_ARTIST="$line"; got=1; }
+
+  # "Track  1 title: 'Robot Stop' from 'King Gizzard'"
+  while IFS= read -r line; do
+    n=$(printf '%s' "$line" | sed -n "s/^Track[ ]*\([0-9]*\).*/\1/p")
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    i=$(row_of_track $(( 10#$n )) ) || continue
+    # Read into a local first: a shape this does not match would otherwise blank
+    # the tidy "Track 07" cd_metadata has already put there, and a row with no
+    # title at all is worse than a row with a dull one.
+    name=$(printf '%s' "$line" \
+      | sed -n -e "s/^Track[ ]*[0-9]*[ ]*title:[ ]*'\(.*\)'[ ]*from[ ]*'.*'[ ]*\$/\1/p" \
+               -e "s/^Track[ ]*[0-9]*[ ]*title:[ ]*'\(.*\)'[ ]*\$/\1/p")
+    [ -n "$name" ] || continue
+    TITLES[$i]="${name//[$'\t\n\r']/ }"
+    name=$(printf '%s' "$line" \
+      | sed -n "s/^Track[ ]*[0-9]*[ ]*title:.*'[ ]*from[ ]*'\(.*\)'[ ]*\$/\1/p")
+    [ -n "$name" ] && ARTISTS[$i]="${name//[$'\t\n\r']/ }"
+    got=1; titles=$(( titles + 1 ))
+  done < <(printf '%s\n' "$out" | grep -i '^Track[ ]*[0-9]*[ ]*title:' || true)
+
+  # Not $got: an album title on its own is not a track list, and returning 0 for
+  # one would both stamp CD-TEXT on the faceplate over a column of bare track
+  # numbers and rob the disc of the MusicBrainz lookup that could have named
+  # them. Whatever album and artist were found stay put either way — mb_lookup
+  # overwrites what it knows better and leaves the rest alone.
+  [ "$titles" -gt 0 ] || return 1
+  META_SOURCE="CD-Text"
+  return 0
+}
+
+# The MusicBrainz disc ID: SHA-1 over the first track, the last track, the
+# lead-out offset and all 99 track offsets, each as uppercase hex, then base64
+# with a URL-safe alphabet. It is a fingerprint of the pressing, which is why it
+# can tell two masterings of the same album apart.
+#
+# The offsets come from the drive's table of contents in frames, plus the 150
+# frame pre-gap that every CD address is measured from.
+mb_discid() {  # mb_discid -> $DISCID, $MB_TOC
+  local out line n off first=0 last=0 leadout=0 hex='' i
+  local -a OFFS
+  DISCID=''; MB_TOC=''
+  command -v cdrecord >/dev/null || return 1
+  command -v shasum   >/dev/null || return 1
+  detect_dev || true
+
+  out=$( (cdrecord dev="$DEV" -toc 2>&1) || true )
+  OFFS=()
+  # "track:   1 lba:         0 (       0) 00:02:00 adr: 1 control: 0 mode: -1"
+  while IFS= read -r line; do
+    n=$(printf '%s' "$line" | sed -n 's/^track:[ ]*\([0-9]*\).*/\1/p')
+    off=$(printf '%s' "$line" | sed -n 's/.*lba:[ ]*\(-*[0-9]*\).*/\1/p')
+    case "$n$off" in ''|*[!0-9-]*) continue ;; esac
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    case "$off" in ''|*[!0-9-]*) continue ;; esac
+    n=$(( 10#$n ))
+    OFFS[$n]=$(( off + 150 ))
+    [ "$first" -eq 0 ] && first=$n
+    [ "$n" -gt "$last" ] && last=$n
+  done < <(printf '%s\n' "$out" | grep '^track:' || true)
+
+  # The lead-out is track 0xAA in the TOC, printed by cdrtools as "lout".
+  leadout=$(printf '%s\n' "$out" \
+    | sed -n 's/^track:[ ]*lout[ ]*lba:[ ]*\([0-9]*\).*/\1/p' | head -1)
+  case "$leadout" in ''|*[!0-9]*) return 1 ;; esac
+  leadout=$(( leadout + 150 ))
+
+  [ "$first" -gt 0 ] && [ "$last" -ge "$first" ] || return 1
+
+  printf -v hex '%02X%02X%08X' "$first" "$last" "$leadout"
+  MB_TOC="$first $last $leadout"
+  i=1
+  while [ "$i" -le 99 ]; do
+    printf -v hex '%s%08X' "$hex" "${OFFS[$i]:-0}"
+    [ "$i" -ge "$first" ] && [ "$i" -le "$last" ] && MB_TOC="$MB_TOC ${OFFS[$i]:-0}"
+    i=$(( i + 1 ))
+  done
+
+  # base64 of the raw SHA-1, then MusicBrainz's own alphabet: + / = become . _ -
+  DISCID=$(printf '%s' "$hex" | xxd -r -p 2>/dev/null | shasum -b 2>/dev/null \
+    | cut -d' ' -f1 | xxd -r -p 2>/dev/null | base64 2>/dev/null \
+    | tr '+/=' '._-' | tr -d '\n')
+  [ -n "$DISCID" ] || return 1
+  return 0
+}
+
+# Ask MusicBrainz what disc this is. Deliberately forgiving: no network, a disc
+# nobody has submitted, a rate limit or a malformed answer all mean the same
+# thing here — the track numbers stay, and the panel says so.
+mb_lookup() {
+  local json titles artists alb art i n=0 t
+  [ "$USE_MB" = 1 ] || return 1
+  command -v curl >/dev/null || return 1
+  mb_discid || return 1
+
+  json=$(curl -sS -m 12 -A 'player/1.0 ( https://github.com/gvorbeck )' \
+    "https://musicbrainz.org/ws/2/discid/${DISCID}?fmt=json&inc=recordings+artist-credits" \
+    2>/dev/null || true)
+  [ -n "$json" ] || return 1
+  printf '%s' "$json" | qgrep '"releases"' || return 1
+
+  if command -v jq >/dev/null; then
+    alb=$(printf '%s' "$json" | jq -r '.releases[0].title // empty' 2>/dev/null || true)
+    art=$(printf '%s' "$json" | jq -r '.releases[0]."artist-credit"[0].name // empty' 2>/dev/null || true)
+    t=$(printf '%s' "$json"   | jq -r '.releases[0].date // empty' 2>/dev/null || true)
+    # The medium this disc actually is, matched on the disc ID that was used to
+    # ask the question — not every medium that has one. A release is one entry
+    # per disc in the box, so taking them all concatenates disc two's track list
+    # onto disc one's, and the loop below then hands disc one's titles to
+    # whichever disc is in the drive. Bracketed and indexed rather than piped
+    # through select, because a medium carries several disc IDs for the same
+    # pressing and select would emit it once per ID.
+    titles=$(printf '%s' "$json" | jq -r --arg id "$DISCID" \
+      '[.releases[0].media[]? | select([.discs[]?.id] | index($id))][0] | .tracks[]?.title' \
+      2>/dev/null || true)
+    # A release with one medium and no disc IDs listed against it is still that
+    # medium, so a single-disc answer is worth taking on its own.
+    [ -n "$titles" ] || titles=$(printf '%s' "$json" | jq -r \
+      'select((.releases[0].media | length) == 1) | .releases[0].media[0].tracks[]?.title' \
+      2>/dev/null || true)
+  else
+    return 1
+  fi
+
+  [ -n "$alb" ] && ALBUM="$alb"
+  [ -n "$art" ] && ALBUM_ARTIST="$art"
+  [ -n "$t" ]   && YEAR="${t%%-*}"
+
+  # The list comes back in track order, so the nth title belongs to track n --
+  # which is not row n, hence the lookup.
+  n=0
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    n=$(( n + 1 ))
+    i=$(row_of_track "$n") || continue
+    TITLES[$i]="${t//[$'\t\n\r']/ }"
+    [ -n "$ALBUM_ARTIST" ] && ARTISTS[$i]="$ALBUM_ARTIST"
+  done < <(printf '%s\n' "$titles")
+
+  [ "$n" -gt 0 ] || return 1
+  META_SOURCE="MusicBrainz"
+  return 0
+}
+
+# A mounted CD has no tags at all, so everything the panel shows has to come from
+# somewhere else. Tried in order of trust, and whichever answers is recorded.
+cd_metadata() {
+  local i
+  META_SOURCE="track numbers"
+  # macOS numbers them "1 Audio Track.aiff"; make that a clean default first, so
+  # a failure below still leaves a tidy list rather than filenames.
+  i=0
+  while [ "$i" -lt "${#TITLES[@]}" ]; do
+    case "${TITLES[$i]}" in
+      # Not printf -v: bash 3.2 will not write into an array element that way.
+      *Audio\ Track*|*audio\ track*) TITLES[$i]=$(printf 'Track %02d' "${TRKNOS[$i]}") ;;
+    esac
+    i=$(( i + 1 ))
+  done
+  [ -z "$ALBUM" ] && ALBUM="$(basename "$SRC_PATH")"
+
+  load_stage "READING DISC" 1 3 "looking for CD-Text"
+  cd_text && return 0
+  load_stage "READING DISC" 2 3 "asking MusicBrainz"
+  mb_lookup && return 0
+  load_stage "READING DISC" 3 3 "no titles on this disc"
+  return 1
+}
+
+# ------------------------------------------------------------ now playing --
+
+# The panel the app spends its life on. Three blocks under the faceplate: what
+# the album is, what its tracks are, and where in them the playhead has got to.
+#
+# Two meters rather than one, because they answer different questions and each
+# one is the wrong answer to the other's. The track bar is "how much of this song
+# is left", which is what you want when you are deciding whether to skip. The
+# album meter is burncd's capacity meter with the playhead on it — the tracks as
+# bands, so you can see the shape of the record and where in that shape you are.
+#
+# Everything here is read out of the caller's locals. np_frame is called from
+# inside the event loop, which is where all the state lives.
+np_frame() {
+  local k i row body meta mark lbl want lo hi
+  local last=$(( np_top + np_rows ))
+
+  printf -v meta '%s · %d TRACKS%s' "$mode_label" "${#ORDER[@]}" "$meta_tail"
+  faceplate "$meta"
+  printf '\n'
+  printf '    %b%-8s%b %s\n' "$ETCH" ALBUM  "$OFF" "${ALBUM:-—}"
+  printf '    %b%-8s%b %b%s%b\n' "$ETCH" ARTIST "$OFF" "$DIM" "${ALBUM_ARTIST:-—}" "$OFF"
+  # Not the metadata source as well: the faceplate says where the titles came
+  # from, and saying it twice on one screen reads like two different facts.
+  printf '    %b%-8s%b %b%s%b\n' "$ETCH" SOURCE "$OFF" "$DIM" \
+    "$(fit "$SRC_LABEL" 52)" "$OFF"
+  printf '\n'
+
+  k=$np_top
+  while [ "$k" -lt "$last" ] && [ "$k" -lt "${#ORDER[@]}" ]; do
+    i=${ORDER[$k]}
+    # Two different things are marked on this list and they are not the same
+    # thing: ♪ is the track the music is coming out of, and the reverse bar with
+    # burncd's ▶ in the gutter is the row the cursor is on. Usually they agree;
+    # when you are browsing ahead they do not, and the panel has to be able to
+    # say so — which is why the playing mark is not a second arrow.
+    if [ "$k" -eq "$cur_track" ]; then
+      if [ "$paused" = true ]; then mark='‖'; else mark='♪'; fi
+    else
+      mark=' '
+    fi
+    printf -v row '%02d' $(( k + 1 ))
+    fitv "${TITLES[$i]}" 32; lbl=$FIT
+    fitv "${ARTISTS[$i]}" 18
+    mmssv "${DURS[$i]}"
+    if [ "$k" -eq "$np_cur" ]; then
+      printf -v body '%s %s  %s  %s  %5s' "$mark" "$row" "$lbl" "$FIT" "$MMSS"
+      printf '  %b▶%b %b%s%b\n' "$AMBER" "$OFF" "$INV" "$body" "$OFF"
+    else
+      printf '    %b%s%b %b%s%b  %s  %b%s%b  %b%5s%b\n' \
+        "$AMBER" "$mark" "$OFF" "$ETCH" "$row" "$OFF" "$lbl" \
+        "$DIM" "$FIT" "$OFF" "$ETCH" "$MMSS" "$OFF"
+    fi
+    k=$(( k + 1 ))
+  done
+  [ "$last" -lt "${#ORDER[@]}" ] && more_row $(( ${#ORDER[@]} - last ))
+
+  # The track readout, and the bar for it. The label sits on the left and the
+  # counter on the right, with the pad between them worked out from the finished
+  # "0:00 / 0:00" string — the same arithmetic burncd's capacity meter uses, so
+  # both readouts land on the same right-hand edge as the bars under them.
+  printf '\n'
+  mmssv "$pos";  lo=$MMSS
+  mmssv "$tdur"; hi=$MMSS
+  printf -v body 'TRACK %02d OF %02d' $(( cur_track + 1 )) "${#ORDER[@]}"
+  printf -v want '%s / %s' "$lo" "$hi"
+  pad $(( PANEL - ${#body} - ${#want} ))
+  printf '  %b%s%b%s%b%s%b %b/ %s%b\n' \
+    "$ETCH" "$body" "$OFF" "$PAD" "$AMBER" "$lo" "$OFF" "$DIM" "$hi" "$OFF"
+  trackbar "$pos" "$tdur"
+  printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$TRACKBAR" "$ETCH" "$OFF"
+
+  # The album meter, with the playhead where it actually is across the whole
+  # record rather than across this one song.
+  printf '\n'
+  mmssv "$apos";  lo=$MMSS
+  mmssv "$TOTAL"; hi=$MMSS
+  body=ALBUM
+  printf -v want '%s / %s' "$lo" "$hi"
+  pad $(( PANEL - ${#body} - ${#want} ))
+  printf '  %b%s%b%s%b%s%b %b/ %s%b\n' \
+    "$ETCH" "$body" "$OFF" "$PAD" "$AMBER" "$lo" "$OFF" "$DIM" "$hi" "$OFF"
+  bandbar "$ahead"
+  printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$BANDBAR" "$ETCH" "$OFF"
+
+  # The analyser stands where burncd puts its minute scale, and says the one
+  # thing no number on this panel says at a glance: what the music is doing.
+  #
+  # Its rows are left empty here and written over by np_draw, in the same write
+  # that puts this frame on the screen. Two reasons, and the second one is why
+  # it is worth the indirection:
+  #
+  # np_frame is run inside $( ) to be captured, which makes it a subshell, and a
+  # subshell's writes to the column state would be thrown away with it — the
+  # columns would fall back a frame every time the panel rebuilt.
+  #
+  # And the analyser is two thousand bytes of escapes and three-byte blocks. The
+  # frame goes through two whole-string substitutions on its way to the screen,
+  # and both of them walk multibyte text a character at a time: carrying the
+  # analyser through them cost fifty milliseconds of every panel rebuild, which
+  # is the best part of a tick, once a second, at exactly the moment the columns
+  # were meant to move. Written straight to its rows instead, it costs one.
+  i=0
+  while [ "$i" -lt "$SPEC_ROWS" ]; do
+    printf '  %b▐%b%s%b▌%b\n' "$ETCH" "$OFF" "$SPEC_BLANK" "$ETCH" "$OFF"
+    i=$(( i + 1 ))
+  done
+
+  printf '\n'
+  keys '␣' PLAY '←→' SEEK '↑↓' SELECT '⏎' JUMP N NEXT P PREV
+  keys S SHUFFLE R REPEAT Q QUIT
+  [ -n "$status" ] && printf '\n  %b%s%b\n' "$AMBER" "$status" "$OFF"
+  return 0
+}
+
+# How many track rows fit. Counted rather than assumed, for the reason paint()
+# sets out: \033[H is absolute, so a frame one row taller than the window scrolls
+# the panel's top row away permanently and every frame after it homes to a row
+# that holds something else.
+np_fit_rows() {  # np_fit_rows <status> -> $NP_ROWS
+  local budget
+  term_size
+  budget=$(( TERM_LINES - NP_CHROME ))
+  [ -n "$1" ] && budget=$(( budget - 2 ))
+  [ "${#ORDER[@]}" -gt "$budget" ] && budget=$(( budget - 1 ))
+  [ "$budget" -lt 1 ] && budget=1
+  NP_ROWS=$budget
+  return 0
+}
+
+# ------------------------------------------------------------------ engine --
+
+# mpv, driven over its JSON IPC socket, one track at a time.
+#
+# mpv has a playlist of its own and this deliberately does not use it. Shuffle,
+# repeat and "play the row I am looking at" are this program's ideas about what
+# comes next, and a playlist held in two places is a playlist that disagrees with
+# itself. mpv is asked to play one file; when it reports that file finished, the
+# next one is chosen here and loaded.
+SOCK=''; CMDFIFO=''
+
+engine_start() {
+  local i
+  scratch
+  SOCK="$WORK/ipc.sock"
+  CMDFIFO="$WORK/cmd"
+  rm -f "$SOCK" "$CMDFIFO"
+  mkfifo "$CMDFIFO" || die "cannot create the command pipe"
+
+  # --idle so mpv survives the end of every track and waits to be told the next
+  # one. --no-terminal so it never writes on the panel or steals a keystroke.
+  mpv --no-video --idle=yes --no-terminal --no-config \
+      --keep-open=no \
+      --input-ipc-server="$SOCK" >/dev/null 2>&1 &
+  MPV_PID=$!
+
+  for i in $(seq 1 40); do
+    [ -S "$SOCK" ] && break
+    sleep 0.1
+  done
+  [ -S "$SOCK" ] || die "mpv did not open its control socket"
+
+  # Read-write rather than write-only. Opening a fifo for writing alone blocks
+  # until something opens the read end, and the reader here is nc — which is not
+  # started until the pipeline below, so a plain > would deadlock the app before
+  # it drew a single frame.
+  exec 3<>"$CMDFIFO"
+  return 0
+}
+
+# One command to mpv. Everything the transport does goes through here.
+mpv_cmd() { printf '%s\n' "$1" >&3; }
+
+# ------------------------------------------------------------------- play --
+
+# The event loop, and the whole of the running app.
+#
+# Three things happen at once and bash can block on exactly one of them, so all
+# three are funnelled into a single stream of \r-terminated records and the loop
+# below blocks on that:
+#
+#   \016      a tick, twenty a second: move the lamp, ask mpv where it is
+#   K<key>    a keystroke, read off /dev/tty by a reader of its own
+#   {...}     a line of JSON from mpv
+#
+# nc is the foreground member of the producer block on purpose. When mpv is told
+# to quit, its socket closes, nc ends, the other two producers are killed and the
+# pipe closes — which is what ends the loop. There is no other way out, and that
+# is the point: one exit path, and it runs the teardown every time.
+KEYMARK=$'\013'
+SCAN_MARK=$'\016'
+
+key_reader() {
+  # /dev/tty explicitly: the reader's own stdin is the pipeline, and it must not
+  # take a byte of it. Job control is off in a script, so this shares the shell's
+  # process group and can read the terminal without earning a SIGTTIN.
+  local k
+  while read_key; do
+    printf '%s%s\r' "$KEYMARK" "$KEY"
+  done < /dev/tty
+}
+
+play() {
+  local np_cur=0 np_top=0 np_rows=1 cur_track=0 status='' frame_no=0
+  local pos=0 tdur=0 apos=0 ahead=0 paused=false
+  local shuffle=0 repeat=0 mode_label=PLAYING meta_tail='' np_follow=1
+  local rec key frame i last_pos=-1 last_draw='' drew=0
+  local ptenth=0
+  local -a DUR_BY_ROW PRE
+
+  # The bands are the tracks of the album, fixed for the whole session, and only
+  # the head moves — so they are worked out once here rather than per frame.
+  DUR_BY_ROW=(); PRE=(); apos=0
+  i=0
+  while [ "$i" -lt "${#ORDER[@]}" ]; do
+    DUR_BY_ROW[$i]=${DURS[${ORDER[$i]}]}
+    PRE[$i]=$apos
+    apos=$(( apos + DUR_BY_ROW[i] ))
+    i=$(( i + 1 ))
+  done
+  apos=0
+  if [ "${#DUR_BY_ROW[@]}" -gt 0 ]; then
+    bands $(( STRIP_WIDTH * 8 )) "${DUR_BY_ROW[@]}"
+  else
+    bands 0
+  fi
+
+  printf -v meta_tail ' · %s' "$META_SOURCE"
+
+  tui_block
+  {
+    key_reader & KR=$!
+    while :; do printf '%s\r' "$SCAN_MARK"; sleep "$TICK"; done & TK=$!
+    nc -U "$SOCK" < "$CMDFIFO" | while IFS= read -r l; do printf '%s\r' "$l"; done
+    kill "$KR" "$TK" 2>/dev/null
+  } | {
+    # The rest of the script wants set -e; this loop does not. Half of what it
+    # does is ask a question — is the cursor past the end, did the album run
+    # out, is there a track before this one — and under set -e a "no" from a bare
+    # test or a helper's return 1 would take the whole player down mid-song. The
+    # right-hand side of a pipe is a subshell, so this stays inside the loop.
+    set +e
+
+    # And the same reason is why the window-size trap has to be set again here.
+    # bash resets every trap it is not ignoring when it makes a subshell, so the
+    # one screen_on installed does not exist on this side of the pipe — which is
+    # the side that draws the panel. Without it term_size answers out of a cache
+    # nothing ever invalidates, np_fit_rows budgets rows for the window the app
+    # started in, and a window made shorter mid-album gets a frame taller than
+    # it: every paint scrolls, \033[H starts addressing the wrong row, and the
+    # panel is wrecked for the rest of the session.
+    #
+    # last_pos too, because clearing the size only takes effect on a redraw and
+    # the tick below only redraws when a number changed. -1 is not a position
+    # any track can be at, so the next tick rebuilds at the new size.
+    trap 'TERM_LINES=; TERM_COLS=; last_pos=-1' WINCH
+
+    # Observed rather than polled: these change rarely and mpv volunteers them.
+    # time-pos is observed too — mpv throttles it to about eighteen a second,
+    # which is under the redraw budget and saves a round trip per frame.
+    mpv_cmd '{"command":["observe_property",1,"time-pos"]}'
+    mpv_cmd '{"command":["observe_property",2,"pause"]}'
+    mpv_cmd '{"command":["observe_property",3,"duration"]}'
+    load_track "$cur_track"
+
+    while IFS= read -r -d $'\r' rec || [ -n "$rec" ]; do
+      case "$rec" in
+
+        "$SCAN_MARK")
+          frame_no=$(( frame_no + 1 ))
+          # Advanced before anything is drawn and outside the two branches
+          # below, so the columns move at the tick's rate whether this frame
+          # rebuilds the panel or only repaints the analyser.
+          # Rendered here too, not just advanced, so that both branches below —
+          # the panel rebuild and the analyser-only repaint — print the same
+          # rows without either of them building them twice.
+          [ "$paused" != true ] && { spec_advance "$frame_no"; spec_render; }
+          # A whole frame twenty times over to advance one digit is nineteen
+          # redraws wasted. The panel is rebuilt when a number on it changed;
+          # every other tick repaints the analyser's rows alone, in place.
+          if [ "$pos" != "$last_pos" ]; then
+            last_pos=$pos
+            np_draw
+          elif [ "$drew" -eq 1 ] && [ "$paused" != true ] && [ "$spec_row" -gt 0 ]; then
+            spec_str
+            printf '%b' "$SPECSTR"
+          fi
+          continue
+          ;;
+
+        "$KEYMARK"*)
+          key=${rec#"$KEYMARK"}
+          case "$key" in
+            ' ')            mpv_cmd '{"command":["cycle","pause"]}' ;;
+            $'\033[D'|h)    mpv_cmd '{"command":["seek",-5,"relative"]}' ;;
+            $'\033[C'|l)    mpv_cmd '{"command":["seek",5,"relative"]}' ;;
+            $'\033[1;2D')   mpv_cmd '{"command":["seek",-30,"relative"]}' ;;
+            $'\033[1;2C')   mpv_cmd '{"command":["seek",30,"relative"]}' ;;
+            # Moving the cursor is browsing, and browsing means the cursor stops
+            # chasing the music until you pick something with it again.
+            $'\033[A'|k)    np_cur=$(( np_cur - 1 )); np_clamp; np_follow=0 ;;
+            $'\033[B'|j)    np_cur=$(( np_cur + 1 )); np_clamp; np_follow=0 ;;
+            $'\033[5~')     np_cur=$(( np_cur - np_rows )); np_clamp; np_follow=0 ;;
+            $'\033[6~')     np_cur=$(( np_cur + np_rows )); np_clamp; np_follow=0 ;;
+            $'\n'|$'\r')    np_follow=1; load_track "$np_cur" ;;
+            n|N)            np_follow=1; next_track; np_cur=$cur_track ;;
+            p|P)            np_follow=1; prev_track; np_cur=$cur_track ;;
+            s|S)            shuffle=$(( 1 - shuffle ))
+                            status="▪ SHUFFLE $( [ "$shuffle" -eq 1 ] && printf ON || printf OFF )" ;;
+            r|R)            repeat=$(( (repeat + 1) % 3 ))
+                            case $repeat in
+                              0) status='▪ REPEAT OFF' ;;
+                              1) status='▪ REPEAT ALBUM' ;;
+                              2) status='▪ REPEAT TRACK' ;;
+                            esac ;;
+            q|Q)            mpv_cmd '{"command":["quit"]}' ;;
+            *)              continue ;;
+          esac
+          np_draw
+          continue
+          ;;
+
+        '{'*)
+          case "$rec" in
+            *'"name":"time-pos"'*)
+              if [[ "$rec" =~ \"data\":([0-9]+)\.?([0-9]*) ]]; then
+                pos="${BASH_REMATCH[1]}"
+                # The readouts want whole seconds; the analyser's table has ten
+                # rows to the second, so the first decimal has to survive too.
+                ptenth="${BASH_REMATCH[2]:0:1}"
+                [ -z "$ptenth" ] && ptenth=0
+              fi ;;
+            *'"name":"duration"'*)
+              if [[ "$rec" =~ \"data\":([0-9]+)\.?([0-9]*) ]]; then
+                tdur="${BASH_REMATCH[1]}"
+              fi ;;
+            *'"name":"pause"'*)
+              [[ "$rec" =~ \"data\":(true|false) ]] && paused="${BASH_REMATCH[1]}"
+              mode_label=$( [ "$paused" = true ] && printf PAUSED || printf PLAYING )
+              np_draw ;;
+            *'"event":"end-file"'*)
+              # eof is a track that finished; anything else is a track that was
+              # replaced by the next loadfile and must not advance anything.
+              case "$rec" in
+                *'"reason":"eof"'*) track_ended ;;
+              esac ;;
+          esac
+          continue
+          ;;
+      esac
+    done
+  } || true
+  # || true because quitting is the normal way out and it is not a clean exit
+  # anywhere in that pipeline: q tells mpv to quit, mpv drops the socket, nc ends
+  # on a broken connection, and pipefail hands the whole pipeline nc's opinion of
+  # that. Getting to here means the loop ended, which is all this needs to know.
+  tui_cooked
+  return 0
+}
+
+# ------------------------------------------------------- the loop's helpers --
+
+# All of these are called from inside the event loop and read and write its
+# locals. bash scopes dynamically, which is what makes that work and what keeps
+# the loop itself short enough to read in one go.
+
+np_clamp() {
+  [ "$np_cur" -lt 0 ] && np_cur=0
+  [ "$np_cur" -ge "${#ORDER[@]}" ] && np_cur=$(( ${#ORDER[@]} - 1 ))
+  return 0
+}
+
+# Move the columns on by one frame, from the table if there is one and from the
+# waves if there is not. Called once per tick and nowhere else, so that the
+# trails fall at a rate tied to the clock rather than to how often the panel
+# happens to be rebuilt.
+spec_advance() {  # spec_advance <frame>
+  local idx
+  local IFS=$' \t\n'
+  # The table arrives partway through a track, so this keeps asking until it
+  # does. Both tests are builtins — no process is started per frame to find out.
+  if [ "$SPEC_FOR" -ne "$cur_track" ]; then
+    spectrum_load "$cur_track" || { spec_synth "$1"; return 0; }
+  fi
+  idx=$(( pos * SPEC_HZ + ptenth ))
+  [ "$idx" -lt 0 ] && idx=0
+  [ "$idx" -ge "$SPEC_N" ] && idx=$(( SPEC_N - 1 ))
+  # Word-splitting the row into sixteen arguments: no fork, and no subshell to
+  # lose the column state in.
+  set -- ${SPEC[$idx]}
+  spec_step "$@"
+  return 0
+}
+
+# Where the analyser's top row is on the screen, so a tick can address it
+# outright instead of redrawing the whole panel to move a column.
+spec_row=0
+np_draw() {
+  local frame nls
+  [ "$SCREEN" -eq 1 ] || return 0
+  np_fit_rows "$status"
+  np_rows=$NP_ROWS
+  [ "$np_cur" -lt "$np_top" ] && np_top=$np_cur
+  [ "$np_cur" -ge $(( np_top + np_rows )) ] && np_top=$(( np_cur - np_rows + 1 ))
+  [ "$np_top" -lt 0 ] && np_top=0
+
+  # Where the playhead is across the whole record: everything before this track,
+  # plus how far into it we are.
+  apos=$(( ${PRE[$cur_track]:-0} + pos ))
+  [ "$apos" -gt "$TOTAL" ] && apos=$TOTAL
+  ahead=0
+  [ "$TOTAL" -gt 0 ] && ahead=$(( apos * STRIP_WIDTH * 8 / TOTAL ))
+
+  frame=$(np_frame)
+  # Where the analyser ended up, so a tick can address those rows outright
+  # instead of rebuilding the panel to move a column.
+  #
+  # Counted off the finished frame rather than from a constant, because the track
+  # list and the status line both change the panel's height. $( ) strips the
+  # trailing newline, so the frame holds one fewer newline than it has lines;
+  # what follows the analyser is fixed — a blank and two keycap rows, plus a
+  # blank and the status line when there is one — and the analyser's own rows
+  # come off the total to get back to the first of them.
+  #
+  # Counted by doubling the newlines and taking the difference in length, which
+  # looks like the long way round and is not: deleting everything that is not a
+  # newline means a negated bracket class, and bash matches one of those a
+  # character at a time through the multibyte machinery. On a panel this size
+  # that is a third of a second, once a second, with the event loop stopped dead
+  # behind it — the lamp froze and then jumped. Substituting a plain newline is a
+  # literal match and costs about seven milliseconds.
+  nls=${frame//$'\n'/$'\n\n'}
+  spec_row=$(( ${#nls} - ${#frame} + 1 - 3 - (SPEC_ROWS - 1) ))
+  [ -n "$status" ] && spec_row=$(( spec_row - 2 ))
+  # Counted first, so the analyser knows its rows before the frame is painted
+  # and both can go out in one write.
+  [ "${#SPECROWS[@]}" -eq 0 ] && spec_render   # the first frame of all
+  spec_str
+  paint "$frame" "$SPECSTR"
+  drew=1
+  return 0
+}
+
+# Hand mpv one file and reset everything that is about to be wrong about it.
+load_track() {  # load_track <row>
+  local i f
+  [ "$1" -ge 0 ] && [ "$1" -lt "${#ORDER[@]}" ] || return 1
+  cur_track=$1
+  i=${ORDER[$cur_track]}
+  f=${FILES[$i]}
+  pos=0
+  ptenth=0
+  tdur=${DURS[$i]}
+  last_pos=-1
+  # This track's levels if they are not already being worked out, and the next
+  # one's as well: analysing a track takes a few seconds and a track lasts
+  # minutes, so asking one ahead means the analyser is live from the first note
+  # of everything except whatever you started with.
+  spectrum_want "$cur_track"
+  spectrum_want $(( cur_track + 1 ))
+  # The columns belong to the track that just ended, and starting the next one
+  # at whatever height that one finished at reads as a glitch.
+  spec_reset
+  # Whatever the panel was saying was about the track before this one -- including
+  # "end of album", which a track starting has just made untrue.
+  status=''
+  mode_label=$( [ "$paused" = true ] && printf PAUSED || printf PLAYING )
+  # JSON, so the path has to survive being one. Backslashes first, then quotes,
+  # or the escaping of the quotes gets escaped in turn.
+  f=${f//\\/\\\\}
+  f=${f//\"/\\\"}
+  mpv_cmd "{\"command\":[\"loadfile\",\"$f\",\"replace\"]}"
+  np_draw
+  return 0
+}
+
+# The next row to play, which is not the same question as the next row down.
+next_track() {
+  local n
+  if [ "$repeat" -eq 2 ]; then load_track "$cur_track"; return 0; fi
+  if [ "$shuffle" -eq 1 ] && [ "${#ORDER[@]}" -gt 1 ]; then
+    # A different track, chosen without a fork: $RANDOM is a builtin.
+    n=$cur_track
+    while [ "$n" -eq "$cur_track" ]; do n=$(( RANDOM % ${#ORDER[@]} )); done
+    load_track "$n"; return 0
+  fi
+  n=$(( cur_track + 1 ))
+  if [ "$n" -ge "${#ORDER[@]}" ]; then
+    if [ "$repeat" -eq 1 ]; then n=0; else return 1; fi
+  fi
+  load_track "$n"
+  return 0
+}
+
+prev_track() {
+  # Within the first few seconds of a track, "previous" means the one before it;
+  # after that it means the start of this one, which is what every deck ever made
+  # has done and what your hand expects.
+  if [ "$pos" -gt 3 ]; then
+    mpv_cmd '{"command":["seek",0,"absolute"]}'
+    return 0
+  fi
+  [ "$cur_track" -gt 0 ] || { mpv_cmd '{"command":["seek",0,"absolute"]}'; return 0; }
+  load_track $(( cur_track - 1 ))
+  return 0
+}
+
+# A track ran out on its own. The end of the last one is the end of the album,
+# and the panel says so rather than quietly sitting there looking like it hung.
+track_ended() {
+  if next_track; then
+    # The cursor follows the music unless you have gone off browsing on your own.
+    # After the move, because next_track has already drawn the panel once.
+    if [ "$np_follow" -eq 1 ] && [ "$np_cur" -ne "$cur_track" ]; then
+      np_cur=$cur_track
+      np_clamp
+      np_draw
+    fi
+    return 0
+  fi
+  mode_label=FINISHED
+  status='▪ END OF ALBUM — PRESS Q TO QUIT, ⏎ TO PLAY A TRACK'
+  # The last reading mpv sent was a fraction before the end, and leaving it there
+  # would park both meters just short of full on a record that has finished.
+  pos=$tdur
+  last_pos=-1
+  np_draw
+  return 0
+}
+
+# ------------------------------------------------------------------- main --
+
+term_size
+if [ -t 0 ] && [ -t 1 ] \
+   && [ "$TERM_LINES" -ge "$NP_MIN_LINES" ] && [ "$TERM_COLS" -ge $(( PANEL + 2 )) ]; then
+  screen_on || true
+fi
+
+# What to play: an argument if there was one, the disc if --cd was asked for, or
+# whatever the picker is told to show.
+if [ -n "$SOURCE_ARG" ]; then
+  [ -e "$SOURCE_ARG" ] || die "no such file or directory: $SOURCE_ARG"
+  if [ -d "$SOURCE_ARG" ]; then
+    PICKED="dir	$SOURCE_ARG	$(basename "$SOURCE_ARG")	folder"
+  else
+    case "$SOURCE_ARG" in
+      *.zip|*.ZIP) PICKED="zip	$SOURCE_ARG	$(basename "$SOURCE_ARG")	zip" ;;
+      *)           die "not a zip or a folder: $SOURCE_ARG" ;;
+    esac
+  fi
+elif [ "$WANT_CD" -eq 1 ]; then
+  find_cd || die "no audio CD in the drive"
+  PICKED="cd	$CD_VOLUME	$(basename "$CD_VOLUME")	in the drive"
+else
+  scan_sources
+  pick_source || { screen_off; exit 0; }
+fi
+
+open_source "$PICKED"
+read_metadata
+[ "$SRC_KIND" = cd ] && { cd_metadata || true; }
+order_tracks
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  screen_off
+  printf '\n  %s — %s (%s)\n' "${ALBUM:-—}" "${ALBUM_ARTIST:-—}" "${YEAR:-—}"
+  printf '  %d tracks, %s, from %s\n\n' "${#ORDER[@]}" "$(mmss "$TOTAL")" "$META_SOURCE"
+  i=1
+  for k in "${ORDER[@]}"; do
+    printf '   %2d. %s %6s\n' "$i" "$(fit "${TITLES[$k]}" 52)" "$(mmss "${DURS[$k]}")"
+    i=$(( i + 1 ))
+  done
+  printf '\n'
+  exit 0
+fi
+
+[ "$SCREEN" -eq 1 ] || die "the panel needs a terminal at least ${NP_MIN_LINES} rows by $(( PANEL + 2 )) columns"
+
+engine_start
+play
+screen_off
+exit 0
