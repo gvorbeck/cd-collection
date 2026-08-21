@@ -21,6 +21,11 @@ burncd --check
 
 You also need a USB optical drive — no Mac has had a built-in burner in years.
 
+burncd is two files, not one: the panel — geometry, palette, meters, key
+reading — lives in [`../lib/panel.sh`](../lib/panel.sh), shared with
+[player](../player). The symlink above is resolved back to the real path, so it
+finds it; copying `burncd` somewhere on its own doesn't.
+
 ## Usage
 
 | Command | What it does |
@@ -45,7 +50,7 @@ the plan as plain text, since a normal run opens the editor instead.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `BURNCD_SPEED` | `8` | Lower is safer on cheap media. |
-| `BURNCD_DEV` | auto | cdrecord device. See troubleshooting. |
+| `BURNCD_DEV` | auto | cdrecord device. See troubleshooting. `player` reads it too. |
 | `BURNCD_SECONDS` | `4797` | Disc capacity — 79:57, the true size of an "80 minute" blank. |
 | `BURNCD_MINUTES` | — | Same in whole minutes. 90-minute blanks: `BURNCD_MINUTES=89`. |
 | `BURNCD_LEVEL` | `off` | `album`, `track` or `off` — leveling without the flag. |
@@ -219,6 +224,9 @@ Measuring reads every file end to end, so the first run is slow and says so.
 Results cache under `~/.cache/burncd`, keyed by path, size and mtime.
 
 ## Troubleshooting
+
+**`cannot find lib/panel.sh`** — burncd was copied out of the repo rather than
+symlinked into it. Put it back and symlink it, or take `scripts/lib` along.
 
 **`cdrecord not found`** — `brew install cdrtools`.
 

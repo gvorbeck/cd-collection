@@ -144,6 +144,10 @@ Three CLI tools, none part of the site — the rest of the hobby, in order:
 - **[player](scripts/player/README.md)** — `player album.zip` plays a zip,
   folder, or the disc in the drive. burncd's twin.
 
+burncd and player draw the same panel out of the same
+[`scripts/lib/panel.sh`](scripts/lib/panel.sh), so neither is a single file you
+can copy off on its own.
+
 [PapaParse]: https://www.papaparse.com/
 [MusicBrainz]: https://musicbrainz.org/
 [Cover Art Archive]: https://coverartarchive.org/

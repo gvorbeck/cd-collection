@@ -11,7 +11,8 @@ It opens the zip into a scratch directory, reads the tags, and puts the album on
 screen. Space pauses, arrows seek, `q` quits — and the scratch directory goes
 with it, leaving only the zip you started with.
 
-burncd's twin: same panel, same amber, same meters.
+burncd's twin, literally: same panel, same amber, same meters, out of the same
+[`../lib/panel.sh`](../lib/panel.sh).
 
 ## Setup
 
@@ -25,6 +26,9 @@ player --check
 `mpv` is the engine. `ffprobe` reads tags and ffmpeg measures the spectrum for
 the analyser. `cdrtools` gets CD-Text off a disc; `jq` reads MusicBrainz's answer
 when a disc has none.
+
+The symlink is resolved back to the real path, so player finds the panel it
+shares with burncd; copying `player` somewhere on its own doesn't.
 
 `--check` prints a pass/warn/fail line per dependency and exits non-zero on a
 hard failure. Warnings are usually fine — "no disc, or no drive" just means the
@@ -50,16 +54,23 @@ box-drawing characters and needs a UTF-8 locale and a window of at least 25×71.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PLAYER_DIRS` | `~/Music:~/Downloads` | Colon-separated dirs the picker scans. |
-| `PLAYER_DEV` | auto | cdrecord device for CD-Text. Same value as `BURNCD_DEV`. |
+| `PLAYER_DEV` | `BURNCD_DEV`, else auto | cdrecord device for CD-Text. One drive, one setting. |
+| `PLAYER_WORK` | `~/.cache/player/work` | Where zips are unpacked. |
 | `PLAYER_MB` | unset | `0` to never ask MusicBrainz about a disc. |
+| `PLAYER_ART` | unset | `0` to never fetch or draw the cover. |
+| `PLAYER_COLLECTION` | the repo's CSV | Catalogue the panel annotates the album from. |
 | `PLAYER_KEEP` | unset | Keep the scratch directory and print where it is. |
 
 ## What it handles
 
-**The zip stays a zip.** Unpacked to `$TMPDIR`, played from there, destroyed on
-exit — on `q`, on Ctrl-C, and on being killed. The whole zip is unpacked, not
-just the audio, so the cover art comes along; that's the meter on the loading
-screen. `PLAYER_KEEP=1` opts out, which is only useful for debugging.
+**The zip stays a zip.** Unpacked to `~/.cache/player/work`, played from there,
+destroyed on exit — on `q`, on Ctrl-C, and on being killed. Not `$TMPDIR`: macOS
+is entitled to reclaim that while a long record is still playing out of it, and
+does. If the cache can't be written, `$TMPDIR` is taken anyway — a missing home
+is a reason to accept the worse directory, not to refuse to play. The whole zip
+is unpacked, not just the audio, so the cover art comes along; that's the meter
+on the loading screen. `PLAYER_KEEP=1` opts out, which is only useful for
+debugging.
 
 **Any format** — anything mpv plays and ffprobe reads, mixed formats fine.
 
@@ -173,6 +184,9 @@ folder with audio under `PLAYER_DIRS`, plus the disc. `r` rescans.
 **`mpv not found`** — `brew install mpv`. It's the engine; there's no fallback.
 **`ffprobe not found`** — `brew install ffmpeg`.
 
+**`cannot find lib/panel.sh`** — player was copied out of the repo rather than
+symlinked into it. Put it back and symlink it, or take `scripts/lib` along.
+
 **No sound, but the meters are moving.** There's no volume control here on
 purpose — it plays at whatever the system is set to. Check system volume and
 output device. mpv follows the system default; if you changed it while the
@@ -182,9 +196,10 @@ player was open, quit and reopen.
 and the stand-in pattern is running; it should catch up within a few seconds. If
 it never does, ffmpeg isn't installed — `--check` says so on the `analyser` line.
 
-**`mpv did not open its control socket`.** Almost always a `$TMPDIR` that isn't
-writable, which `--check` reports as a scratch failure. Can also be a wedged old
-mpv: `pkill -f input-ipc-server`.
+**`mpv did not open its control socket`.** The socket lives in the scratch
+directory, so this is almost always a scratch directory that isn't writable,
+which `--check` reports on its own line. Can also be a wedged old mpv:
+`pkill -f input-ipc-server`.
 
 **The disc doesn't appear in the picker.** macOS has to mount it first — wait a
 few seconds and press `r`. If it never mounts, `drutil status` says whether the
@@ -198,7 +213,8 @@ discs genuinely aren't in the database.
 **CD-Text is there but player doesn't see it.** cdrtools has to be able to open
 the drive, and `--check` only confirms it's installed. Run `cdrecord -scanbus`
 and use the bus address it prints — `1,0,0` — as `PLAYER_DEV=1,0,0`. A `/dev/`
-path does not work. Same setting and same value as burncd's `BURNCD_DEV`.
+path does not work. If burncd's `BURNCD_DEV` is already set, player reads that:
+one drive, one setting.
 
 **The panel is full of `?`.** The terminal isn't in a UTF-8 locale; `--check`
 says which it found. `echo 'export LC_ALL=en_US.UTF-8' >> ~/.zshrc`.
@@ -207,7 +223,8 @@ says which it found. `echo 'export LC_ALL=en_US.UTF-8' >> ~/.zshrc`.
 There's no small-screen layout; the meters are the point.
 
 **A scratch directory got left behind.** It shouldn't — cleanup runs on every
-exit path. If the machine lost power mid-play, `rm -rf $TMPDIR/player.*`.
+exit path, and the next run sweeps any `~/.cache/player/work/player.*` whose
+process is gone. Only one `PLAYER_KEEP` asked for is yours to delete.
 
 ## Notes
 

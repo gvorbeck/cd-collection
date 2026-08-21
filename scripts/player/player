@@ -47,47 +47,33 @@
 
 set -euo pipefail
 
-# Every rule, meter cell and track title on the panel is UTF-8, and ${#s} counts
-# bytes unless the ctype locale says otherwise — one accented title would then
-# shove the whole column grid sideways. Only the ctype category is changed, so
-# collation and number formatting are left exactly as the user has them.
+# The faceplate, shared with burncd: the locale repair, the panel's geometry and
+# palette, the alternate screen, the width primitives, the capacity meter, raw
+# key reading and the health-check scaffolding all live in lib/panel.sh. The two
+# tools are one instrument at two moments of the same disc, and that is only true
+# for as long as one file decides what the picture is.
 #
-# LC_ALL has to be dismantled first when it is what pins the locale: bash ignores
-# LC_CTYPE for as long as LC_ALL is set and non-empty, so exporting one under the
-# other looks like a fix and does nothing. Handing its value to the other five
-# categories keeps every one of them where it was.
-case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
-  *UTF-8*|*utf-8*|*UTF8*|*utf8*) ;;
-  *) if [ -n "${LC_ALL:-}" ]; then
-       export LC_COLLATE="$LC_ALL"  LC_NUMERIC="$LC_ALL"  LC_TIME="$LC_ALL" \
-              LC_MONETARY="$LC_ALL" LC_MESSAGES="$LC_ALL"
-       unset LC_ALL
-     fi
-     LOCALES=$( (locale -a 2>/dev/null || true) | tr '\n' ' ' )
-     case " $LOCALES " in
-       *" en_US.UTF-8 "*) export LC_CTYPE=en_US.UTF-8 ;;
-       *" C.UTF-8 "*)     export LC_CTYPE=C.UTF-8 ;;
-       *)                 export LC_CTYPE=UTF-8 ;;   # BSD libc accepts the bare name
-     esac ;;
-esac
+# Resolved through however many symlinks stand between $0 and the real file: the
+# install is a symlink into /usr/local/bin, and BSD readlink has no -f to lean on.
+APP=player
+SELF=$0
+while [ -L "$SELF" ]; do
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF=$LINK ;; *) SELF=$(dirname "$SELF")/$LINK ;; esac
+done
+LIB=$( (cd "$(dirname "$SELF")/../lib" && pwd) 2>/dev/null || true )
+[ -n "$LIB" ] && [ -r "$LIB/panel.sh" ] \
+  || { printf 'player: cannot find lib/panel.sh alongside %s\n' "$SELF" >&2; exit 1; }
+. "$LIB/panel.sh"
 
-UTF8_PROBE='é'
-if [ "${#UTF8_PROBE}" -eq 1 ]; then UTF8=1; else UTF8=0; fi
-
-DEV="${PLAYER_DEV:-}"
+# Both tools talk to the same drive, so a device pinned for one is a device
+# pinned for the other. PLAYER_DEV still wins where someone has set only that.
+DEV="${PLAYER_DEV:-${BURNCD_DEV:-}}"
 DRY_RUN=0
 CHECK=0
 WANT_CD=0
 SOURCE_ARG=""
 USE_MB="${PLAYER_MB:-1}"
-
-# The panel is a fixed 71 columns: 2 of margin plus a 69-column grid that the
-# faceplate, the track rows and both meters share. Fixed rather than fluid
-# because every column here has a job — 34 for a title, 20 for an artist — and a
-# grid that reflows is a grid you cannot learn. Same figure as burncd, on
-# purpose: the two are the same instrument at two moments of the same disc.
-PANEL=69
-STRIP_WIDTH=$(( PANEL - 2 ))
 
 # How often the panel redraws while something is playing. Twenty frames a second
 # is enough for the analyser to read as motion rather than as a stutter, and
@@ -127,61 +113,7 @@ NP_MIN_LINES=$(( NP_CHROME + 3 ))
 PICK_CHROME=10
 PICK_MIN_LINES=$(( PICK_CHROME + 3 ))
 
-# Panel palette, lifted whole from burncd. The screen is dressed as the faceplate
-# of a deck that never existed: amber silkscreen on black, backlit keycaps, a
-# tape-counter readout. Amber is the chrome — rules, labels, the badge — and
-# never the data, so the titles stay the brightest thing on the screen.
-AMBER='\033[38;5;214m'      # lit amber, for the readout and keycap legends
-ETCH='\033[38;5;172m'       # the darker amber of paint on a metal panel
-BADGE='\033[48;5;214m\033[38;5;232m'   # engraved plate: black on amber
-CAP='\033[48;5;236m\033[38;5;214m'     # a keycap, backlit from behind
-OFF='\033[0m'
-DIM='\033[2m'
-INV='\033[7m'
-# Four steps around the panel's own amber rather than four cool hues, zigzagging
-# light/dark/light/dark so neighbouring bands separate on brightness even where
-# the hues are cousins, and the edges survive without colour vision.
-SHADES=(214 130 220 166)
-RUNOUT=94              # the darkest amber on the ramp: everything not yet played
-HEAD=231               # the playhead, the brightest thing on the screen
-
 # ------------------------------------------------------------------ plumbing --
-
-SPACES='                                                                                '
-pad() {  # pad <count> -> $PAD
-  PAD=''
-  [ "$1" -gt 0 ] || return 0
-  while [ "$1" -gt "${#SPACES}" ]; do SPACES="$SPACES$SPACES"; done
-  PAD=${SPACES:0:$1}
-}
-repv() {  # repv <char> <count> -> $REP
-  REP=''
-  [ "$2" -gt 0 ] || return 0
-  pad "$2"
-  REP=${PAD// /$1}
-}
-rep() { repv "$1" "$2"; printf '%s' "$REP"; }
-
-# How big the window actually is. Not plain `tput lines`: tput measures the
-# terminal attached to its own stdout, and inside $( ) that is a pipe, so it
-# falls back to whatever static size the terminfo entry declares. stty asks the
-# kernel for the real window size off /dev/tty, which no redirection can move.
-TERM_LINES='' TERM_COLS=''
-term_size() {  # term_size -> $TERM_LINES, $TERM_COLS
-  local sz
-  [ -n "$TERM_LINES" ] && [ -n "$TERM_COLS" ] && return 0
-  sz=$( (stty size </dev/tty) 2>/dev/null || true )
-  TERM_LINES=${sz%% *}
-  TERM_COLS=${sz##* }
-  case "$TERM_LINES" in ''|*[!0-9]*|0) TERM_LINES=$(tput lines 2>/dev/null || true) ;; esac
-  case "$TERM_COLS"  in ''|*[!0-9]*|0) TERM_COLS=$(tput cols 2>/dev/null || true) ;; esac
-  case "$TERM_LINES" in ''|*[!0-9]*|0) TERM_LINES=24 ;; esac
-  case "$TERM_COLS"  in ''|*[!0-9]*|0) TERM_COLS=80 ;; esac
-  return 0
-}
-
-mmss()  { printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
-mmssv() { printf -v MMSS '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
 
 # mpv reports every time in float seconds. Everything on this panel is counted in
 # whole ones, and a bare ${x%%.*} on "1.2e-05" or on an empty property would put
@@ -192,8 +124,6 @@ intsec() {  # intsec <float> -> $ISEC
   return 0
 }
 
-qgrep() { grep "$@" >/dev/null; }
-
 # ---------------------------------------------------------------- the screen --
 
 # player is one instrument for as long as it runs, not a program that prints.
@@ -202,31 +132,12 @@ qgrep() { grep "$@" >/dev/null; }
 # display on the alternate screen, each laid over the last from the home
 # position. Nothing scrolls, nothing stacks, and the scrollback underneath is
 # untouched — when the app closes the terminal is exactly as it was found.
-SCREEN=0
-SCREEN_STTY=''
-
-screen_on() {
-  [ "$SCREEN" -eq 1 ] && return 0
-  [ -t 0 ] && [ -t 1 ] || return 1
-  SCREEN_STTY=$(stty -g 2>/dev/null || true)
-  # Erase on the way in only. Every frame after this one is laid over its
-  # predecessor rather than drawn on a cleared screen — see paint().
-  printf '\033[?1049h\033[?25l\033[H\033[2J'
-  SCREEN=1
-  trap 'TERM_LINES=; TERM_COLS=' WINCH
-  return 0
-}
-
-# Idempotent, and called from die() and from the exit trap as much as from the
-# ordinary end of a session: whatever goes wrong, the terminal is handed back
-# with its cursor visible, its modes as they were, and the scrollback intact.
-screen_off() {
-  [ "$SCREEN" -eq 1 ] || return 0
-  SCREEN=0
-  [ -n "$SCREEN_STTY" ] && stty "$SCREEN_STTY" 2>/dev/null || true
-  printf '\033[?1006l\033[?1002l\033[?25h\033[?1049l'
-  return 0
-}
+#
+# The mechanics are in lib/panel.sh. What is here is the mouse, which player has
+# and burncd has nothing to point at — and which screen_off has to know about,
+# because a terminal handed back still in button-event tracking is a terminal
+# that swallows drags. SCREEN_OFF_PRE is how it is told.
+SCREEN_OFF_PRE='\033[?1006l\033[?1002l'
 
 # The pointer, for the one part of this panel that is a control rather than a
 # readout: the meters. A bar drawn to the width of the window is a scrubber
@@ -248,44 +159,6 @@ screen_off() {
 # select on shift-drag, which is the usual way out.
 mouse_on()  { [ "$SCREEN" -eq 1 ] && printf '\033[?1002h\033[?1006h'; return 0; }
 mouse_off() { [ "$SCREEN" -eq 1 ] && printf '\033[?1006l\033[?1002l'; return 0; }
-
-# Lay one frame over the screen from the home position.
-#
-# No erase first, and one write for the whole frame. Clearing and then drawing is
-# two pictures the terminal genuinely paints, so the blank one shows through as a
-# flash. Instead: end every line with an erase-to-end-of-line so a line that got
-# shorter cannot leave the tail of the old one behind, and \033[J at the bottom
-# to clear whatever the previous frame had below this one.
-#
-# The frame must be at most one line shorter than the window. \033[H is absolute,
-# so a frame that scrolls the terminal loses its own top row permanently.
-paint() {  # paint <frame> [overlay]
-  local nl=$'\n' eol=$'\033[K\n'
-  # The overlay is written in the same printf as the frame rather than after it,
-  # so a rebuilt panel reaches the terminal as one write and there is no instant
-  # where the screen holds the frame without it. It comes through %b because it
-  # is escape sequences written as text, where the frame arrives already escaped.
-  printf '\033[H%s\033[K\n\033[J%b' "${1//$nl/$eol}" "${2:-}"
-  return 0
-}
-
-# The faceplate every screen wears: engraved badge, a rule across the panel, and
-# the state of the machine stamped at the far end the way a deck prints its mode.
-faceplate() {  # faceplate <meta>
-  local rule=$(( PANEL - 10 - ${#1} ))
-  [ "$rule" -lt 2 ] && rule=2
-  repv '━' "$rule"
-  printf '  %b PLAYER %b %b%s%b %b%s%b\n' \
-    "$BADGE" "$OFF" "$ETCH" "$REP" "$OFF" "$ETCH" "$1" "$OFF"
-  return 0
-}
-
-die() { screen_off; printf '\nplayer: %s\n' "$1" >&2; exit 1; }
-
-usage() {
-  awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
-  exit "${1:-0}"
-}
 
 # ------------------------------------------------------------------ scratch --
 
@@ -435,18 +308,9 @@ done
 
 # ------------------------------------------------------------- health check --
 
-ck() {   # ck <ok|warn|fail> <label> <detail>
-  case "$1" in
-    ok)   printf '  \033[32m✓\033[0m  %-20s %s\n' "$2" "$3" ;;
-    warn) printf '  \033[33m!\033[0m  %-20s %s\n' "$2" "$3" ;;
-    fail) printf '  \033[31m✗\033[0m  %-20s %s\n' "$2" "$3"; CK_FAIL=1 ;;
-  esac
-}
-
 run_check() {
   local v dev=''
-  CK_FAIL=0
-  printf '\n  player health check\n\n'
+  check_open
 
   if v=$(mpv --version 2>/dev/null | head -1 | cut -c1-40); then
     ck ok mpv "$v"
@@ -544,13 +408,7 @@ run_check() {
     ck ok "window size" "room for the panel"
   fi
 
-  printf '\n'
-  if [ "$CK_FAIL" -eq 1 ]; then
-    printf '  Not ready.\n\n'
-    return 1
-  fi
-  printf '  Ready to play.\n\n'
-  return 0
+  check_summary 'Ready to play.' 'Not ready to play.'
 }
 
 if [ "$CHECK" -eq 1 ]; then
@@ -566,114 +424,14 @@ command -v nc      >/dev/null || die "nc not found — mpv cannot be driven"
 
 # ------------------------------------------------------------ the meters --
 
-# Exactly burncd's capacity meter, and deliberately so: the picture you approved
-# before burning a disc is the picture you watch while playing it back. Bands are
-# tracks, in four alternating ambers; the head is where the laser was and is now
-# where the playhead is; the run-out is everything not yet reached.
+# The album meter is burncd's capacity meter, drawn by bands() and bandbar() in
+# lib/panel.sh: bands are tracks in four alternating ambers, the head is where
+# the laser was and is now where the playhead is, the run-out is everything not
+# yet reached. The picture you approved before burning a disc is the picture you
+# watch while playing it back, which is only true for as long as one file decides
+# what the picture is.
 #
-# Largest-remainder rather than a running total, so a longer track can never be
-# drawn narrower than a shorter one — which is the one comparison the meter
-# exists to support.
-BEND=(); BCOL=()
-bands() {  # bands <total-units> <duration>...  -> $BEND, $BCOL
-  local units=$1 n=0 cum=0 used=0 left=0 best bi i pos=0 nb=0
-  local -a D HC REM
-  BEND=(); BCOL=(); D=(); HC=(); REM=()
-  shift
-
-  for i in "$@"; do
-    D[$n]=$i
-    cum=$(( cum + i ))
-    n=$(( n + 1 ))
-  done
-  [ "$n" -gt 0 ] && [ "$cum" -gt 0 ] && [ "$units" -gt 0 ] || return 0
-
-  i=0
-  while [ "$i" -lt "$n" ]; do
-    HC[$i]=$(( D[i] * units / cum ))
-    REM[$i]=$(( D[i] * units % cum ))
-    used=$(( used + HC[i] ))
-    i=$(( i + 1 ))
-  done
-  left=$(( units - used ))
-  while [ "$left" -gt 0 ]; do
-    best=-1; bi=-1
-    i=0
-    while [ "$i" -lt "$n" ]; do
-      [ "${REM[$i]}" -gt "$best" ] && { best=${REM[$i]}; bi=$i; }
-      i=$(( i + 1 ))
-    done
-    [ "$bi" -lt 0 ] && break
-    HC[$bi]=$(( HC[bi] + 1 ))
-    REM[$bi]=-1
-    left=$(( left - 1 ))
-  done
-
-  i=0
-  while [ "$i" -lt "$n" ]; do
-    if [ "${HC[$i]}" -gt 0 ]; then
-      pos=$(( pos + HC[i] ))
-      BEND[$nb]=$pos
-      BCOL[$nb]=${SHADES[$(( nb % 4 ))]}
-      nb=$(( nb + 1 ))
-    fi
-    i=$(( i + 1 ))
-  done
-  return 0
-}
-
-# One meter cell's colour, appended to $out only when it differs from what is
-# already in effect — a fresh pair of escapes per cell would treble the size of
-# the frame for nothing. Reads and writes the caller's locals, on purpose.
-strip_sgr() {  # strip_sgr <fg> <bg-or-empty>
-  [ "$1" = "$curfg" ] || { out="$out\033[38;5;$1m"; curfg=$1; }
-  if [ -n "$2" ]; then
-    [ "$2" = "$curbg" ] || { out="$out\033[48;5;$2m"; curbg=$2; }
-  elif [ -n "$curbg" ]; then
-    out="$out\033[49m"; curbg=''
-  fi
-}
-
-# One row of meter, in $BANDBAR. A column wholly inside a band is a shaded block,
-# a column a boundary runs through is a partial block of the outgoing colour laid
-# over the incoming one as background, and anything past the head is run-out.
-#
-# Not returned on stdout: a $( ) here is a fork, and this is redrawn several
-# times a second for as long as something is playing.
-BANDBAR=''
-bandbar() {  # bandbar <head-units> -- reads $BEND/$BCOL -> $BANDBAR
-  local head=$1 j=0 b=0 nb=${#BEND[@]} cs ce t nxt
-  local out='' curfg='' curbg=''
-  # Unicode has a full set of left-aligned partial blocks, and a cell can show
-  # two colours — foreground for the left part, background for the right — so a
-  # boundary is drawn where it actually falls rather than snapped to the nearest
-  # whole character.
-  local PARTS=('' '▏' '▎' '▍' '▌' '▋' '▊' '▉')
-
-  while [ "$j" -lt "$STRIP_WIDTH" ]; do
-    cs=$(( j * 8 )); ce=$(( cs + 8 ))
-    while [ "$b" -lt "$nb" ] && [ "${BEND[$b]}" -le "$cs" ]; do b=$(( b + 1 )); done
-    if [ "$head" -gt "$cs" ] && [ "$head" -lt "$ce" ]; then
-      strip_sgr "$HEAD" ''; out="${out}${PARTS[$(( head - cs ))]}"
-    elif [ "$head" -le "$cs" ] || [ "$b" -ge "$nb" ]; then
-      strip_sgr "$RUNOUT" ''; out="${out}░"
-    elif [ "${BEND[$b]}" -ge "$ce" ]; then
-      strip_sgr "${BCOL[$b]}" ''; out="${out}▓"
-    else
-      t=$(( BEND[b] - cs ))
-      nxt=$(( b + 1 ))
-      if [ "$nxt" -lt "$nb" ]; then
-        strip_sgr "${BCOL[$b]}" "${BCOL[$nxt]}"
-      else
-        strip_sgr "${BCOL[$b]}" ''
-      fi
-      out="${out}${PARTS[$t]}"
-    fi
-    j=$(( j + 1 ))
-  done
-  BANDBAR="$out\033[0m"
-  return 0
-}
+# What is here is the bar burncd has no use for.
 
 # A plain single-band bar, for the one track playing now. Same cells and the same
 # partial blocks as the album meter so the two read as one family, but one colour
@@ -1064,119 +822,7 @@ spec_synth() {  # spec_synth <frame>
 
 # ------------------------------------------------------------------ widths --
 
-# How many columns one character takes. A CJK ideograph, a kana, a Hangul
-# syllable, a fullwidth form or an emoji is drawn two columns wide, so ${#s} —
-# which counts characters — is half the truth for a Japanese title, and the grid
-# built on it comes out bent.
-#
-# Testing by glob range rather than by code point because there is no code point
-# to test: bash 3.2 is what ships with macOS, and printf '%d' "'字" there gives
-# the first byte as a signed char, not the code point.
-CW=1
-cwidth() {  # cwidth <character> -> $CW
-  case "$1" in
-    [⺀-〿]|[぀-ヿ]|[一-鿿]|[가-힣]|[！-｠]|[🀀-🿿]) CW=2 ;;
-    *) CW=1 ;;
-  esac
-}
-
-WCOLS=0
-wcols() {  # wcols <string> -> $WCOLS
-  local s=$1 i=0 n=0
-  case "$s" in
-    *[⺀-〿]*|*[぀-ヿ]*|*[一-鿿]*|*[가-힣]*|*[！-｠]*|*[🀀-🿿]*) ;;
-    *) WCOLS=${#s}; return 0 ;;
-  esac
-  while [ "$i" -lt "${#s}" ]; do
-    cwidth "${s:$i:1}"
-    n=$(( n + CW ))
-    i=$(( i + 1 ))
-  done
-  WCOLS=$n
-  return 0
-}
-
-# Pad or truncate to an exact column count. Not printf's own width and precision:
-# those are counted in bytes even under a UTF-8 locale. A cut title ends in … so
-# the truncation is visible.
-FIT=''
-fitv() {  # fitv <string> <columns> [right] -> $FIT
-  local s=$1 i=0 w=0 keep='' lim
-  wcols "$s"
-  if [ "$WCOLS" -gt "$2" ]; then
-    lim=$(( $2 - 1 ))
-    while [ "$i" -lt "${#s}" ]; do
-      cwidth "${s:$i:1}"
-      [ $(( w + CW )) -gt "$lim" ] && break
-      keep="$keep${s:$i:1}"
-      w=$(( w + CW ))
-      i=$(( i + 1 ))
-    done
-    # Braces are not optional: bash 3.2 reads "$keep…" as one name.
-    s="${keep}…"
-    WCOLS=$(( w + 1 ))
-  fi
-  pad $(( $2 - WCOLS ))
-  # Right-aligned is the same fit with the slack moved to the front. It is asked
-  # for by the track list, where the artist column stands against the durations:
-  # two ragged edges facing each other read as a gap of no particular width,
-  # where two flush ones read as a margin.
-  if [ "${3:-}" = right ]; then FIT="$PAD$s"; else FIT="$s$PAD"; fi
-}
-fit() { fitv "$1" "$2"; printf '%s' "$FIT"; }
-
-# One row of backlit keycaps, given as key/label pairs.
-keys() {  # keys <key> <label> [<key> <label> ...]
-  local line='' sep=''
-  while [ "$#" -gt 1 ]; do
-    line="$line$sep$CAP $1 $OFF $2"
-    sep='   '
-    shift 2
-  done
-  printf '  %b\n' "$line"
-}
-
-# What is below the fold, worded the same way wherever a list gets clamped.
-more_row() {  # more_row <count>
-  printf '    %b▾ %d MORE%b\n' "$ETCH" "$1" "$OFF"
-  return 0
-}
-
 # ------------------------------------------------------------------- input --
-
-tui_block()  { stty -echo -icanon min 1 time 0 2>/dev/null || true; }
-tui_cooked() { stty echo icanon 2>/dev/null || true; }
-
-# Every read here blocks. bash 3.2 has no sub-second read timeout, and flipping
-# the terminal between blocking and polling around each keystroke is worse than
-# useless: stty flushes input that has already arrived, so a fast escape sequence
-# loses bytes and arrow keys go missing. Staying in one mode means the three
-# bytes of an arrow key are always read together. The cost is that a bare ESC
-# waits for another key, which is why ESC is not bound to anything.
-KEY=""
-read_key() {  # read_key [fd-redirected by caller] -> $KEY
-  local k c
-  KEY=""
-  IFS= read -rsn1 k 2>/dev/null || return 1
-  # read discards its delimiter, so Return comes back as an empty string rather
-  # than as a newline. Reading exactly one byte makes that unambiguous.
-  [ -z "$k" ] && { KEY=$'\n'; return 0; }
-  if [ "$k" = $'\033' ]; then
-    IFS= read -rsn1 c 2>/dev/null || c=""
-    k="$k$c"
-    # CSI and SS3 sequences run until the first letter or tilde.
-    if [ "$c" = "[" ] || [ "$c" = "O" ]; then
-      while :; do
-        IFS= read -rsn1 c 2>/dev/null || break
-        [ -z "$c" ] && break
-        k="$k$c"
-        case "$c" in [A-Za-z~]) break ;; esac
-      done
-    fi
-  fi
-  KEY="$k"
-  return 0
-}
 
 # ------------------------------------------------------------------ sources --
 
@@ -2062,24 +1708,6 @@ art_start() {
 #
 # Whichever answered is printed on the faceplate. A track list is only as good as
 # its source, and "CD-TEXT" and "MUSICBRAINZ" are different degrees of certain.
-detect_dev() {
-  [ -n "$DEV" ] && return 0
-  local class n cand
-  # macOS names an optical drive after the richest media class its driver
-  # publishes: a SuperDrive that reads CDs all day comes up as IODVDServices
-  # because it can also read a DVD. Ask each name in turn.
-  for class in IODVDServices IOCompactDiscServices IOBDServices; do
-    for n in 0 1; do
-      cand="$class/$n"
-      if cdrecord -checkdrive dev="$cand" >/dev/null 2>&1; then
-        DEV="$cand"; return 0
-      fi
-    done
-  done
-  DEV="IODVDServices/0"
-  return 1
-}
-
 # CD-Text off the disc, into TITLES/ARTISTS/ALBUM. cdrtools prints it in a couple
 # of shapes depending on version, so both are matched and neither is required.
 #
