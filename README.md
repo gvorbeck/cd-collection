@@ -17,11 +17,13 @@ Four pages. Three read the sheet; the fourth is a print tool that doesn't:
 | `stats.html`    | Breakdowns by decade, genre, artist and shelf, and a tag cloud drawn in two tones — shelf and wishlist. |
 | `labels.html`   | Printable jewel-case inserts, typed by hand or sent over from a disc, kept in this browser. |
 
-### Also in here: `burncd`
+### Also in here: `burncd`, `player` and `bandcamp-wishlist`
 
-Not part of the site. [`scripts/burncd/`](scripts/burncd/README.md) is a
-command-line tool for the other half of this hobby — turning a folder of
-purchased music into an actual CD-R:
+None of the three is part of the site. They're the rest of the hobby, in the
+order it happens: find the music, burn it to a disc, play the disc.
+
+[`scripts/burncd/`](scripts/burncd/README.md) is a command-line tool for turning
+a folder of purchased music into an actual CD-R:
 
 ```bash
 burncd ~/Music/Nonagon\ Infinity
@@ -30,6 +32,27 @@ burncd ~/Music/Nonagon\ Infinity
 Gapless, CD-Text, track order from tags rather than filenames, splits long sets
 across discs. Run `burncd --check` first on the machine with the burner attached.
 Full docs: [scripts/burncd/README.md](scripts/burncd/README.md).
+
+[`scripts/player/`](scripts/player/README.md) is burncd's twin — same panel,
+same amber, same meters — for playing an album rather than burning one, whether
+it's a zip, a folder, or the CD in the drive:
+
+```bash
+player ~/Downloads/Nonagon\ Infinity.zip
+```
+
+A zip plays without unpacking: it opens into a scratch directory that's deleted
+when you quit, so nothing joins a library and nothing is left behind. Run
+`player --check` on a new machine. Full docs:
+[scripts/player/README.md](scripts/player/README.md).
+
+[`scripts/bandcamp-wishlist/`](scripts/bandcamp-wishlist/README.md) is a
+bookmarklet for the buying end. Bandcamp shows a wishlist as a wall of album art
+with no prices on it; click the bookmark on that page and it lists every item
+with what it costs, cheapest first, plus a CSV. Prices come from Bandcamp's own
+endpoints in your logged-in browser, so there's no scraping and no login to
+handle. Install and edit instructions:
+[scripts/bandcamp-wishlist/README.md](scripts/bandcamp-wishlist/README.md).
 
 ## How it works
 
@@ -408,6 +431,8 @@ what was wanted, and when it stopped being.
 | `scripts/snapshot.js`   | Regenerates the snapshots in `data/` — likewise Node stdlib, run by hand. |
 | `scripts/check-shell-assets.js` | Checks `SHELL_ASSETS` in `sw.js` against the files actually in the tree. |
 | `scripts/burncd/`       | **[burncd](scripts/burncd/README.md)** — CLI that burns a folder of music to an audio CD. Nothing to do with the site; see below. |
+| `scripts/player/`       | **[player](scripts/player/README.md)** — CLI that plays an album from a zip, a folder, or the drive. burncd's twin; likewise nothing to do with the site. |
+| `scripts/bandcamp-wishlist/` | **[bandcamp-wishlist](scripts/bandcamp-wishlist/README.md)** — bookmarklet that prices a Bandcamp wishlist, cheapest first. Likewise; see below. |
 | `test/`                 | Unit tests for the pure helpers. See below.                       |
 | `.github/workflows/`    | Checks every push to `main` and every pull request; publishes `main` to Pages. See below. |
 | `sample.csv`            | Dummy data for local development (see below). One file, read by both tabs. |
