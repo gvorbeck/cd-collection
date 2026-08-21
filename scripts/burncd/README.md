@@ -1,284 +1,136 @@
 # burncd
 
-Burn a folder of music to an audio CD from the command line. No playlists, no
-dragging files into Music.app, no thinking about disc formats.
+Burn a folder of music to an audio CD from the command line.
 
 ```bash
 burncd ~/Music/Nonagon\ Infinity
 ```
 
-That's the whole thing. It reads the folder, works out the track order, and puts
-the plan on screen. Look it over, fix anything the tags got wrong, and press
-**`b`** to burn — gapless, with CD-Text. `q` walks away without burning.
+It reads the folder, works out the track order, and puts the plan on screen.
+Look it over, fix anything the tags got wrong, press **`b`** to burn — gapless,
+with CD-Text. `q` walks away. Nothing is converted, written, or asked of the
+drive until you press `b`.
 
----
-
-## Setup on a new machine
-
-Two dependencies:
+## Setup
 
 ```bash
 brew install ffmpeg cdrtools
-```
-
-Then put the script on your PATH:
-
-```bash
 ln -s ~/Sites/cd-collection/scripts/burncd/burncd /usr/local/bin/burncd
-```
-
-Adjust that path if the repo lives somewhere else. Then confirm the machine is
-actually ready:
-
-```bash
 burncd --check
 ```
 
 You also need a USB optical drive — no Mac has had a built-in burner in years.
-
----
-
-## Run this first: `--check`
-
-`--check` is the thing to run on the burn machine before you spend a disc. It
-looks at the parts that vary from machine to machine and prints a pass/warn/fail
-line for each:
-
-```
-  burncd health check
-
-  ✓  ffmpeg               ffmpeg version 8.1.2
-  ✓  ffprobe              present
-  ✓  dither support       triangular dither available
-  ✓  loudness             ebur128 present — --level can measure
-  ✓  cdrecord             Cdrecord 3.02a09
-  ✓  cue + CD-Text        cdrecord supports cuefile= and -text
-  ✓  cdda2wav             present — --verify can read discs back
-  ✓  drive                cdrecord can open dev=IODVDServices/0
-  ✓  drive CD-Text        Does write CD-Text
-  ✓  drive --dummy        Does support test writing
-  ✓  media                blank CD-R ready
-  ✓  scratch space        54.1 GB free in /var/folders/...
-  ✓  terminal             UTF-8 locale (en_US.UTF-8), progress bar will render
-
-  Ready to burn.
-```
-
-It exits non-zero if anything is a hard failure, so it works in a script too.
-Warnings are usually fine — "no disc inserted" just means you haven't put one in
-yet.
-
-### The check before each disc
-
-`--check` is about the machine. Every burn also checks the disc, at the moment
-you press ⏎ at the INSERT prompt and before any audio is converted:
-
-- an empty tray, and it asks again;
-- a disc that isn't blank, and it says what kind it is and asks again;
-- a blank too short for what's planned for it — a 74-minute disc under a
-  79-minute plan — and it says both figures and asks again.
-
-The capacity comes from the disc's ATIP, which is the pre-groove's own record of
-where it ends; nothing else can tell a 74-minute blank from an 80-minute one.
-Two seconds, against the five minutes of converting that used to happen before
-cdrecord got a look at the disc and refused it.
-
-A drive that can't be read this way isn't held against the disc: if the ATIP
-can't be read after a couple of tries, burncd says so once and goes ahead. If
-yours reports nonsense, `--no-media-check` (or `BURNCD_NO_MEDIA_CHECK=1`) skips
-the lot. `--demo` never runs it — there's no drive involved. `--dummy` does: a
-rehearsal on a disc that can't take the job is a rehearsal of nothing.
-
-### The three rehearsals, in order
-
-They do different things and none of them replaces another:
-
-| | Touches the audio | Touches the drive | Uses a disc |
-| --- | --- | --- | --- |
-| `--check` | no | yes — opens it, reads its capabilities and the media | no |
-| `--demo` | yes — converts, builds the real image and cue | no | no |
-| `--dummy` | yes | yes — a complete burn with the write laser off | no, the blank survives |
-
-So: `--check` proves the hardware and tooling are there. `--demo` proves the
-*output* is right — it converts the audio and builds the real image and cue sheet,
-then runs the burn screen against them so you can see the whole thing land without
-a disc in the drive. Its stand-in for the drive is deliberately as awkward as a
-real one: it goes quiet for the lead-in, reports a disc that adds up to less than
-the disc it was given, and goes quiet again for the lead-out, so the demo
-rehearses the parts of the display that have to work unaided. `--dummy` proves
-the drive actually accepts that cue sheet and CD-Text, by doing the entire burn
-for real minus the laser.
-
-```bash
-burncd --check
-burncd --demo  ~/Music/Album
-burncd --dummy ~/Music/Album
-burncd         ~/Music/Album
-```
-
-`--dummy` leaves the disc in the drive rather than ejecting it, so the real burn
-is the next command with no shuffling. Not every drive supports test writing;
-`--check` says whether yours advertises it.
-
-### `--verify`
-
-After the burn, reads the disc back and reports whether it is sound:
-
-```
-  ✓ Disc 1 of 1 written
-  Verifying disc 1...
-    ✓ table of contents — 12 tracks
-    ✓ full read — every sector came back
-    ✓ CD-Text — album title reads back
-  ✓ Disc 1 verified
-```
-
-It deliberately does **not** compare the disc byte-for-byte against the image.
-Every drive reads audio back at a small fixed sample offset from where it wrote
-it, so an exact compare reports a mismatch on a perfectly good disc — which is
-the same false alarm this flag exists to settle. It checks the things that
-actually go wrong instead: the table of contents, whether every sector can be
-read back without error, and whether the CD-Text survived.
-
-The full read needs `cdda2wav` (it comes with cdrtools). Without it you still get
-the TOC check, and `--check` says so. Verification roughly doubles the time per
-disc, which is why it is opt-in. If any disc fails, burncd exits non-zero and
-names it in the summary.
-
----
 
 ## Usage
 
 | Command | What it does |
 | --- | --- |
 | `burncd --check` | Verify this machine can burn. Run first on a new setup. |
-| `burncd DIR` | Open the plan, edit it if needed, `b` to burn — the whole job on one screen |
+| `burncd DIR` | Open the plan, edit it, `b` to burn |
 | `burncd -n DIR` | Dry run — print the plan, burn nothing |
-| `burncd --demo DIR` | Convert for real, build the image and cue, simulate the burn |
-| `burncd --dummy DIR` | Rehearse the burn on the drive with the laser off |
+| `burncd --demo DIR` | Convert for real, build image + cue, simulate the burn |
+| `burncd --dummy DIR` | Rehearse on the drive with the laser off |
 | `burncd --verify DIR` | Burn, then read the disc back and check it |
 | `burncd --level DIR` | Bring a quiet album up to normal CD loudness |
 | `burncd --split-long DIR` | Allow cutting a track that's longer than a disc |
 | `burncd --no-cdtext DIR` | Burn without CD-Text (fallback if the drive balks) |
 | `burncd --from-disc 3 DIR` | Resume a multi-disc job at disc 3 |
 | `burncd --no-media-check DIR` | Don't look at the disc before converting |
-| `burncd --help` | Usage |
 
-`-n` is worth using the first time on any album. It costs nothing and shows you
-exactly what would land on which disc. It's also the way to get the plan as plain
-text: a normal run opens the editor instead, and so does everything else that has
-a terminal to draw on.
+`-n` is worth using the first time on any album — it's also the only way to get
+the plan as plain text, since a normal run opens the editor instead.
 
-### Environment overrides
+### Environment
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `BURNCD_SPEED` | `8` | Burn speed. Lower is safer on cheap media. |
-| `BURNCD_DEV` | auto-detected | cdrecord device. Set it only to override the search — see troubleshooting. |
-| `BURNCD_SECONDS` | `4797` | Disc capacity. 4797 = 79:57, see below. |
-| `BURNCD_MINUTES` | — | Same thing in whole minutes, if you prefer. |
+| `BURNCD_SPEED` | `8` | Lower is safer on cheap media. |
+| `BURNCD_DEV` | auto | cdrecord device. See troubleshooting. |
+| `BURNCD_SECONDS` | `4797` | Disc capacity — 79:57, the true size of an "80 minute" blank. |
+| `BURNCD_MINUTES` | — | Same in whole minutes. 90-minute blanks: `BURNCD_MINUTES=89`. |
 | `BURNCD_LEVEL` | `off` | `album`, `track` or `off` — leveling without the flag. |
-| `BURNCD_LUFS` | `-11` | Loudness target. See leveling below. |
+| `BURNCD_LUFS` | `-11` | Loudness target. |
 | `BURNCD_PEAK` | `-1` | True-peak ceiling in dBTP. |
-| `BURNCD_NO_MEDIA_CHECK` | unset | Set to anything to skip the pre-burn look at the disc. |
-| `BURNCD_KEEP_WORK` | unset | Set to keep the image, cue sheet and drive logs, and print where they are. |
+| `BURNCD_NO_MEDIA_CHECK` | unset | Skip the pre-burn look at the disc. |
+| `BURNCD_KEEP_WORK` | unset | Keep the image, cue sheet and drive logs; print where. |
 
-### Why 79:57 and not 80:00
+## The three rehearsals
 
-A blank sold as "80 minute / 700 MB" holds **79:57** — 359,849 sectors at 75 per
-second. The 80 on the packaging is rounding. Track lengths are rounded *up* when
-read, so aiming at the true figure is safe rather than optimistic.
+None replaces another. Run them in this order on a new setup:
 
-If you use 90-minute blanks, `BURNCD_MINUTES=89`. Overburning past the rated
-capacity is not attempted.
+| | Touches audio | Touches drive | Uses a disc |
+| --- | --- | --- | --- |
+| `--check` | no | yes — capabilities and media | no |
+| `--demo` | yes — real image and cue | no | no |
+| `--dummy` | yes | yes — full burn, laser off | no, the blank survives |
 
-```bash
-BURNCD_SPEED=4 burncd ~/Music/Album
-```
+`--check` proves the hardware and tooling are there. `--demo` proves the output
+is right. `--dummy` proves the drive accepts that cue sheet and CD-Text.
+`--dummy` leaves the disc in the drive so the real burn is the next command.
 
----
+**Before each disc**, at the INSERT prompt and before any audio is converted,
+burncd checks the tray: empty, not blank, or too short for the plan (a 74-minute
+disc under a 79-minute plan) and it says so and asks again. Capacity comes from
+the disc's ATIP — the only thing that can tell a 74-minute blank from an
+80-minute one. If the ATIP can't be read, it says so once and goes ahead;
+`--no-media-check` skips the lot.
 
-## What it handles for you
+### `--verify`
 
-**Any format.** aiff, flac, mp3, ogg, opus, m4a, wav, ape — anything ffmpeg
-reads. Mixed formats in one folder is fine. Everything is converted to
-16-bit/44.1kHz stereo, which is what a CD actually stores. Hi-res sources get
-**triangular dither** on the way down to 16-bit — ffmpeg does not dither by
-default, it truncates, so this is set explicitly.
+Reads the disc back afterwards and checks the table of contents, that every
+sector reads without error, and that CD-Text survived. It deliberately does
+**not** byte-compare against the image: every drive reads audio back at a small
+fixed sample offset from where it wrote it, so an exact compare reports a
+mismatch on a perfectly good disc — the same false alarm this flag exists to
+settle. Needs `cdda2wav` for the full read; without it you still get the TOC
+check. Roughly doubles the time per disc, which is why it's opt-in. A failed
+disc means a non-zero exit.
 
-**Track order from metadata, not filenames.** It reads the embedded track
-number tag, so files named `aaa-random.mp3` and `zzz-whatever.flac` still come
-out in album order. Multi-disc source folders sort by disc number first. If some
-files have no track tag, those fall back to a natural filename sort and the plan
-tells you it did that — check the order before confirming.
+## What it handles
 
-**CD-Text.** Album title, album artist, and per-track titles and artists are
-written into the disc's lead-in, so a car stereo or CD player that supports
-CD-Text shows names instead of "Track 01". This comes from the same tags used for
-ordering, so if the files are tagged you get it for free. `--no-cdtext` turns it
-off entirely.
+**Any format** — anything ffmpeg reads, mixed formats fine. Everything converts
+to 16-bit/44.1kHz stereo with **triangular dither** on the way down (ffmpeg
+truncates by default; this is set explicitly).
 
-CD-Text lives in a small area of the lead-in, and a drive handed more of it than
-fits refuses the whole burn. So the metadata is measured against that budget —
-the real one, in 18-byte packs, not the size of the cue sheet — and if it doesn't
-fit it is shed a step at a time, remeasuring after each, until it does: per-track
-artists first, then track titles cut to 60 characters and then to 30, then track
-titles altogether, and only if none of that is enough, CD-Text for that disc.
-Every step says so. A disc that arrives with fewer of its names on it is a better
-outcome than one the drive won't write.
+**Track order from tags, not filenames.** Reads the embedded track number, so
+`aaa-random.mp3` still lands in album order. Multi-disc sources sort by disc
+first. Files with no track tag fall back to a natural filename sort, and the
+plan tells you it did that — check the order before confirming.
 
-The alphabet on a disc is ISO-8859-1, not Unicode, whatever your files are tagged
-in. Accented Latin text is converted and comes out right on the player: `Björk`
-is written as one byte, not as the two the panel drew it with.
+**CD-Text** — album, artist, and per-track titles and artists written to the
+lead-in. CD-Text lives in a small area there, and a drive handed more than fits
+refuses the whole burn, so metadata is measured against the real 18-byte-pack
+budget and shed a step at a time until it fits: per-track artists, then titles
+cut to 60 and 30 characters, then titles entirely, then CD-Text for that disc.
+Every step says so.
 
-Typographic punctuation is mapped before any of that, because it is the case that
-actually comes up — three of the eleven titles on *Santa Cruz* have a curly
-apostrophe in them, and left to iconv `Don’t` is written `Don´t`, an acute accent
-standing where the apostrophe was. Curly quotes become straight ones, en and em
-dashes become hyphens, `…` becomes three dots. These are exact stand-ins rather
-than approximations, so they are not counted as anything lost.
+The alphabet on a disc is ISO-8859-1, not Unicode. Accented Latin converts
+correctly; curly quotes, dashes and `…` are mapped to ASCII stand-ins first
+(otherwise iconv turns `Don’t` into `Don´t`); anything with no equivalent —
+Japanese, Chinese, Cyrillic — is dropped, and burncd counts what it
+approximated and says so before the burn. The plan still shows the real titles.
 
-What is left with a close equivalent is transliterated — `Tōkyō` becomes `Tokyo`
-— and anything with none, Japanese and Chinese and Cyrillic among them, cannot
-ride in a CD-Text pack at all and is dropped. burncd counts what it had to
-approximate and says so before the burn, once per disc. The panel and the plan go
-on showing the real titles; it is only the lead-in that is limited.
+**No gaps.** Each disc is one continuous sector-aligned image written
+disc-at-once, with track boundaries as index marks. Default, not a flag.
 
-**No gaps between tracks.** Each disc is assembled as one continuous
-sector-aligned image and written disc-at-once, with track boundaries as index
-marks rather than separate writes. Albums that segue between tracks stay
-seamless. This is the default, not a flag.
+**Splitting across discs.** Anything that won't fit is split across as many
+discs as it needs, *balanced* — a 128-minute set becomes 60 + 68, not 79 + 49 —
+with album order preserved. A CD also can't hold more than **99 tracks**
+regardless of runtime; the plan says which limit caused a split.
 
-**Splitting across discs.** Anything that won't fit on one disc is split across
-as many as it needs — two, five, however many. The split is *balanced*, so a
-128-minute set becomes 60 + 68 rather than 79 + 49, and album order is always
-preserved. It ejects each disc, asks for the next, and continues.
+**Tracks longer than a disc.** By default burncd refuses and tells you.
+`--split-long` cuts the track into equal parts — a 95-minute file becomes two of
+47:30 rather than 79:57 plus a stub — labelled `Title (part 1/2)`. The cut is
+sample-exact and contiguous.
 
-A CD also cannot hold more than **99 tracks** regardless of runtime, so a
-105-track folder splits even if it's only nine minutes long. The plan tells you
-which limit caused the split.
-
-**Tracks longer than a whole disc.** A 90-minute live set or DJ mix is one file
-that cannot fit on any CD. By default burncd refuses and tells you. Pass
-`--split-long` and it cuts the track into equal parts across discs — a 95-minute
-file becomes two 47:30 parts rather than 79:57 plus a 15-minute stub. The parts
-are labelled `Title (part 1/2)` in the plan and in CD-Text. The cut is sample-
-exact and contiguous: nothing is lost or duplicated, but the music does stop at
-the disc change, because that is what a disc change is.
-
-**Not running out of room.** Before converting each disc it checks that the temp
-filesystem can hold the image — roughly 10 MB per minute of audio, about 800 MB
-for a full disc — and stops with a clear message rather than dying at 90%. Set
-`TMPDIR` to a roomier volume if your boot disk is tight.
-
----
+**Disk space.** Checks the temp filesystem holds the image (~10 MB per minute of
+audio) before converting, rather than dying at 90%. Set `TMPDIR` if your boot
+disk is tight.
 
 ## The plan screen
 
-Tags are often wrong, and the wrong ones are burned into the lead-in permanently.
-So the plan you see before every burn is not a printout — it is the editor. You
-notice the bad title on the same screen you fix it on, with no flag to decide on
-in advance:
+Tags are often wrong, and the wrong ones get burned into the lead-in
+permanently. So the plan isn't a printout — it's the editor.
 
 ```
    BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 11 TRACKS · 40:35 · 1 DISC
@@ -290,14 +142,7 @@ in advance:
   ━━ DISC 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ▶ 01  Take Me Home, Country Roads (Orig…  John Denver            3:14
     02  Follow Me ("Greatest Hits" Versio…  John Denver            2:58
-    03  Starwood In Aspen ("Greatest Hits…  John Denver            3:16
-    04  For Baby (For Bobbie)               John Denver            3:00
-    05  Rhymes and Reasons ("Greatest Hit…  John Denver            3:18
-    06  Leaving, On a Jet Plane ("Greates…  John Denver            4:09
-    07  The Eagle and the Hawk ("Greatest…  John Denver            2:17
-    08  Sunshine on My Shoulders ("Greate…  John Denver            5:15
-    09  Goodbye Again                       John Denver            3:42
-    10  Poems, Prayers and Promises ("Gre…  John Denver            4:42
+    ...
     11  Rocky Mountain High                 John Denver            4:44
 
   DISC 1                                                  40:35 / 79:57
@@ -308,535 +153,125 @@ in advance:
    S  SPLIT    U  UNDO    R  RESET    B  BURN    Q  QUIT
 ```
 
-That is the screen with its colour stripped out. On the terminal the `BURNCD`
-badge is engraved black-on-amber, the rules and labels are the darker amber of
-paint on a metal panel, the keycaps along the bottom are backlit, and the track
-titles are left the brightest thing on the screen. Titles too long for the column
-end in `…` so a truncated one is obvious. The meter is dithered throughout and
-coloured in the same amber family — amber, brown, gold, burnt orange, alternating
-light and dark so one track ends and the next begins visibly.
-
-Redraws are whole frames laid over the top of the last one, never a clear
-followed by a repaint, so holding an arrow key down does not strobe. Building a
-frame costs no subprocesses at all, which is what keeps that redraw under a
-frame's worth of time on a folder of any size.
-
-The number of tracks shown is whatever the window has room for, counted rather
-than guessed — the disc rules on a multi-disc split take rows too, and a frame
-one line taller than the window scrolls the panel's own header away where no
-later redraw can reach it. Below 19 rows there is no room for a panel at all, so
-a very short window falls through to the static plan the same way a pipe does.
-
-**`b` is what starts the burn** — or `space`, whichever your hand finds first.
-Nothing is written, converted, or asked of the drive until then, so there is no
-cost to opening the screen, looking, and leaving with `q`.
-
 | Key | What it does |
 | --- | --- |
-| `↑` `↓` or `k` `j` | Move the selection. It runs through the three header fields and then the tracks. |
-| `⇧↑` `⇧↓` or `K` `J` | Move the selected track up or down in the running order. |
-| `⏎` | Rename whatever is selected — album, artist, year, or a track title. |
-| `a` | Edit the artist of the selected track, for compilations with a different name per track. |
-| `x` or `d` | Drop the selected track from the burn. The file is untouched. |
-| `s` | Start a new disc at the selected track. Press it again to clear the break. |
-| `u` | Undo the last edit, whatever it was — a rename, a move, a drop, a break, or `r`. |
-| `r` | Reset everything to the original tags and order. |
-| `b` or `space` | Accept the plan and burn. |
+| `↑` `↓` / `k` `j` | Move the selection — through the three header fields, then the tracks. |
+| `⇧↑` `⇧↓` / `K` `J` | Move the selected track in the running order. |
+| `⏎` | Rename whatever is selected. |
+| `a` | Edit the selected track's artist, for compilations. |
+| `x` / `d` | Drop the track from the burn. The file is untouched. |
+| `s` | Start a new disc here. Press again to clear. |
+| `u` | Undo the last edit — rename, move, drop, break or reset. Holds 100. |
+| `r` | Reset to the original tags and order. |
+| `b` / `space` | Accept the plan and burn. |
 | `q` | Quit without burning. |
-| `PgUp` `PgDn` | Page through a long track list. |
 
-Nothing here touches your files. Edits apply to this burn only — to the CD-Text
-in the lead-in and to the cue sheet — and they are gone when the command exits.
+Nothing here touches your files — edits apply to this burn's CD-Text and cue
+sheet only, and are gone when the command exits.
 
-The editor needs a terminal and something to decide, so `-n` and any piped or
-redirected run skip it and print the static plan instead. Pressing `b` does not
-close the editor so much as turn the page: the screen stays where it is and the
-burn happens on it, starting with a confirm screen that `e` brings you straight
-back here from. See [one screen, start to
-finish](#one-screen-start-to-finish).
+The disc layout recomputes after every change, so on a multi-disc set the
+separators and the meter move as you reorder. `s` puts a break where the
+balancer wouldn't have, marked `· SPLIT` so it's never confused with one the
+arithmetic chose; the rest rebalances around it.
 
-The disc layout is recomputed after every change, so on a multi-disc set the
-`━━ DISC N` separators and the meter move as you reorder or drop tracks; you can
-see a disc boundary land somewhere better in real time. The meter always shows
-the disc the cursor is on, with a minute scale under it, so "where does this
-disc end?" and "how full is it?" are the same glance.
+Pressing `b` turns the page rather than exiting: the INSERT prompt is also the
+confirmation step, showing the album and running order as you edited them. `e`
+goes back to the editor with your changes intact — offered only on disc 1 of a
+job that started at disc 1, since after that the plan is a fact about a physical
+object on the desk. Converting, writing and the final report all draw on the
+same screen, and `q` at the end closes it, leaving nothing in your scrollback.
 
-When the balancer's idea of where a disc ends isn't yours — a set with an obvious
-seam, a double album whose sides are the point — `s` puts the break where you
-want it and the rest rebalances around it:
+Set the year even though no CD player shows it — CD-Text has no year field, but
+it's written to the cue sheet as `REM DATE`, which some rippers read back later.
 
-```
-  ━━ DISC 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    01  Short 1                             Long Artist           10:00
-  ━━ DISC 2 · SPLIT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ▶ 02  The Long Piece                      Long Artist           85:00
-  ━━ DISC 3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    03  Short 3                             Long Artist           10:00
-```
-
-`· SPLIT` marks the boundaries you asked for, so a break of yours is never
-confused with one the arithmetic chose. Breaks only ever add discs — a disc can
-still fill up and break on its own before the next one you set — and under
-`--split-long` a track cut across discs won't take a second break on its later
-parts.
-
-Every one of these edits is undoable, one step at a time, including `r`: the
-stack holds the last hundred changes and `u` walks back through renames, moves,
-drops, breaks and resets alike. Pressing `⏎` on a title to read it in full and
-`⏎` again to keep it doesn't count as a change and doesn't cost an undo.
-
-The screen draws on the terminal's alternate buffer, and that buffer is opened
-before the first line of output rather than after — even "reading the folder"
-happens inside it. So nothing above it moves, and when it closes there is nothing
-of the run left behind at all.
-
-Year is worth setting even though no CD player will ever show it — CD-Text has no
-year field. It is written to the cue sheet as `REM DATE`, which some ripping
-software reads back when the disc is later imported.
-
----
+A window under 19 rows or 71 columns skips the panel and prints linearly, the
+same way a pipe does. Run `burncd --demo` on any folder to see the whole thing
+without a disc in the drive.
 
 ## Loudness: `--level`
 
-Some albums are mastered quiet and play noticeably softer than everything else in
-the changer. `--level` measures the album and raises it:
-
-```
-  Nonagon Infinity — King Gizzard (2016)
-  6 tracks, 1:23, ordered by embedded track numbers
-  CD-Text: on — disc and track names written to the lead-in
-  Level: +33.4 dB to reach -11 LUFS
-```
+Some albums are mastered quiet and play noticeably softer than everything else
+in the changer. `--level` measures the album and raises it.
 
 **It only ever applies gain — a single volume change.** No compression, no
-limiting, no normalization per track by default. It cannot make a record sound
-squashed, because it has no mechanism to; the dynamics that come out are exactly
-the ones that went in, moved up as a whole.
+limiting. It cannot make a record sound squashed; it has no mechanism to.
 
-The gain is whichever is smaller of two numbers:
-
-- how much is needed to hit the loudness target (`-11` LUFS, about where a
-  typical commercial CD sits), and
-- how much headroom there is before the loudest true peak reaches the ceiling
-  (`-1` dBTP).
-
-So a quiet record gets the full boost, and a record that is already loud gets
-whatever fits under the ceiling — often nothing:
-
-```
-  Level: already at CD loudness, no change
-```
-
-When the peak is what stops it rather than the target, the plan says so, because
-that is the case where you don't get all the way to the target:
-
-```
-  Level: +41.1 dB — all the headroom there is before clipping
-```
-
-The ceiling is `-1` dBTP rather than `0` on purpose. **True** peak is not the
-highest sample: reconstructing the waveform between samples can overshoot them,
-and a signal that measures 0 dBFS in the file can clip a player's DAC anyway. A
-dB of margin costs nothing audible and avoids that.
-
-### Album gain vs track gain
-
-`--level` is album mode: **one gain across the whole disc**. Quiet interludes stay
-quiet relative to the loud tracks, because that relationship is a decision someone
-made and it is not burncd's to overrule. Album mode also never turns anything
-*down*.
-
-`--level=track` measures and levels each track independently. That is right for a
-mixtape of unrelated masters, where the tracks have no relationship to preserve,
-and wrong for an album. It does attenuate — matching a set means bringing the loud
-ones down as well as the quiet ones up.
+The gain is whichever is smaller: what's needed to hit the target (`-11` LUFS,
+about where a commercial CD sits), or the headroom before the loudest true peak
+reaches the ceiling (`-1` dBTP). So a quiet record gets the full boost and an
+already-loud one often gets nothing. The plan says which limit applied. The
+ceiling is `-1` rather than `0` because true peak isn't the highest sample —
+reconstruction between samples can overshoot, and a file measuring 0 dBFS can
+still clip a DAC.
 
 ```bash
 burncd --level ~/Music/QuietAlbum       # one gain for the record
 burncd --level=track ~/Music/Mixtape    # every track to the same loudness
-BURNCD_LUFS=-14 burncd --level ~/Music/Album   # quieter target
-BURNCD_LEVEL=album burncd ~/Music/Album        # on by default, no flag
 ```
 
-Measuring reads every file end to end — roughly as long as converting them — so
-the first run on an album is slower and says so. Results are cached under
-`~/.cache/burncd`, keyed by path, size and mtime, so re-runs and the eventual real
-burn are instant. If that directory can't be written, it measures every time and
-doesn't complain about it.
+`--level` is **album mode**: one gain across the disc, so quiet interludes stay
+quiet relative to loud tracks — that relationship is someone's decision and not
+burncd's to overrule. It never turns anything down. `--level=track` levels each
+track independently and does attenuate; right for a mixtape of unrelated
+masters, wrong for an album.
 
-Gain is applied in floating point and quantized to 16-bit once, at the end of the
-chain, with the same triangular dither as everything else. `--check` reports
-whether your ffmpeg has the `ebur128` filter this needs.
-
----
-
-## What it looks like
-
-### The plan
-
-What a normal run opens with. It is the editor described above — arrow around
-it, fix what's wrong, `b` when it's right — and this is the plain-text copy of
-the same thing, which is what `-n` prints and what a piped run or a window too
-short for a panel falls back to. A normal run keeps the plan on the panel
-instead and leaves nothing in your scrollback at all:
-
-```
-  Nonagon Infinity — King Gizzard
-  12 tracks, 41:38, ordered by embedded track numbers
-  CD-Text: on — disc and track names written to the lead-in
-
-    1. Robot Stop                                             3:30
-    2. Big Fig Wasp                                           3:10
-    ...
-   12. Road Train                                             4:12
-                                                             41:38
-  DISC 1                                                  41:38 / 79:57
-  ▐▓▓▓▎▓▓▓▊▓▓▌▓▓▓▏▓▓▓▊▓▓▓▎▓▓▌▓▓▓▓▏▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
-   0               20               40               60             80
-```
-
-The meter under each disc is that disc filling up. Each cell is real time on the
-disc and the colour steps between tracks, so you can see at a glance both how full
-the disc is and where the tracks divide it — which is the thing you actually want
-to look at on a multi-disc split, where every disc gets its own listing and its
-own meter.
-
-It is drawn at eighth-cell resolution. A cell can carry two colours — one as
-foreground, one as background — and Unicode has the full run of left-aligned
-partial blocks, so where a track boundary lands mid-column it is drawn as a
-partial block of the outgoing colour over the incoming one rather than snapped to
-the nearest character. That is eight times the precision for no extra width,
-which is what makes the widths comparable at all: on a half-full disc of eleven
-tracks each band is about three cells, and at whole-cell resolution a 3:14 and a
-2:58 are simply the same bar.
-
-Widths are apportioned by largest remainder rather than by truncating a running
-total, so a longer track is never drawn narrower than a shorter one, and the bands
-always add up to exactly the filled length. Measured against a real album the
-bands come out within about 1% of true. A track under about ten seconds rounds
-away to nothing and does not consume a colour, so the tracks either side of it
-keep their contrast.
-
-The grain is uniform within a band on purpose. An earlier version varied the
-density from cell to cell and the speckle read as gaps, which destroyed the only
-comparison the bar exists to support; a shaded cell is exactly as wide as a solid
-one, so the texture costs nothing as long as it does not vary. The unburnt tail is
-the same texture at a quarter density in the darkest amber, so it still reads as
-part of the meter rather than as the end of it.
-
-The scale underneath is spaced from the disc's capacity — every 20 minutes on a
-Red Book disc, closer together on the short ones `BURNCD_MINUTES` can ask for.
-
-### One screen, start to finish
-
-Pressing `b` does not drop you back to the shell. The alternate screen the
-editor opened is held for the whole job, and every step after it is drawn over
-the last one from the same home position: waiting for a disc, converting it,
-writing it, and the disc-by-disc report at the end are four states of one
-instrument, not four messages stacked up a scrolling terminal.
-
-Every stage has the same shape — the badge and what is happening now across the
-top, the album under it, the stage's own body, then whatever has already happened,
-and last of all the keys you can press:
-
-```
-   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ INSERT · DISC 1 OF 1
-
-    ALBUM    John Denver's Greatest Hits
-    ARTIST   John Denver
-    YEAR     1973
-
-    01  Take Me Home, Country Roads (Orig…  John Denver            3:14
-    02  Follow Me ("Greatest Hits" Versio…  John Denver            2:58
-    03  Starwood In Aspen ("Greatest Hits…  John Denver            3:16
-    04  For Baby (For Bobbie)               John Denver            3:00
-    05  Rhymes and Reasons ("Greatest Hit…  John Denver            3:18
-    06  Leaving, On a Jet Plane ("Greates…  John Denver            4:09
-    07  The Eagle and the Hawk ("Greatest…  John Denver            2:17
-    08  Sunshine on My Shoulders ("Greate…  John Denver            5:15
-    09  Goodbye Again                       John Denver            3:42
-    10  Poems, Prayers and Promises ("Gre…  John Denver            4:42
-    11  Rocky Mountain High                 John Denver            4:44
-
-  DISC 1                                                  40:35 / 79:57
-  ▐▓▓▊▓▓▎▓▓▓▓▌▓▓▎▓▓▊▓▋▓▓▓▓▓▓▓▏▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
-   0               20               40               60             80
-
-  INSERT a blank CD-R
-   ⏎  BURN    E  EDIT    Q  CANCEL
-```
-
-**Asking for the disc is also the confirmation step.** The point of no return is
-the moment a blank goes in, so that is the screen that shows you what you are
-about to commit to: the album, artist and year as you edited them, the running
-order as you left it, and the meter for the disc about to be written. `e` goes
-back to the editor with everything you changed still changed; `⏎` starts the
-burn. Nothing is converted or written until then, so the round trip costs a
-keystroke and nothing else.
-
-`e` is offered only on the first disc of a job that started at disc one. Once a
-disc has been written the plan is a fact about a physical object sitting on the
-desk, and re-cutting the running order underneath it would renumber discs that
-are already in a sleeve — so from disc two on, the keys are `⏎ BURN` and
-`Q CANCEL`.
-
-When the track list is taller than the window has room for, it is cut to fit and
-the last line reads `▾ 7 MORE`. There is no scrolling here — this screen is a
-last look, and the place to read a long album line by line is the editor `e`
-takes you back to.
-
-Under the meter is the running log — discs finished, verify results, anything the
-drive had to say:
-
-```
-  ✓ Disc 1 of 2 written
-
-  INSERT a blank CD-R for disc 2 of 2
-   ⏎  BURN    Q  CANCEL
-```
-
-Those lines used to print wherever the cursor happened to be, over the top of
-whatever was being drawn at the time; now they join the frame they belong to and
-it is redrawn around them. If the log outgrows the window, the oldest lines
-scroll out of the panel rather than pushing its header off the top of the screen.
-
-Converting is the same frame with the capacity meter filling as each track is
-encoded, so the wait before the laser looks like the wait during it.
-
-### Burning
-
-```
-   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ WRITING · DISC 1 OF 2 ·  54%
-
-    ALBUM    Nonagon Infinity
-
-    TRACK    06 OF 11  Rhymes and Reasons ("Greatest Hits" Version)
-    WRITTEN  329 OF 605 MB AT 8.0x
-    BUFFER   97%   ELAPSED 0:42   REMAINING 0:36
-
-  ▐▓▓▓▓▓▍▓▓▓▓▎▓▓▓▓▋▓▓▓▓▋▓▓▓▓▓▏▓▓▓▓▓▓▌░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
-  ▐·······················░░▒▒▓█······································▌
-```
-
-Same badge, same grid, same amber as the plan. **The progress bar is the capacity
-meter again** — literally the same two functions, one deciding the band widths
-and one drawing them, so the plan you approved and the disc coming out of it are
-the same picture at two moments and cannot drift apart. The bands are the tracks
-in the same alternating ambers, with the same partial blocks on the boundaries;
-the part not yet written is the same run-out the meter uses for the empty end of
-a disc; and the write head is a partial block too, so on a bar this wide it
-creeps forward continuously instead of sitting still and then jumping a cell.
-
-The second line is a lamp sweeping a dark field, in the position the plan gives
-its minute scale. It runs on its own clock rather than on the drive's: a burn is
-twenty minutes of a number that changes every few seconds, and a panel with
-nothing moving on it looks like a panel that has died. Whether the write has
-actually stalled is a question for the numbers above it, which are the ones you
-would check to confirm it anyway.
-
-A drive only narrates the middle of a burn. It says nothing while it spins up,
-calibrates its laser and writes the lead-in, and nothing again while it empties
-its buffer and writes the lead-out — each of them seconds long, and on some
-drives the better part of a minute. Both get the panel above, said outright:
-
-```
-   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━ WRITING · DISC 1 OF 2 · LEAD-IN
-
-    ALBUM    Nonagon Infinity
-
-    TRACK    -- OF 11  —
-    WRITTEN  0 OF 605 MB AT --x
-    BUFFER   --%   ELAPSED 0:06   REMAINING --:--
-```
-
-Same layout, with `--` standing in for the fields the drive has not filled yet,
-so nothing on screen moves when a phase changes hands. The lead-out reads the
-same way at the other end — dashes for the speed and the buffer, because nothing
-is being written by then and a speed left over from the last track would be the
-one dishonest number on the panel.
-
-The lamp sweeps and the clock runs throughout, and that goes for a silence
-anywhere in a burn, not just the two at its ends. A drive that stops mid-disc to
-recalibrate or to let its buffer refill leaves every other number where it was,
-and a running clock is the difference between that and a drive that has died.
-
-The lead-out ends the bar at 100%, which the megabytes on their own never quite
-reach: the drive rounds each track down to a whole megabyte as it goes, we round
-the disc down once, and the difference is half a megabyte a track — fifteen of
-them across a twenty-eight track disc. The panel used to stop there and stay
-until the disc was ejected out from under it. It now treats the last track
-finishing as the end of the audio whatever the disc's percentage says, so a disc
-of forty short pieces, whose bar tops out in the low nineties, still gets its
-lead-out and its 100%.
-
-There used to be a disc filling in from the hub outward here, in cyan and white.
-It was a second, unrelated instrument bolted to the side of this one, and it said
-nothing the numbers beside it did not.
-
-In a terminal narrower than 71 columns it falls back to a compact four-line
-readout, and when output is piped to a file it prints plain one-line-per-track
-progress instead of redrawing anything.
-
-### When it's done
-
-The last state of the same panel, not a message printed after it:
-
-```
-   BURNCD  ━━━━━━━━━━━━━━━━━━━━━━━━━━ 2 DISCS · 78:10 · 41:12 ELAPSED
-
-    ALBUM    Nonagon Infinity
-
-  DISC 1                                                  46:12 / 79:57
-  ▐▓▓▓▎▓▓▓▓▊▓▓▓▌▓▓▓▓▏▓▓▓▊▓▓▓▓▎▓▓▓▌▓▓▓▓▏▓▓▓▓▎░░░░░░░░░░░░░░░░░░░░░░░░░░▌
-   0               20               40               60             80
-
-  DISC 2                                                  31:58 / 79:57
-  ▐▓▓▓▓▌▓▓▓▏▓▓▓▓▊▓▓▓▎▓▓▓▓▋▓▓▓▌▓▓▓▏░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▌
-   0               20               40               60             80
-
-  ✓ Disc 1 of 2 written
-  ✓ Disc 2 of 2 written
-
-   Q  QUIT
-```
-
-Same bars as the plan, so you can see what actually landed on each disc, with the
-whole log of the job under them. `--from-disc` reruns show only the discs they
-burned.
-
-**`q` is the end of the job, and it takes the screen with it.** The alternate
-buffer closes and your terminal is exactly as you left it — the last thing in the
-scrollback is the `burncd` command you typed, with nothing between it and the next
-prompt. Nothing from the run is printed before the screen opens or after it
-closes, so a burn leaves no wreckage to scroll past. The one exception is a disc
-that failed `--verify`: that is worth keeping, so it is written to stderr after
-the screen is down, and burncd exits non-zero.
-
-A window shorter than 19 rows or narrower than 71 columns never opens the screen
-in the first place and prints the whole job linearly instead, the same way a pipe
-does.
-
-Run `burncd --demo` on any folder to see all of this without a disc in the drive.
-
----
+Measuring reads every file end to end, so the first run is slow and says so.
+Results cache under `~/.cache/burncd`, keyed by path, size and mtime.
 
 ## Troubleshooting
 
 **`cdrecord not found`** — `brew install cdrtools`.
 
 **cdrecord can't find the drive.** `--check` fails with `no drive answered`,
-usually while `drutil` still reports the drive fine. burncd tries the three IOKit
-classes an optical drive can register as — `IODVDServices`, then
-`IOCompactDiscServices`, then `IOBDServices`, unit 0 and 1 of each — and keeps
-the first one cdrecord can open, so this should not need setting. (Almost every
-USB drive sold now is a DVD combo and comes up as `IODVDServices/0`, even when
-all you ever put in it is a CD-R.)
-
-If none of them answered, ask cdrecord what it can see:
+often while `drutil` reports the drive fine. burncd tries `IODVDServices`,
+`IOCompactDiscServices` and `IOBDServices`, units 0 and 1, so this shouldn't
+normally need setting. If none answered:
 
 ```bash
 cdrecord -scanbus
 ```
 
-and use the bus address it prints — `1,0,0` in the line
-`1,0,0  100) 'MATSHITA' 'DVD-RAM UJ8E2 S ' ...` — as `BURNCD_DEV=1,0,0`.
+Use the bus address it prints — `1,0,0` — as `BURNCD_DEV=1,0,0`, and put it in
+your shell profile. A `/dev/` path does **not** work: cdrecord wants an IOKit
+class name or a bus address, and `dev=/dev/disk4` fails the same way a wrong
+class name does. A device set by hand is never second-guessed.
 
-What does **not** work is a `/dev/` path: cdrecord wants an IOKit class name or a
-bus address, and `dev=/dev/disk4` fails the same way the wrong class name does,
-which makes it easy to mistake for the same problem.
+**The burn failed mentioning CD-Text or the cue sheet.** Some drives and some
+cdrecord builds don't handle it; `--check` says which. Fall back with
+`--no-cdtext` — everything else is unchanged. To see what was handed to the
+drive, `BURNCD_KEEP_WORK=1 burncd --demo DIR` keeps the image, cue sheet and
+drive logs and prints the path.
 
-Once you know the right value, put it in your shell profile and forget it:
+**It keeps asking for a disc that's already in the drive.** Some drives report
+the tray as empty for a second after anything else has spoken to them. burncd
+reads twice; a drive that insists can't be argued with. Use
+`--no-media-check` — cdrecord still refuses anything that genuinely won't fit,
+just five minutes later.
 
-```bash
-echo 'export BURNCD_DEV=1,0,0' >> ~/.zshrc
-```
+**"This blank holds 74:00 and disc 1 is 79:12."** The disc's ATIP says it's a
+74-minute blank. Use an 80-minute one, or `BURNCD_MINUTES=73`.
 
-A device set by hand is never second-guessed: burncd skips the search entirely
-and reports failures against the name you gave it.
+**A disc failed partway through a multi-disc job.** Don't restart from disc 1 —
+`burncd --from-disc 3 DIR`. The split is deterministic, so disc 3 holds the same
+tracks it would have.
 
-**The burn failed and mentioned CD-Text or the cue sheet.** Some drives and some
-cdrecord builds don't handle it. `burncd --check` says which of the two is the
-problem. Either way:
+**Track order looks wrong.** Missing track number tags; the dry run says
+`ordered by filename` when that happens.
 
-```bash
-burncd --no-cdtext ~/Music/Album
-```
-
-That falls back to burning without names in the lead-in. Everything else —
-gapless, ordering, splitting — is unchanged. To find out which it is without
-spending discs, run the same album with `--dummy` twice, once each way.
-
-To see what was actually handed to the drive, keep the working files:
-
-```bash
-BURNCD_KEEP_WORK=1 burncd --demo ~/Music/Album
-```
-
-The path is printed when the run ends. In it are the WAV image, the cue sheet
-with the CD-Text exactly as it would be written, and cdrecord's own log for each
-disc — none of which normally survives the exit. `hexdump -C disc1.cue` is how to
-confirm an accented title went out as one byte per character rather than two.
-
-**It keeps asking for a disc that's already in the drive.** The pre-burn check
-believes the drive, and some report the tray as empty for a second after anything
-else has spoken to them — burncd reads twice before saying so, but a drive that
-insists can't be argued with. Confirm with `burncd --check`, and if that's happy
-while the burn isn't:
-
-```bash
-burncd --no-media-check ~/Music/Album
-```
-
-Same for a drive that reports a blank as too small: `--no-media-check` skips the
-capacity test with it, and cdrecord still refuses anything that genuinely won't
-fit — just five minutes later, after the audio has been converted.
-
-**"This blank holds 74:00 and disc 1 is 79:12."** The disc's own ATIP says it is a
-74-minute blank. Use an 80-minute one, or `BURNCD_MINUTES=73` to plan for what you
-have and start again.
-
-**A disc failed partway through a multi-disc job.** Don't restart from disc 1:
-
-```bash
-burncd --from-disc 3 ~/Music/Album
-```
-
-The split is deterministic, so disc 3 contains the same tracks it would have the
-first time.
-
-**Track order looks wrong.** The files are probably missing track number tags.
-The dry run says `ordered by filename` when that happens. Fix the tags in a
-tagger, or rename the files so a natural sort gives the right order.
-
-**"longer than a disc"** — one file is longer than 79:57. Use `--split-long` to
-cut it across discs, or split the file yourself first if you want to choose where
-the break lands.
+**"longer than a disc"** — use `--split-long`, or split the file yourself if you
+want to choose where the break lands.
 
 **Music.app said the burn failed but the disc plays fine.** That's Music.app's
-post-burn *verification* read, not the burn. Cheap bus-powered USB drives are
-often worse at reading a disc than at writing one, and some report an error while
-closing the session even when the audio is intact. burncd reports cdrecord's own
-exit status and prints its actual output, which tells you something real instead
-of a generic dialog. `--verify` settles it either way: it re-reads the finished
-disc and tells you whether the audio and the CD-Text are actually there.
-
-If it does fail for real, drop the speed:
-
-```bash
-BURNCD_SPEED=4 burncd ~/Music/Album
-```
-
-Bus-powered USB drives are also prone to browning out near the end of a burn.
-If failures cluster at the end, use a powered hub or the drive's second USB leg.
-
----
+post-burn verification read, not the burn. Cheap bus-powered USB drives are
+often worse at reading than writing. `--verify` settles it either way. If it
+does fail for real, drop to `BURNCD_SPEED=4`. Bus-powered drives also brown out
+near the end of a burn — if failures cluster there, use a powered hub.
 
 ## Notes
 
-Burn speed defaults to 8x rather than maximum, which generally gives lower error
-rates on cheap media. Verbatim AZO is the reliable blank these days — Taiyo Yuden
-no longer manufactures, so anything sold under that name is a different factory.
+Burn speed defaults to 8x rather than maximum, which gives lower error rates on
+cheap media. Verbatim AZO is the reliable blank these days — Taiyo Yuden no
+longer manufactures, so anything sold under that name is a different factory.
 
-Keep the purchased lossless files as the real archive. CD-R dye degrades in a way
-pressed discs don't, so treat the burned disc as the playback copy, not the
-master.
+Keep the purchased lossless files as the archive. CD-R dye degrades in a way
+pressed discs don't, so the burned disc is the playback copy, not the master.

@@ -10,34 +10,27 @@ Third-party runtime code, committed rather than linked.
 - **SHA-384:** `D/t0ZMqQW31H3az8ktEiNb39wyKnS82iFY52QPACM+IjKW3jDUhyIgh2PApRqJZs`
 - **License:** MIT
 
-Loaded as a plain `<script>` by `index.html`, `wishlist.html` and `stats.html`,
-which is why it is a global (`window.Papa`) rather than an import. It is used at
-exactly one call site — `parseCsv` in `js/collection.js` — with three options:
-`download`, `header`, and `skipEmptyLines`.
+Loaded as a plain `<script>` by `index.html`, `wishlist.html` and `stats.html` —
+hence a global (`window.Papa`) rather than an import. One call site: `parseCsv`
+in `js/collection.js`, with `download`, `header` and `skipEmptyLines`.
 
-### Why it is here and not on a CDN
+**Why it's here and not on a CDN.** It used to be a `<script src>` at jsdelivr
+pinned with `integrity`. That was safe against the file changing but not against
+it being *gone*, and three of the four pages render no rows without it — so a
+first visit on a new device with jsdelivr unreachable showed an empty collection.
+Served from this repo there's no second origin that has to still exist. The
+deployed site now has no third-party runtime origins at all; the only external
+request left is the Google Fonts stylesheet, which falls back cleanly.
 
-It used to be a `<script src>` pointing at jsdelivr, pinned with an `integrity`
-attribute. That was safe against the file changing, but not against it being
-gone: three of the four pages render no rows at all without it, so a first visit
-on a new device with jsdelivr unreachable showed an empty collection. Served
-from this repo there is no second origin that has to still exist — clone it,
-serve the directory, and the site works with no network at all, which is the
-whole premise of the offline shell.
+`integrity` and `crossorigin` came off with the move. SRI exists to check a file
+someone else is serving; this one ships in the same commit as the page loading
+it, and git already knows if it changed.
 
-It also means the deployed site has no third-party runtime origins left. The
-only remaining external request is the Google Fonts stylesheet, and the type
-falls back cleanly when that does not answer.
+### Verifying
 
-The `integrity` and `crossorigin` attributes came off with the move. Subresource
-Integrity exists to check a file someone else is serving; this one ships in the
-same commit as the page that loads it, and git already knows if it changed.
-
-### Verifying this copy
-
-The hash above is the one that was in the pages' `integrity` attributes before
-the move, so this check also confirms the vendored bytes are identical to what
-the site was already loading:
+The hash above is the one that was in the `integrity` attributes before the
+move, so this also confirms the vendored bytes match what the site already
+loaded:
 
 ```sh
 openssl dgst -sha384 -binary vendor/papaparse.min.js | openssl base64 -A
@@ -45,15 +38,14 @@ openssl dgst -sha384 -binary vendor/papaparse.min.js | openssl base64 -A
 
 ### Upgrading
 
-There is no build step and no lockfile, so this is a manual, deliberate act:
+No build step and no lockfile, so this is manual and deliberate:
 
-1. Download the new build and diff the hash so you know what changed.
-2. Update the version, size, and hash above.
+1. Download the new build and diff the hash.
+2. Update the version, size and hash above.
 3. Bump `CACHE_VERSION` in `sw.js` — installed clients hold the old copy in
-   `cdc-shell-*` and will not fetch a new one otherwise.
+   `cdc-shell-*` and won't fetch a new one otherwise.
 4. Load all three pages and confirm rows still parse.
 
-Nothing checks this file automatically. `scripts/check-shell-assets.js` asserts
-it is precached, because it is named in `SHELL_ASSETS`, but it deliberately does
-not walk classic scripts, so the `<script src>` in the three pages is still kept
-by hand.
+Nothing checks this automatically. `scripts/check-shell-assets.js` asserts it's
+precached, because it's named in `SHELL_ASSETS`, but it deliberately doesn't walk
+classic scripts — so the `<script src>` in the three pages is kept by hand.
