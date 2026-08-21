@@ -1423,8 +1423,28 @@ load_stage() {  # load_stage <title> <done> <total> <line>
 # being clever about.
 AUDIO_DIR=''
 SRC_KIND=''; SRC_PATH=''; SRC_LABEL=''; SRC_DETAIL=''
+
+# Bytes as something a person can read. Only the two messages about room use it,
+# and both of them are read by somebody who has just been told no.
+room_str() {  # room_str <bytes>
+  awk -v b="${1:-0}" 'BEGIN {
+    split("B KiB MiB GiB TiB", u, " "); i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    f = (i == 1) ? "%d %s" : "%.1f %s"
+    printf f, b, u[i] }'
+}
+
+# How much room is left where the album is going. In 1K blocks, times 1024, and
+# -P because the default df wraps long device names onto a second line and takes
+# the columns with it.
+room_free() {  # room_free <dir>
+  local kb
+  kb=$(df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  case "$kb" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' $(( kb * 1024 )) ;; esac
+}
+
 open_source() {  # open_source <record>
-  local rec=$1 n=0 total=0 entry esc
+  local rec=$1 n=0 total=0 entry esc rc=0 need=0 have=0
   IFS=$'\t' read -r SRC_KIND SRC_PATH SRC_LABEL SRC_DETAIL <<< "$rec"
 
   case "$SRC_KIND" in
@@ -1438,6 +1458,25 @@ open_source() {  # open_source <record>
       mkdir -p "$AUDIO_DIR"
       total=$( (unzip -Z1 "$SRC_PATH" 2>/dev/null || true) | grep -vc '/$' || true )
       [ "${total:-0}" -gt 0 ] || die "nothing inside $SRC_LABEL"
+
+      # Whether it fits, asked before a byte of it is written. A lossless record
+      # is two to three times its zip, a long one is several gigabytes of that,
+      # and the volume this unpacks onto is nobody's idea of empty. Finding out
+      # afterwards means a half-unpacked album and a disk with nothing left on
+      # it; finding out now costs one fork and a sentence.
+      #
+      # The margin is so that a record which only just fits does not leave the
+      # volume at zero — the rest of the machine is still using it, and an album
+      # is not worth wedging a Mac for.
+      need=$(unzip -Zt "$SRC_PATH" 2>/dev/null | awk '/bytes uncompressed/ { print $3; exit }')
+      case "$need" in ''|*[!0-9]*) need=0 ;; esac
+      if [ "$need" -gt 0 ]; then
+        have=$(room_free "$AUDIO_DIR")
+        if [ $(( have - need )) -lt 33554432 ]; then
+          die "$SRC_LABEL unpacks to $(room_str "$need") and there is $(room_str "$have") free in $WORK — set PLAYER_WORK to somewhere with room"
+        fi
+      fi
+
       load_stage "OPENING" 0 "$total" "$SRC_LABEL"
       while IFS= read -r entry; do
         [ -n "$entry" ] || continue
@@ -1451,7 +1490,31 @@ open_source() {  # open_source <record>
         # -o overwrites without asking, -qq says nothing, and a failure on one
         # entry is not a reason to abandon an album — a zip with one corrupt
         # booklet scan in it still has twelve good tracks.
-        unzip -qq -o "$SRC_PATH" "$esc" -d "$AUDIO_DIR" 2>/dev/null || true
+        #
+        # But not every failure is about the entry. A disk that fills partway
+        # through fails every entry after it, identically and silently, and what
+        # comes out the far end is an album missing its second half that plays
+        # until it doesn't. So the exit code is read: the ones that mean "this
+        # entry" carry on, and the ones that mean "this zip" or "this machine"
+        # stop and say which. Room was checked before any of this ran, so
+        # arriving here full means something else on the volume took it in the
+        # meantime — worth saying out loud rather than half-unpacking over.
+        #
+        # -P '' is not about passwords, it is about not being asked for one: an
+        # encrypted entry makes unzip prompt, and it prompts on the terminal this
+        # program has in raw mode with the panel drawn over it. Handing it an
+        # empty password up front turns a hang nobody can see into exit 82.
+        rc=0
+        unzip -qq -o -P '' "$SRC_PATH" "$esc" -d "$AUDIO_DIR" 2>/dev/null || rc=$?
+        case "$rc" in
+          0|1|2|11|81) ;;
+          50) die "ran out of room unpacking $SRC_LABEL — $(room_str "$(room_free "$AUDIO_DIR")") left in $WORK" ;;
+          51) die "$SRC_LABEL is truncated — it ends partway through $(basename "$entry")" ;;
+          9)  die "$SRC_PATH went away while it was being unpacked" ;;
+          80) die "interrupted while unpacking $SRC_LABEL" ;;
+          82) die "$SRC_LABEL is encrypted — this player cannot open it" ;;
+          *)  die "unzip gave up on $SRC_LABEL at $(basename "$entry") (exit $rc)" ;;
+        esac
         n=$(( n + 1 ))
         load_stage "OPENING · $(( n * 100 / total ))%" "$n" "$total" "$(basename "$entry")"
       done < <(unzip -Z1 "$SRC_PATH" 2>/dev/null || true)
