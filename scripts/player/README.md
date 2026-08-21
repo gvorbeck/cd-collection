@@ -57,7 +57,7 @@ box-drawing characters and needs a UTF-8 locale and a window of at least 25×71.
 | `PLAYER_DEV` | `BURNCD_DEV`, else auto | cdrecord device for CD-Text. One drive, one setting. |
 | `PLAYER_WORK` | `~/.cache/player/work` | Where zips are unpacked. |
 | `PLAYER_MB` | unset | `0` to never ask MusicBrainz about a disc. |
-| `PLAYER_ART` | unset | `0` to never fetch or draw the cover. |
+| `PLAYER_ART` | unset | `0` to never fetch or draw the cover, `blocks` to force half blocks. |
 | `PLAYER_COLLECTION` | the repo's CSV | Catalogue the panel annotates the album from. |
 | `PLAYER_KEEP` | unset | Keep the scratch directory and print where it is. |
 
@@ -157,6 +157,28 @@ the gaps between songs; scale the tail and every band ends up pinned at the top,
 twitching. Falling columns leave a trail that sinks and dims behind them — the
 peak-hold of a hardware analyser, making a fast transient visible for longer than
 the tenth of a second it lasted.
+
+To the right of the panel, when the window is wide enough, is the **cover**. If
+the zip or the folder came with a picture in it, that's the one — it's the
+artwork this copy shipped with, where the archive can only offer a scan of
+whichever release the album *name* matched. `cover`, `folder` and `front` are
+preferred, but any image will do, which is what it takes to find the
+`Artist - Album.jpg` a Bandcamp download leaves you; the back, the booklet and
+the face of the disc are skipped by name, and anything under 200 pixels is
+skipped as a thumbnail.
+
+Failing that it's fetched from the Cover Art Archive in the background and
+cached under `~/.cache/player/art`, so an album played twice costs one download.
+The panel is a fixed 71 columns, so it needs **85 columns** for the smallest
+sleeve it will draw and **105** for a full-size one; under that it simply isn't
+there. Nothing waits for it: no cover, no network, no window — same panel either
+way.
+
+In **iTerm2** it's a real image, at the resolution the screen has. Every other
+terminal gets it drawn out of half blocks (`▀`, two pixels a cell, truecolour or
+the 256-colour cube), which at 32 cells across is a 32×32 picture and looks it —
+recognisable as a sleeve, not as *which* sleeve. `PLAYER_ART=blocks` forces the
+fallback anywhere; `PLAYER_ART=0` turns the whole thing off.
 
 ## Keys
 

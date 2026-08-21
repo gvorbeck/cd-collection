@@ -32,16 +32,20 @@
 # the album meter stays inside the track it started in. Click a row to select it
 # and again to play it, and the wheel walks the list.
 #
-# The cover is drawn beside the panel when the window is wide enough to hold it,
-# fetched from the Cover Art Archive in the background and cached, so an album
-# played twice only ever costs one download. It is never waited for: if there is
-# no cover, or no network, the panel is exactly the panel it would have been.
+# The cover is drawn beside the panel when the window is wide enough to hold it.
+# A picture inside the zip or the folder is the one used, being the artwork this
+# copy came with; failing that it is fetched from the Cover Art Archive in the
+# background and cached, so an album played twice only ever costs one download
+# and one that brought its own costs none. It is never waited for: if there is
+# no cover, or no network, the panel is exactly the panel it would have been. In
+# iTerm2 it is a real picture; elsewhere it is drawn out of half blocks, which is
+# recognisably worse and the best a character grid can do.
 #
 # Env overrides:
 #   PLAYER_DIRS    colon-separated dirs the picker scans (default ~/Music:~/Downloads)
 #   PLAYER_DEV     cdrecord device for CD-Text (default: whichever the drive answers to)
 #   PLAYER_MB      set to 0 to never ask MusicBrainz about a disc
-#   PLAYER_ART     set to 0 to never fetch or draw the cover
+#   PLAYER_ART     set to 0 to never fetch or draw the cover, blocks to force half blocks
 #   PLAYER_WORK    where zips are unpacked (default ~/.cache/player/work)
 #   PLAYER_KEEP    set to keep the scratch directory instead of destroying it
 
@@ -408,8 +412,79 @@ run_check() {
     ck ok "window size" "room for the panel"
   fi
 
+  # Which cover you are getting, and — the question this is really here for —
+  # whether the window is wide enough for one at all. A sleeve that is silently
+  # absent looks exactly like a sleeve that failed to download, and the two have
+  # nothing to do with each other.
+  if [ "$USE_ART" -ne 1 ]; then
+    ck ok cover "off (PLAYER_ART=0)"
+  elif [ "$TERM_COLS" -lt $(( ART_COL0 + ART_MIN - 1 )) ]; then
+    ck warn cover \
+      "window is ${TERM_COLS} cols — need $(( ART_COL0 + ART_MIN - 1 )) for a sleeve, $(( ART_COL0 + ART_MAX - 1 )) for a full-size one"
+  elif [ "$ART_PROTO" = iterm ]; then
+    ck ok cover "iTerm2 inline images, at the resolution the screen has"
+  else
+    ck ok cover "half blocks — a real picture needs iTerm2, outside tmux"
+  fi
+
   check_summary 'Ready to play.' 'Not ready to play.'
 }
+
+# ------------------------------------------------------------ cover renderer --
+
+# Which of the two cover renderers this terminal can take. Up here, ahead of the
+# --check gate rather than down with the rest of the cover machinery, because a
+# health check that cannot say which one you are getting is not much of a health
+# check — "why is mine still blocky" is exactly the question it exists to answer.
+#
+# iTerm2 has an escape that carries a whole file inline and is told how much of
+# the character grid to put it on. That last part is what makes it usable here
+# rather than merely possible: the picture lands in exactly the cells the block
+# renderer would have used, so the panel's arithmetic — where the sleeve starts,
+# how tall it may be, where the analyser goes — does not change at all. Only what
+# is inside those cells does.
+#
+# Not under tmux or screen. Either would have to be talked through rather than
+# talked to, and a terminal escape that is not recognised on the way past is
+# printed as text across the panel.
+art_proto() {
+  command -v base64 >/dev/null || { printf blocks; return 0; }
+  [ -z "${TMUX:-}" ] || { printf blocks; return 0; }
+  case "${TERM:-}" in screen*|tmux*) printf blocks; return 0 ;; esac
+  # LC_TERMINAL first: it is the one iTerm forwards over ssh, so it is still
+  # right on the far end of one, where TERM_PROGRAM is whatever the login shell
+  # there decided.
+  case "${LC_TERMINAL:-}:${TERM_PROGRAM:-}" in *iTerm*) printf iterm; return 0 ;; esac
+  printf blocks
+  return 0
+}
+USE_ART=1
+ART_PROTO=blocks
+case "${PLAYER_ART:-1}" in
+  0)      USE_ART=0 ;;
+  blocks) ;;                    # forced, for looking at the fallback on purpose
+  *)      ART_PROTO=$(art_proto) ;;
+esac
+
+# Where the sleeve goes and how big it is allowed to get. Columns 72 and 73 are
+# the gutter: the panel ends at 71 and a sleeve butted straight against it would
+# read as part of the same object. Row 3 is where the album title is, so the
+# cover starts level with the name of the record.
+#
+# Under ART_MIN cells the sleeve is not worth the columns and is not drawn; over
+# ART_MAX it starts crowding the panel it is meant to sit beside. Both are widths;
+# the height follows from the width, because a cell is twice as tall as it is
+# wide. Up here with the rest of it so the health check can say how wide a window
+# has to be before any of this happens.
+ART_COL0=74; ART_ROW0=3
+ART_MIN=12; ART_MAX=32
+
+# The panel stops owning the whole width the moment there is a sleeve beside it,
+# so its erase has to stop at the gutter — see paint() in lib/panel.sh, and
+# art_out below for the bookkeeping that costs. Left alone when there will never
+# be a cover, because then the erase has nothing to be careful of and the panel
+# repaints exactly as it always did.
+if [ "$USE_ART" -eq 1 ]; then PAINT_COLS=$(( ART_COL0 - 1 )); fi
 
 if [ "$CHECK" -eq 1 ]; then
   run_check || exit 1
@@ -1501,7 +1576,7 @@ EOF
 
 # ---------------------------------------------------------------- the sleeve --
 
-# The cover, drawn beside the panel out of the terminal's own colours.
+# The cover, drawn beside the panel.
 #
 # A record has a front, and a player that never shows it is missing the part of
 # the object you would actually be looking at. There is room for it: the panel is
@@ -1510,24 +1585,33 @@ EOF
 # narrow to hold it, it simply is not drawn, and the panel is exactly the panel it
 # has always been — which is the whole reason the panel's width is fixed.
 #
-# Half blocks, not one character per pixel. ▀ paints its top half in the
-# foreground colour and its bottom half in the background, so a single cell
-# carries two pixels and the picture comes out at twice the vertical resolution
-# the character grid has rows. A cell is also about twice as tall as it is wide,
-# so two pixels per cell is exactly what makes a square cover come out square.
+# Two renderers, one geometry. Both put the sleeve in the same cells; they differ
+# only in what goes in them, and art_proto picks between them once at startup.
 #
-# Truecolour when the terminal says it has it, and the 256-colour cube when it
-# does not — see art_render for why the fallback is not a plain nearest colour.
+# A terminal that can be handed a real image is handed one, because the character
+# grid is a hard ceiling on the other path and it is a low one. Half blocks are
+# the best a grid can do — ▀ paints its top half in the foreground colour and its
+# bottom half in the background, so one cell carries two pixels and the picture
+# comes out at twice the vertical resolution the grid has rows, and a cell being
+# about twice as tall as it is wide is exactly what makes a square cover come out
+# square. That is still only 32x32 across a 32-cell sleeve, however carefully it
+# is quantised: enough to say a record is dark or that it is red, not enough to
+# say which record it is.
+#
+# So the blocks are the fallback rather than the plan. Truecolour when the
+# terminal says it has it and the 256-colour cube when it does not — see
+# art_render_blocks for why that fallback is not a plain nearest colour.
 ART_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/player/art"
-USE_ART="${PLAYER_ART:-1}"
 MB_RELEASE=''
+
+# USE_ART and ART_PROTO are settled much earlier, above the --check gate, because
+# the health check reports which renderer this terminal is getting.
 ART_KEY=''; ART_FILE=''
 ART_STR=''; ART_COLS=0; ART_ROWS=0
-# Column 72 and 73 are the gutter: the panel ends at 71 and a sleeve butted
-# straight against it would read as part of the same object. Row 3 is where the
-# album title is, so the cover starts level with the name of the record.
-ART_COL0=74; ART_ROW0=3
 ART_GEOM=''
+# What is on the screen, as against what has been rendered: ART_STR is the sleeve
+# and ART_OUT is the part of it this frame actually has to say.
+ART_OUT=''; ART_SHOWN=''; ART_SHOWN_H=0
 
 # What this record is called on disk, so an album fetched once is not fetched
 # again. The release ID when a disc gave us one, because that names a pressing
@@ -1615,7 +1699,7 @@ mb_release_search() {
 # under a 200 — and, worse, serving it labelled image/jpeg. Neither the status
 # line nor the content type can be believed, so the only test worth making is
 # whether a decoder can read the bytes, and that is the test.
-art_ok() {  # art_ok <file>
+art_ok() {  # art_ok <file> [min-side]
   local wh
   [ -s "$1" ] || return 1
   wh=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
@@ -1623,7 +1707,10 @@ art_ok() {  # art_ok <file>
   # ffprobe prints "500,500" for a picture and "0,0" for something it opened but
   # could not measure, which is why this cannot just look for a digit.
   case "$wh" in ''|0,0|*,0|0,*|*[!0-9,]*) return 1 ;; esac
-  return 0
+  # The archive only ever sends one size, so the floor is for the pictures found
+  # lying next to the record, where a logo or a thumbnail is as likely as a scan.
+  [ -n "${2:-}" ] || return 0
+  [ "${wh%%,*}" -ge "$2" ] && [ "${wh##*,}" -ge "$2" ]
 }
 
 # A record the archive has no cover for, remembered — but not for ever. Without
@@ -1672,12 +1759,66 @@ art_fetch() {
   return 1
 }
 
+ART_GLOB=( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp'
+           -o -iname '*.gif' -o -iname '*.bmp'  -o -iname '*.tif' -o -iname '*.tiff' )
+
+# The sleeve the record came with, if it came with one.
+#
+# Worth looking for before the network is asked anything, and worth preferring to
+# what comes back: this is the artwork that shipped with this copy, where the
+# archive can only offer a scan of whichever release the album name matched — and
+# the name is the weakest thing there is to match on.
+#
+# What it is called is the whole difficulty. Rips settle on cover or folder or
+# front; Bandcamp names its picture "Artist - Album.jpg", which is no convention
+# at all. So the known names are ranked first and everything else is still
+# allowed after them, shallowest path first. The scans that are definitely not
+# the front — the back, the booklet, the face of the disc — are thrown out
+# rather than ranked last, because drawing one of those confidently beside the
+# panel is worse than the network answer they would have displaced.
+art_local() {
+  local f
+  [ -n "$AUDIO_DIR" ] && [ -d "$AUDIO_DIR" ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    # 200 is well under the 500 the archive sends and well over anything that is
+    # really a thumbnail or a label logo.
+    if art_ok "$f" 200; then printf '%s' "$f"; return 0; fi
+  done < <(
+    find "$AUDIO_DIR" -maxdepth 3 -type f \( "${ART_GLOB[@]}" \) 2>/dev/null |
+      awk -F/ '
+        {
+          base = tolower($NF)
+          sub(/\.[^.]*$/, "", base)
+          # Separators folded to spaces so the words can be matched as words:
+          # "front-cover" is a front cover, and "discovery" is not a disc.
+          gsub(/[_ -]+/, " ", base)
+          if (base ~ /(^| )(back|inlay|booklet|tray|obi|spine|label|matrix|inside|thumb|thumbnail)( |$)/) next
+          if (base ~ /(^| )(disc|cd|dvd)[0-9]*( |$)/) next
+          if (base ~ /^(cover|front|folder|album|albumart|artwork|sleeve)$/) rank = 1
+          else if (base ~ /(^| )(cover|front)( |$)/) rank = 2
+          else if (base ~ /(cover|front)/) rank = 3
+          else rank = 4
+          print rank "\t" NF "\t" $0
+        }' |
+      LC_ALL=C sort -t"$(printf '\t')" -k1,1n -k2,2n -k3,3 |
+      cut -f3-
+  )
+  return 1
+}
+
 # Decide there is a cover to look for, and go and look in the background.
 art_start() {
   ART_STR=''; ART_KEY=''; ART_FILE=''
   [ "$USE_ART" = 1 ] || return 0
   [ "$UTF8" -eq 1 ] || return 0
   command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || return 0
+  # Asked before the tests below rather than after them, because none of them
+  # have anything to do with a picture that is already on the disk: no cover
+  # archive means no curl and no jq, and the album name is only needed to search
+  # for a record whose sleeve is right here. A hit ends it — the file is drawn
+  # where it lies, nothing is fetched and nothing is written to the cache.
+  if ART_FILE=$(art_local); then return 0; fi
   command -v curl >/dev/null && command -v jq >/dev/null || return 0
   [ -n "$ALBUM" ] || return 0
   mkdir -p "$ART_CACHE" 2>/dev/null || return 0
@@ -2595,7 +2736,7 @@ np_draw() {
   # starts, and before the paint that both of them go out in.
   art_tick
   spec_str
-  paint "$frame" "$SPECSTR$ART_STR"
+  paint "$frame" "$SPECSTR$ART_OUT"
   drew=1
   return 0
 }
@@ -2603,11 +2744,11 @@ np_draw() {
 # The cover as one string of cursor moves and half blocks, addressed to the empty
 # column beside the panel.
 #
-# Built as a string and emitted inside the same write as the panel, for the same
-# reason the analyser is: the paint that draws a frame ends every line with an
-# erase-to-end-of-line, which wipes everything to the right of the panel as it
-# goes. A cover printed after that write would be visibly absent for as long as
-# the terminal took to get between the two, once a second, for the whole record.
+# Built as a string rather than printed, and emitted inside the same write as the
+# panel, for the same reason the analyser is: two writes are two pictures the
+# terminal genuinely paints, and the one in between is the wrong one. It is also
+# what lets art_out decide, at the last moment, that this frame does not need to
+# say anything about the cover at all.
 #
 # The 256-colour fallback is not a plain nearest neighbour over the cube. That
 # palette is a coarse 6×6×6 cube with a fine 24-step grey ramp beside it, and a
@@ -2621,7 +2762,7 @@ np_draw() {
 # visible checkerboard noise rather than as smoother colour — because the thing
 # being dithered here is not a pixel but a whole character cell, and at 32 cells
 # across there is nowhere for the error to hide.
-art_render() {  # art_render <cols> <rows>
+art_render_blocks() {  # art_render_blocks <cols> <rows>
   local w=$1 h=$2 tc=0
   case "${COLORTERM:-}" in truecolor|24bit) tc=1 ;; esac
   ART_STR=$(
@@ -2690,6 +2831,72 @@ art_render() {  # art_render <cols> <rows>
   return 0
 }
 
+# The cover as a picture, for a terminal that can take one.
+#
+# The sleeve occupies the same cells either way — width and height are given in
+# cells, not pixels, so this is the block renderer's geometry with a real image
+# in it. preserveAspectRatio is off because those cells were already chosen to be
+# square between them: w is fixed at twice h precisely because a cell is about
+# twice as tall as it is wide, so asking iTerm to fit the picture inside the box
+# as well would letterbox it inside a box that is already the right shape.
+#
+# Scaled to sixteen pixels a cell on the way out, which is roughly what a cell is
+# on a Retina panel at a normal font size, and re-encoded rather than sent as it
+# came: the original 500x500 is more picture than the screen was going to show.
+# Built once per geometry and then left standing — see art_out for why sending it
+# again would be worse than not sending it.
+#
+# The base64 is folded onto one line. macOS does not wrap it and GNU coreutils
+# does, at 76 columns, and a newline inside the escape would end it early and
+# spray the rest of the picture across the panel as text.
+art_render_iterm() {  # art_render_iterm <cols> <rows>
+  local w=$1 h=$2 px b64
+  px=$(( w * 16 ))
+  b64=$(
+    ffmpeg -v error -nostdin -i "$ART_FILE" \
+        -vf "scale=$px:$px:flags=lanczos" -q:v 4 -f mjpeg - 2>/dev/null \
+      | base64 | tr -d '\n'
+  ) || { ART_STR=''; return 1; }
+  # Not merely non-empty. ffmpeg cut off part way through still exits 0 and still
+  # writes the JPEG header, and half a picture is worse beside the panel than
+  # none — the same judgement the block renderer makes on a short read, which is
+  # why that one counts its pixels rather than testing that any arrived.
+  [ "${#b64}" -gt 1024 ] || { ART_STR=''; return 1; }
+  printf -v ART_STR \
+    '\033[%d;%dH\033]1337;File=inline=1;width=%d;height=%d;preserveAspectRatio=0:%s\a' \
+    "$ART_ROW0" "$ART_COL0" "$w" "$h" "$b64"
+  return 0
+}
+
+art_render() {  # art_render <cols> <rows>
+  if [ "$ART_PROTO" = iterm ]; then art_render_iterm "$1" "$2"; return; fi
+  art_render_blocks "$1" "$2"
+}
+
+# What this frame actually has to say about the cover, which is usually nothing.
+#
+# The sleeve stands between frames now that the panel's erase stops at the gutter,
+# so sending it again is sending a picture the screen already has. That is free
+# for the blocks and it is not free for an image: the terminal cannot put a
+# decoded JPEG back in the same instant it took the old one away, and a gap of one
+# decode, once a second, for the length of a record, is a flicker. So it goes over
+# when it changes and not otherwise.
+#
+# What the bounded erase costs is this: the cells to the right of the panel are
+# now nobody's but the sleeve's, and a sleeve that shrank or went away has to
+# clear the ones it is giving up, because nothing else is ever going to.
+art_out() {  # art_out <cols> <rows>
+  local r
+  ART_OUT=''
+  [ "$1.$2" = "$ART_SHOWN" ] && return 0
+  for (( r = ART_ROW0; r < ART_ROW0 + ART_SHOWN_H; r++ )); do
+    printf -v ART_OUT '%s\033[%d;%dH\033[K' "$ART_OUT" "$r" "$ART_COL0"
+  done
+  ART_OUT=$ART_OUT$ART_STR
+  ART_SHOWN="$1.$2"; ART_SHOWN_H=$2
+  return 0
+}
+
 # Whether there is a cover to draw yet, how big it can be, and — the once it
 # matters — drawing it.
 #
@@ -2702,38 +2909,42 @@ art_render() {  # art_render <cols> <rows>
 # never binds, but on a short one the analyser's rows would otherwise sit under
 # the bottom of the sleeve — and the analyser repaints its own rows nineteen times
 # a second with an erase-to-end-of-line on each, which would strobe a hole through
-# the picture. Keeping the sleeve above it means the only thing that ever erases
-# the cover is the full rebuild that redraws it in the same write.
+# the picture. Keeping the sleeve above it means nothing erases the cover except
+# the cover itself, in art_out, when it is giving those rows up.
 art_tick() {
   local w h avail cap g
+  ART_OUT=''
   [ -n "$ART_FILE" ] || return 0
   [ "$spec_row" -gt 0 ] || return 0
   term_size
   avail=$(( TERM_COLS - ART_COL0 + 1 ))
   w=$avail
-  [ "$w" -gt 32 ] && w=32
+  [ "$w" -gt "$ART_MAX" ] && w=$ART_MAX
   # Two pixel rows to a cell and a cell twice as tall as it is wide, so a square
   # cover is twice as many columns as rows.
   h=$(( w / 2 ))
   cap=$(( spec_row - ART_ROW0 ))
   [ "$h" -gt "$cap" ] && h=$cap
   w=$(( h * 2 ))
-  if [ "$w" -lt 12 ] || [ "$w" -gt "$avail" ]; then
+  if [ "$w" -lt "$ART_MIN" ] || [ "$w" -gt "$avail" ]; then
     ART_STR=''; ART_COLS=0; ART_ROWS=0; ART_GEOM=''
+    art_out 0 0
     return 0
   fi
   g="$w.$h"
   # A window that changed shape needs the picture resampled, not merely moved.
   [ "$g" != "$ART_GEOM" ] && { ART_GEOM=$g; ART_STR=''; }
-  [ -n "$ART_STR" ] && return 0
+  [ -n "$ART_STR" ] && { art_out "$w" "$h"; return 0; }
   [ -s "$ART_FILE" ] || return 0
   if art_render "$w" "$h"; then
     ART_COLS=$w; ART_ROWS=$h
+    art_out "$w" "$h"
   else
     # A cache entry that will not decode is one that will not decode next second
     # either, so stop asking. It is cleared rather than deleted: another player
     # may be part way through writing it.
     ART_COLS=0; ART_ROWS=0; ART_FILE=''
+    art_out 0 0
   fi
   return 0
 }

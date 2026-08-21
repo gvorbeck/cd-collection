@@ -212,12 +212,35 @@ screen_off() {
 # The frame must be at most one line shorter than the window. \033[H is absolute,
 # so a frame that scrolls the terminal loses its own top row permanently — the
 # next frame homes to a row that now holds something else.
+#
+# PAINT_COLS is for a caller that draws something beside the panel and needs it to
+# survive: set to the number of columns the frame owns, the per-line erase becomes
+# an erase of exactly those columns and everything to the right of them is left
+# alone. The player puts the cover there, and a cover that has to be re-decoded
+# every time it is erased is the one thing on the screen that cannot be redrawn
+# inside a single frame — which is the whole reason this knob exists. Zero keeps
+# the erase-to-end-of-line above, which is what a panel with nothing beside it
+# wants: it needs no bookkeeping about what used to be out there.
+PAINT_COLS=0
+
 paint() {  # paint <frame> [overlay]
-  local nl=$'\n' eol=$'\033[K\n'
+  local nl=$'\n' eol=$'\033[K\n' pre
   # The overlay is written in the same printf as the frame rather than after it,
   # so a rebuilt panel reaches the terminal as one write and there is no instant
   # where the screen holds the frame without it. It comes through %b because it
   # is escape sequences written as text, where the frame arrives already escaped.
+  if [ "$PAINT_COLS" -gt 0 ]; then
+    # ECH erases a fixed count of cells from the cursor without moving it, so it
+    # can bound what the erase touches where \033[K cannot. It has to go before
+    # the line rather than after it: after, the cursor sits at the end of the
+    # content, and working out how far along the row that is means knowing the
+    # visible width of a string that is mostly colour escapes. Before, the cursor
+    # is at column one, the count is a constant, and the content is written over
+    # the cells it just cleared.
+    printf -v pre '\033[%dX' "$PAINT_COLS"
+    printf '\033[H%s%s\033[K\n\033[J%b' "$pre" "${1//$nl/$nl$pre}" "${2:-}"
+    return 0
+  fi
   printf '\033[H%s\033[K\n\033[J%b' "${1//$nl/$eol}" "${2:-}"
   return 0
 }
