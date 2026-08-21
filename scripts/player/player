@@ -1971,24 +1971,23 @@ np_columns() {
 }
 
 np_frame() {
-  local k i row body meta mark lbl art artc want lo hi
+  local k i row body meta mark lbl art want lo hi
   local last=$(( np_top + np_rows ))
 
   printf -v meta '%s · %d TRACKS%s' "$mode_label" "${#ORDER[@]}" "$meta_tail"
   faceplate "$meta"
   printf '\n'
   printf '    %b%-8s%b %s\n' "$ETCH" ALBUM  "$OFF" "${ALBUM:-—}"
-  printf '    %b%-8s%b %b%s%b\n' "$ETCH" ARTIST "$OFF" "$DIM" "${ALBUM_ARTIST:-—}" "$OFF"
+  printf '    %b%-8s%b %s\n' "$ETCH" ARTIST "$OFF" "${ALBUM_ARTIST:-—}"
   # Not the metadata source as well: the faceplate says where the titles came
   # from, and saying it twice on one screen reads like two different facts.
-  printf '    %b%-8s%b %b%s%b\n' "$ETCH" SOURCE "$OFF" "$DIM" \
-    "$(fit "$SRC_LABEL" 52)" "$OFF"
+  printf '    %b%-8s%b %s\n' "$ETCH" SOURCE "$OFF" "$(fit "$SRC_LABEL" 52)"
   # What the shelf says, when this record is on it. The note is in amber and the
-  # rest is dim, because the note is the half you wrote down yourself and the
+  # rest is plain, because the note is the half you wrote down yourself and the
   # only line here you cannot get from any other player.
   if [ "$COLL_HIT" -eq 1 ]; then
-    [ -n "$COLL_SHELF" ] && printf '    %b%-8s%b %b%s%b\n' "$ETCH" SHELF "$OFF" \
-      "$DIM" "$(fit "$COLL_SHELF" 52)" "$OFF"
+    [ -n "$COLL_SHELF" ] && printf '    %b%-8s%b %s\n' "$ETCH" SHELF "$OFF" \
+      "$(fit "$COLL_SHELF" 52)"
     [ -n "$COLL_NOTES" ] && printf '    %b%-8s%b %b%s%b\n' "$ETCH" NOTE "$OFF" \
       "$AMBER" "$(fit "$COLL_NOTES" 52)" "$OFF"
   fi
@@ -2011,14 +2010,12 @@ np_frame() {
     fitv "${TITLES[$i]}" "$NP_TITLE_W"; lbl=$FIT
     # The artist field carries its own leading gap, so that a record with no
     # artist column leaves no gap where one would have been — the title simply
-    # runs on to where the artist used to start. Twice over because the cursor
-    # row is drawn inside one reverse-video run and cannot have colours in it.
+    # runs on to where the artist used to start.
     if [ "$NP_ARTIST_W" -gt 0 ]; then
       fitv "${ARTISTS[$i]}" "$NP_ARTIST_W" right
       art="  $FIT"
-      printf -v artc '  %b%s%b' "$DIM" "$FIT" "$OFF"
     else
-      art=''; artc=''
+      art=''
     fi
     mmssv "${DURS[$i]}"
     if [ "$k" -eq "$np_cur" ]; then
@@ -2027,7 +2024,7 @@ np_frame() {
     else
       printf '    %b%s%b %b%s%b  %s%s  %b%5s%b\n' \
         "$AMBER" "$mark" "$OFF" "$ETCH" "$row" "$OFF" "$lbl" \
-        "$artc" "$ETCH" "$MMSS" "$OFF"
+        "$art" "$ETCH" "$MMSS" "$OFF"
     fi
     k=$(( k + 1 ))
   done
@@ -2043,8 +2040,8 @@ np_frame() {
   printf -v body 'TRACK %02d OF %02d' $(( cur_track + 1 )) "${#ORDER[@]}"
   printf -v want '%s / %s' "$lo" "$hi"
   pad $(( PANEL - ${#body} - ${#want} ))
-  printf '  %b%s%b%s%b%s%b %b/ %s%b\n' \
-    "$ETCH" "$body" "$OFF" "$PAD" "$AMBER" "$lo" "$OFF" "$DIM" "$hi" "$OFF"
+  printf '  %b%s%b%s%b%s%b / %s\n' \
+    "$ETCH" "$body" "$OFF" "$PAD" "$AMBER" "$lo" "$OFF" "$hi"
   trackbar "$pos" "$tdur"
   printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$TRACKBAR" "$ETCH" "$OFF"
 
@@ -2056,8 +2053,8 @@ np_frame() {
   body=ALBUM
   printf -v want '%s / %s' "$lo" "$hi"
   pad $(( PANEL - ${#body} - ${#want} ))
-  printf '  %b%s%b%s%b%s%b %b/ %s%b\n' \
-    "$ETCH" "$body" "$OFF" "$PAD" "$AMBER" "$lo" "$OFF" "$DIM" "$hi" "$OFF"
+  printf '  %b%s%b%s%b%s%b / %s\n' \
+    "$ETCH" "$body" "$OFF" "$PAD" "$AMBER" "$lo" "$OFF" "$hi"
   bandbar "$ahead"
   printf '  %b▐%b%b%b▌%b\n' "$ETCH" "$OFF" "$BANDBAR" "$ETCH" "$OFF"
 
