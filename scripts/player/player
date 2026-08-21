@@ -33,13 +33,14 @@
 # and again to play it, and the wheel walks the list.
 #
 # The cover is drawn beside the panel when the window is wide enough to hold it.
-# A picture inside the zip or the folder is the one used, being the artwork this
-# copy came with; failing that it is fetched from the Cover Art Archive in the
-# background and cached, so an album played twice only ever costs one download
-# and one that brought its own costs none. It is never waited for: if there is
-# no cover, or no network, the panel is exactly the panel it would have been. In
-# iTerm2 it is a real picture; elsewhere it is drawn out of half blocks, which is
-# recognisably worse and the best a character grid can do.
+# A picture inside the zip or the folder is the one used, or failing that the one
+# in the tags, both being the artwork this copy came with; failing both it is
+# fetched from the Cover Art Archive in the background and cached, so an album
+# played twice only ever costs one download and one that brought its own artwork
+# costs none. It is never waited for: if there is no cover, or no network, the
+# panel is exactly the panel it would have been. In iTerm2 it is a real picture;
+# elsewhere it is drawn out of half blocks, which is recognisably worse and the
+# best a character grid can do.
 #
 # Env overrides:
 #   PLAYER_DIRS    colon-separated dirs the picker scans (default ~/Music:~/Downloads)
@@ -476,8 +477,15 @@ esac
 # the height follows from the width, because a cell is twice as tall as it is
 # wide. Up here with the rest of it so the health check can say how wide a window
 # has to be before any of this happens.
+#
+# ART_MAX was 32 while every cover was a 500-pixel download and the ceiling was
+# how much picture there was to show. Records now mostly bring their own artwork,
+# which is commonly three times that, so the ceiling is back to being about the
+# window — and 42 is where the sleeve stops looking like it is beside the panel
+# and starts looking like the panel is beside it. Even, because the height is
+# half of it.
 ART_COL0=74; ART_ROW0=3
-ART_MIN=12; ART_MAX=32
+ART_MIN=12; ART_MAX=42
 
 # The panel stops owning the whole width the moment there is a sleeve beside it,
 # so its erase has to stop at the gutter — see paint() in lib/panel.sh, and
@@ -1594,9 +1602,11 @@ EOF
 # bottom half in the background, so one cell carries two pixels and the picture
 # comes out at twice the vertical resolution the grid has rows, and a cell being
 # about twice as tall as it is wide is exactly what makes a square cover come out
-# square. That is still only 32x32 across a 32-cell sleeve, however carefully it
-# is quantised: enough to say a record is dark or that it is red, not enough to
-# say which record it is.
+# square. That is still only 42x42 across the widest sleeve there is, however
+# carefully it is quantised: enough to say a record is dark or that it is red,
+# not enough to say which record it is. Widening it does not help either, because
+# the ceiling moves with the sleeve — the picture is always as many pixels as the
+# grid has cells.
 #
 # So the blocks are the fallback rather than the plan. Truecolour when the
 # terminal says it has it and the 256-colour cube when it does not — see
@@ -1807,18 +1817,59 @@ art_local() {
   return 1
 }
 
+# The picture inside the tags, when there is no picture beside the record.
+#
+# An APIC frame in an MP3, a PICTURE block in a FLAC, a covr atom in an M4A: to
+# ffmpeg all three are one video stream of one frame, marked attached_pic. So the
+# mapping asks for every video stream less the ones that are really video —
+# without that second half, a music video sitting in the folder would have its
+# opening frame pulled out and hung beside the panel as a sleeve.
+#
+# Copied rather than re-encoded, which keeps whatever was in there at whatever
+# size it was and costs one fork. Only the first few tracks are asked: a record
+# that tags its artwork tags it on track one, and this runs before the panel's
+# first frame, where a fork per track on a long album would be felt.
+art_embedded() {
+  local i out
+  [ -n "$WORK" ] || return 1
+  [ "${#FILES[@]}" -gt 0 ] || return 1
+  out="$WORK/embedded"
+  for i in 0 1 2; do
+    [ "$i" -lt "${#FILES[@]}" ] || break
+    rm -f "$out"
+    # No extension on the file and none wanted. What comes out is whatever the
+    # tag held, usually JPEG and sometimes PNG, and everything downstream of here
+    # hands it to ffmpeg, which reads the bytes rather than the name.
+    ffmpeg -v error -nostdin -y -i "${FILES[$i]}" -map 0:v -map -0:V \
+      -c copy -frames:v 1 -f image2 "$out" >/dev/null 2>&1 || continue
+    if art_ok "$out" 200; then printf '%s' "$out"; return 0; fi
+  done
+  rm -f "$out"
+  return 1
+}
+
 # Decide there is a cover to look for, and go and look in the background.
 art_start() {
   ART_STR=''; ART_KEY=''; ART_FILE=''
   [ "$USE_ART" = 1 ] || return 0
   [ "$UTF8" -eq 1 ] || return 0
   command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || return 0
-  # Asked before the tests below rather than after them, because none of them
-  # have anything to do with a picture that is already on the disk: no cover
-  # archive means no curl and no jq, and the album name is only needed to search
-  # for a record whose sleeve is right here. A hit ends it — the file is drawn
-  # where it lies, nothing is fetched and nothing is written to the cache.
+  # Both asked before the tests below rather than after them, because none of
+  # those have anything to do with a picture that is already on the disk: no
+  # cover archive means no curl and no jq, and the album name is only wanted for
+  # searching out a record whose sleeve is right here. Either hit ends it — the
+  # picture is drawn where it lies, nothing is fetched, nothing is cached.
+  #
+  # A file beside the record before a picture in its tags, because a folder that
+  # has both usually has the scan in the file and the thumbnail in the tag. When
+  # it is the other way round the size floor in art_ok catches it: the small one
+  # is refused and the next candidate down is tried.
   if ART_FILE=$(art_local); then return 0; fi
+  # Here rather than inside art_embedded, which is run in a command substitution:
+  # scratch() reports the directory it made by setting $WORK, and a $WORK set in
+  # a subshell is a scratch directory nothing afterwards knows to clean up.
+  scratch
+  if ART_FILE=$(art_embedded); then return 0; fi
   command -v curl >/dev/null && command -v jq >/dev/null || return 0
   [ -n "$ALBUM" ] || return 0
   mkdir -p "$ART_CACHE" 2>/dev/null || return 0
@@ -2760,8 +2811,8 @@ np_draw() {
 #
 # No dithering. It was tried, at three amplitudes, and every one of them read as
 # visible checkerboard noise rather than as smoother colour — because the thing
-# being dithered here is not a pixel but a whole character cell, and at 32 cells
-# across there is nowhere for the error to hide.
+# being dithered here is not a pixel but a whole character cell, and at forty-odd
+# cells across there is nowhere for the error to hide.
 art_render_blocks() {  # art_render_blocks <cols> <rows>
   local w=$1 h=$2 tc=0
   case "${COLORTERM:-}" in truecolor|24bit) tc=1 ;; esac
@@ -2842,26 +2893,41 @@ art_render_blocks() {  # art_render_blocks <cols> <rows>
 #
 # Scaled to sixteen pixels a cell on the way out, which is roughly what a cell is
 # on a Retina panel at a normal font size, and re-encoded rather than sent as it
-# came: the original 500x500 is more picture than the screen was going to show.
-# Built once per geometry and then left standing — see art_out for why sending it
-# again would be worse than not sending it.
+# came: a sleeve out of a FLAC is often 1400 square, which is a great deal more
+# picture than the screen was going to show. Built once per geometry and then
+# left standing — see art_out for why sending it again would be worse than not
+# sending it.
+#
+# Never past what the source has, though. At the full 42 cells the cell size
+# asked for is larger than a cover-archive download, and upscaling here only
+# means iTerm is handed a soft picture instead of a small one and rescales it
+# again on top. min() leaves anything smaller than the box alone and lets iTerm
+# do the one resample.
 #
 # The base64 is folded onto one line. macOS does not wrap it and GNU coreutils
 # does, at 76 columns, and a newline inside the escape would end it early and
 # spray the rest of the picture across the panel as text.
 art_render_iterm() {  # art_render_iterm <cols> <rows>
-  local w=$1 h=$2 px b64
+  local w=$1 h=$2 px b64 eoi
   px=$(( w * 16 ))
   b64=$(
     ffmpeg -v error -nostdin -i "$ART_FILE" \
-        -vf "scale=$px:$px:flags=lanczos" -q:v 4 -f mjpeg - 2>/dev/null \
+        -vf "scale='min($px,iw)':'min($px,ih)':flags=lanczos" -q:v 4 -f mjpeg - 2>/dev/null \
       | base64 | tr -d '\n'
   ) || { ART_STR=''; return 1; }
-  # Not merely non-empty. ffmpeg cut off part way through still exits 0 and still
-  # writes the JPEG header, and half a picture is worse beside the panel than
-  # none — the same judgement the block renderer makes on a short read, which is
-  # why that one counts its pixels rather than testing that any arrived.
-  [ "${#b64}" -gt 1024 ] || { ART_STR=''; return 1; }
+  # Not merely non-empty: ffmpeg cut off part way through still writes the JPEG
+  # header, and half a picture is worse beside the panel than none — the same
+  # judgement the block renderer makes on a short read, which is why that one
+  # counts its pixels rather than testing that any arrived.
+  #
+  # Asked as a question about the end of the file rather than about its size. A
+  # sleeve that is mostly one flat colour encodes to a few hundred bytes whole,
+  # which is smaller than plenty of truncated ones, so no threshold can separate
+  # the two — but a JPEG that finished ends with its end-of-image marker and a
+  # JPEG that was cut off ends wherever the pipe closed.
+  eoi=$(printf '%s' "$b64" | base64 -d 2>/dev/null | tail -c 2 \
+        | od -An -tx1 | tr -d ' \n' || true)
+  [ "$eoi" = ffd9 ] || { ART_STR=''; return 1; }
   printf -v ART_STR \
     '\033[%d;%dH\033]1337;File=inline=1;width=%d;height=%d;preserveAspectRatio=0:%s\a' \
     "$ART_ROW0" "$ART_COL0" "$w" "$h" "$b64"

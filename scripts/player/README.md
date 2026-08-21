@@ -167,18 +167,25 @@ preferred, but any image will do, which is what it takes to find the
 the face of the disc are skipped by name, and anything under 200 pixels is
 skipped as a thumbnail.
 
-Failing that it's fetched from the Cover Art Archive in the background and
+Failing that it comes out of the tags — an APIC frame in an MP3, a PICTURE block
+in a FLAC, a `covr` atom in an M4A — copied out at whatever size it was stored,
+from the first of the opening three tracks that carries one. A music video in
+the folder won't have its first frame mistaken for a sleeve.
+
+Failing *that* it's fetched from the Cover Art Archive in the background and
 cached under `~/.cache/player/art`, so an album played twice costs one download.
 The panel is a fixed 71 columns, so it needs **85 columns** for the smallest
-sleeve it will draw and **105** for a full-size one; under that it simply isn't
-there. Nothing waits for it: no cover, no network, no window — same panel either
-way.
+sleeve it will draw and **115** for a full-size one, plus the rows to hang it in
+— the sleeve stops where the analyser starts, so a short window gets a smaller
+one. Under 85 it simply isn't there. Nothing waits for it: no cover, no network,
+no window — same panel either way.
 
-In **iTerm2** it's a real image, at the resolution the screen has. Every other
-terminal gets it drawn out of half blocks (`▀`, two pixels a cell, truecolour or
-the 256-colour cube), which at 32 cells across is a 32×32 picture and looks it —
-recognisable as a sleeve, not as *which* sleeve. `PLAYER_ART=blocks` forces the
-fallback anywhere; `PLAYER_ART=0` turns the whole thing off.
+In **iTerm2** it's a real image, at the resolution the screen has, and never
+scaled up past whatever the source actually had. Every other terminal gets it
+drawn out of half blocks (`▀`, two pixels a cell, truecolour or the 256-colour
+cube), which even at full size is a 42×42 picture and looks it — recognisable as
+a sleeve, not as *which* sleeve. `PLAYER_ART=blocks` forces the fallback
+anywhere; `PLAYER_ART=0` turns the whole thing off.
 
 ## Keys
 

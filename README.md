@@ -135,10 +135,12 @@ See also [`data/`](data/README.md) and [`vendor/`](vendor/README.md).
 
 ## Also in this repo
 
-Three CLI tools, none part of the site — the rest of the hobby, in order:
+Four tools, none part of the site — the rest of the hobby, in order:
 
 - **[bandcamp-wishlist](scripts/bandcamp-wishlist/README.md)** — bookmarklet
   that prices a Bandcamp wishlist, cheapest first.
+- **[bandcamp-artist](scripts/bandcamp-artist/README.md)** — the same, pointed
+  at an artist or label page: a whole discography, cheapest first.
 - **[burncd](scripts/burncd/README.md)** — `burncd ~/Music/Album` burns a folder
   to CD-R. Gapless, CD-Text, track order from tags.
 - **[player](scripts/player/README.md)** — `player album.zip` plays a zip,
