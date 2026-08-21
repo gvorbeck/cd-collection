@@ -213,6 +213,13 @@ folder with audio under `PLAYER_DIRS`, plus the disc. `r` rescans.
 **`mpv not found`** — `brew install mpv`. It's the engine; there's no fallback.
 **`ffprobe not found`** — `brew install ffmpeg`.
 
+**A track in a zip is missing, and `--check` warns on the `zips` line.** Zips are
+opened with `bsdtar`, which is `/usr/bin/tar` on any Mac. Where there isn't one,
+it falls back to `unzip` — and Apple's `unzip` mangles a filename that arrived
+decomposed (an `o` plus a combining circumflex, which is how a Mac writes
+`Hôtel`) into bytes the filesystem rejects, so that entry doesn't unpack. The
+album still opens, one track short. Getting a real `tar` back on `PATH` fixes it.
+
 **`cannot find lib/panel.sh`** — player was copied out of the repo rather than
 symlinked into it. Put it back and symlink it, or take `scripts/lib` along.
 

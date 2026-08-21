@@ -253,6 +253,35 @@ scratch() {
 SPEC_OK=0
 command -v ffmpeg >/dev/null && SPEC_OK=1
 
+# What opens a zip. bsdtar for preference, and /usr/bin/tar on a Mac is bsdtar:
+# it takes a zip's names as the bytes the zip stores them in, which is the whole
+# of the problem. Apple's unzip does not. It puts a UTF-8 name through a
+# conversion to the local charset first, and a name that arrived decomposed — an
+# o followed by a combining circumflex, which is how a Mac writes Hôtel — comes
+# out the far side as two bytes no filesystem will take. unzip then reports that
+# as exit 50, the same code it uses for a full disk, so an album stops with a
+# message about room on a volume with a hundred gigabytes free. tar has none of
+# this, and needs neither a pattern per entry nor a second read of the archive to
+# say where it has got to. unzip stays as the fallback for a machine that somehow
+# has no tar, with its 50 no longer taken at its word.
+#
+# The passphrase is not a passphrase, it is a refusal to be asked for one. An
+# encrypted zip makes bsdtar prompt, and it prompts on the terminal this program
+# has in raw mode with the panel drawn over it — over and over, since there is
+# nobody there to answer. Handing it one it will certainly not accept turns that
+# into a single line saying so. Two words with no spaces in them, so left
+# unquoted where it is used; libarchives too old to know the option say so, and
+# are left to fail the longer way.
+UNPACK=''
+TAR_ARGS=''
+if tar --version 2>/dev/null | qgrep bsdtar; then
+  UNPACK=tar
+  tar --passphrase x -tf /dev/null 2>&1 | qgrep 'not supported' \
+    || TAR_ARGS='--passphrase player-does-not-open-encrypted-zips'
+elif command -v unzip >/dev/null; then
+  UNPACK=unzip
+fi
+
 cleanup() {
   local rc=$?
   local p pid
@@ -345,9 +374,14 @@ run_check() {
     ck warn analyser "no ffmpeg — the columns fall back to a pattern"
   fi
 
-  command -v unzip >/dev/null \
-    && ck ok unzip "$(unzip -v 2>/dev/null | head -1 | cut -c1-40)" \
-    || ck fail unzip "not found — zips cannot be opened"
+  # Which of the two is opening zips, because it decides whether an album whose
+  # track names are not plain ASCII arrives whole.
+  case "$UNPACK" in
+    tar)   ck ok "zips" "$(tar --version 2>/dev/null | head -1 | cut -c1-40)" ;;
+    unzip) ck warn "zips" \
+             "$(unzip -v 2>/dev/null | head -1 | cut -c1-28) — no bsdtar, so accented track names may not unpack" ;;
+    *)     ck fail "zips" "no tar and no unzip — zips cannot be opened" ;;
+  esac
 
   if command -v nc >/dev/null && nc -h 2>&1 | qgrep -- '-U'; then
     ck ok "unix sockets" "nc -U present — mpv can be driven"
@@ -1144,12 +1178,9 @@ load_stage() {  # load_stage <title> <done> <total> <line>
 
 # Open whatever was picked and leave a directory of playable files in $AUDIO_DIR.
 #
-# A zip is unpacked entry by entry rather than in one unzip run, which costs a
-# fork per file and buys the only progress report there is: the central directory
-# is read once per entry, and on an album that is a dozen reads of a few hundred
-# bytes. Everything in the zip is taken, not just the audio — the cover art is
-# worth having on the panel, and a zip of an album is not big enough to be worth
-# being clever about.
+# Everything in the zip is taken, not just the audio — the cover art is worth
+# having on the panel, and a zip of an album is not big enough to be worth being
+# clever about.
 AUDIO_DIR=''
 SRC_KIND=''; SRC_PATH=''; SRC_LABEL=''; SRC_DETAIL=''
 
@@ -1172,8 +1203,167 @@ room_free() {  # room_free <dir>
   case "$kb" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' $(( kb * 1024 )) ;; esac
 }
 
+# How many things are in the zip, and what they come to unpacked. Asked of
+# whichever unpacker is in hand, because on a machine with no unzip the two
+# questions still have to have answers — the count is what the progress line
+# counts towards, and the size is what decides whether to start at all.
+zip_count() {  # zip_count <zip>
+  case "$UNPACK" in
+    tar) (tar -tf "$1" 2>/dev/null || true) | grep -vc '/$' || true ;;
+    *)   (unzip -Z1 "$1" 2>/dev/null || true) | grep -vc '/$' || true ;;
+  esac
+}
+
+zip_bytes() {  # zip_bytes <zip>
+  local n
+  case "$UNPACK" in
+    tar) n=$(tar -tvf "$1" 2>/dev/null | awk '{ s += $5 } END { printf "%d", s }') ;;
+    *)   n=$(unzip -Zt "$1" 2>/dev/null | awk '/bytes uncompressed/ { print $3; exit }') ;;
+  esac
+  case "$n" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$n" ;; esac
+}
+
+# Why it stopped, in the words of whoever stopped it. Room is asked about first,
+# because it is the one cause a person can do something about — and asked of the
+# disk, not inferred from an exit code. That inference is exactly what once put
+# "ran out of room" on a screen with a hundred gigabytes free.
+unpack_die() {  # unpack_die <message> <exit code>
+  local msg=$1 rc=$2 free
+  free=$(room_free "$AUDIO_DIR")
+  case "$msg" in
+    *'No space left'*|*'disk full'*)
+      die "ran out of room unpacking $SRC_LABEL — $(room_str "$free") left in $WORK" ;;
+  esac
+  if [ "$free" -lt 33554432 ]; then
+    die "ran out of room unpacking $SRC_LABEL — $(room_str "$free") left in $WORK"
+  fi
+  case "$msg" in
+    *passphrase*|*'(encrypted'*|*'Encrypted file is unsupported'*)
+      die "$SRC_LABEL is encrypted — this player cannot open it" ;;
+    *'Truncated ZIP'*|*'Truncated input'*)
+      die "$SRC_LABEL is truncated — it stops partway through" ;;
+    *'Unrecognized archive format'*|*'Damaged ZIP'*|*'Invalid central directory'*)
+      die "$SRC_LABEL is not a zip this can read" ;;
+    '') die "$UNPACK gave up on $SRC_LABEL (exit $rc)" ;;
+    *)  die "cannot open $SRC_LABEL — ${msg#tar: }" ;;
+  esac
+}
+
+# One pass over the zip, and the progress comes out of it: -v names each entry
+# on stderr as it finishes writing it, which is the same list the count was
+# taken from and costs nothing extra to read. No name is ever handed back to a
+# matcher, which is the point — that round trip is where a decomposed "ô" used
+# to be lost. tar's own complaints come down the same stream, and its exit code
+# comes down it too, because a process substitution has nowhere else to put one.
+#
+# stdin goes to /dev/null because this program's stdin is a terminal in raw mode
+# with the panel drawn over it, and nothing tar might read from it is a key the
+# player should have lost.
+UNPACK_RC='tar-exit:'
+unpack_tar() {  # unpack_tar <total>
+  local total=$1 line name n=0 err='' bad='' rc=0 shown
+  while IFS= read -r line; do
+    case "$line" in "$UNPACK_RC"*) rc=${line#"$UNPACK_RC"}; continue ;; esac
+
+    # What is wrong with the archive itself, looked for by its words wherever it
+    # appears. tar reports a failed entry on the same "x name" line it reports a
+    # good one on, and signs off with "Error exit delayed from previous errors",
+    # which says nothing at all — so the shape of the line cannot be trusted to
+    # sort them and the wording has to. Whole phrases, because half of one is a
+    # track title: "Damaged" on its own would refuse to open Gang of Four.
+    case "$line" in
+      *'No space left on device'*|*'Truncated ZIP'*|*'Truncated input'* \
+      |*'Incorrect passphrase'*|*'Enter passphrase'*|*'Passphrase required'* \
+      |*'Encrypted file is unsupported'*|*'(encrypted'* \
+      |*'Unrecognized archive format'*|*'Damaged ZIP'*|*'Invalid central directory'*)
+        [ -n "$bad" ] || bad=$line ;;
+    esac
+
+    case "$line" in
+      'x '*)
+        name=${line#x }
+        case "$name" in */) continue ;; esac
+        n=$(( n + 1 ))
+        # An error line wears the same "x " as a good one, so the count can run
+        # past the total. The meter is not allowed to.
+        shown=$(( n > total ? total : n ))
+        load_stage "OPENING · $(( shown * 100 / total ))%" "$shown" "$total" "$(basename "$name")"
+        ;;
+      'tar: Error exit delayed'*) ;;
+      ?*) err=$line ;;
+    esac
+  done < <( tar $TAR_ARGS -xvf "$SRC_PATH" -C "$AUDIO_DIR" </dev/null 2>&1 >/dev/null \
+              || printf '%s%s\n' "$UNPACK_RC" "$?" )
+
+  # tar says 1 when it could not extract everything and 2 when it could not go
+  # on, and that difference is not the one that matters: a zip that is truncated
+  # or encrypted also comes back 1, having written whatever it managed first. So
+  # the message decides. One entry refused on its own account is a resource fork
+  # or a booklet scan and the record still plays; something wrong with the
+  # archive, or an archive that yielded nothing, is the end of the album.
+  if [ -n "$bad" ]; then unpack_die "$bad" "$rc"; fi
+  if [ "$rc" -ge 2 ] || { [ "$rc" -ne 0 ] && [ "$n" -eq 0 ]; }; then
+    unpack_die "$err" "$rc"
+  fi
+  [ "$n" -gt 0 ] || die "nothing came out of $SRC_LABEL"
+  return 0
+}
+
+# The fallback, for a machine with no bsdtar on it. Entry by entry, which costs
+# a fork per file and a re-read of the central directory each time, and is the
+# only way unzip will say where it has got to.
+unpack_unzip() {  # unpack_unzip <total>
+  local total=$1 entry esc n=0 rc=0
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$entry" in */) continue ;; esac
+    # unzip reads the name it is handed as a pattern, not as a filename, so the
+    # brackets in "Track [Live].mp3" are a character class that matches one of
+    # L, i, v, e — and the track is silently not there afterwards. Escaping the
+    # three metacharacters is what makes it a literal name.
+    esc=${entry//\\/\\\\}
+    esc=${esc//\[/\\[}; esc=${esc//\*/\\*}; esc=${esc//\?/\\?}
+    # -o overwrites without asking, -qq says nothing, and a failure on one entry
+    # is not a reason to abandon an album — a zip with one corrupt booklet scan
+    # in it still has twelve good tracks.
+    #
+    # But not every failure is about the entry. A disk that fills partway
+    # through fails every entry after it, identically and silently, and what
+    # comes out the far end is an album missing its second half that plays until
+    # it doesn't. So the exit code is read: the ones that mean "this entry"
+    # carry on, and the ones that mean "this zip" or "this machine" stop and say
+    # which.
+    #
+    # -P '' is not about passwords, it is about not being asked for one: an
+    # encrypted entry makes unzip prompt, and it prompts on the terminal this
+    # program has in raw mode with the panel drawn over it. Handing it an empty
+    # password up front turns a hang nobody can see into exit 82.
+    rc=0
+    unzip -qq -o -P '' "$SRC_PATH" "$esc" -d "$AUDIO_DIR" 2>/dev/null || rc=$?
+    case "$rc" in
+      0|1|2|11|81) ;;
+      # 50 is documented as a full disk and is not only that: it is what unzip
+      # returns whenever it could not create the output file at all, a name the
+      # filesystem rejects included. So the disk gets asked. Still room means it
+      # was the name, and one unwritable entry is not a reason to close the
+      # record — the rest of the album is sitting right there.
+      50) if [ "$(room_free "$AUDIO_DIR")" -lt 33554432 ]; then
+            unpack_die 'disk full' "$rc"
+          fi ;;
+      51) die "$SRC_LABEL is truncated — it ends partway through $(basename "$entry")" ;;
+      9)  die "$SRC_PATH went away while it was being unpacked" ;;
+      80) die "interrupted while unpacking $SRC_LABEL" ;;
+      82) die "$SRC_LABEL is encrypted — this player cannot open it" ;;
+      *)  die "unzip gave up on $SRC_LABEL at $(basename "$entry") (exit $rc)" ;;
+    esac
+    n=$(( n + 1 ))
+    load_stage "OPENING · $(( n * 100 / total ))%" "$n" "$total" "$(basename "$entry")"
+  done < <(unzip -Z1 "$SRC_PATH" 2>/dev/null || true)
+  return 0
+}
+
 open_source() {  # open_source <record>
-  local rec=$1 n=0 total=0 entry esc rc=0 need=0 have=0
+  local rec=$1 total=0 need=0 have=0
   IFS=$'\t' read -r SRC_KIND SRC_PATH SRC_LABEL SRC_DETAIL <<< "$rec"
 
   case "$SRC_KIND" in
@@ -1181,11 +1371,11 @@ open_source() {  # open_source <record>
       AUDIO_DIR="$SRC_PATH"
       ;;
     zip)
-      command -v unzip >/dev/null || die "unzip not found — cannot open $SRC_LABEL"
+      [ -n "$UNPACK" ] || die "no tar and no unzip — cannot open $SRC_LABEL"
       scratch
       AUDIO_DIR="$WORK/album"
       mkdir -p "$AUDIO_DIR"
-      total=$( (unzip -Z1 "$SRC_PATH" 2>/dev/null || true) | grep -vc '/$' || true )
+      total=$(zip_count "$SRC_PATH")
       [ "${total:-0}" -gt 0 ] || die "nothing inside $SRC_LABEL"
 
       # Whether it fits, asked before a byte of it is written. A lossless record
@@ -1197,8 +1387,7 @@ open_source() {  # open_source <record>
       # The margin is so that a record which only just fits does not leave the
       # volume at zero — the rest of the machine is still using it, and an album
       # is not worth wedging a Mac for.
-      need=$(unzip -Zt "$SRC_PATH" 2>/dev/null | awk '/bytes uncompressed/ { print $3; exit }')
-      case "$need" in ''|*[!0-9]*) need=0 ;; esac
+      need=$(zip_bytes "$SRC_PATH")
       if [ "$need" -gt 0 ]; then
         have=$(room_free "$AUDIO_DIR")
         if [ $(( have - need )) -lt 33554432 ]; then
@@ -1207,46 +1396,10 @@ open_source() {  # open_source <record>
       fi
 
       load_stage "OPENING" 0 "$total" "$SRC_LABEL"
-      while IFS= read -r entry; do
-        [ -n "$entry" ] || continue
-        case "$entry" in */) continue ;; esac
-        # unzip reads the name it is handed as a pattern, not as a filename, so
-        # the brackets in "Track [Live].mp3" are a character class that matches
-        # one of L, i, v, e — and the track is silently not there afterwards.
-        # Escaping the three metacharacters is what makes it a literal name.
-        esc=${entry//\\/\\\\}
-        esc=${esc//\[/\\[}; esc=${esc//\*/\\*}; esc=${esc//\?/\\?}
-        # -o overwrites without asking, -qq says nothing, and a failure on one
-        # entry is not a reason to abandon an album — a zip with one corrupt
-        # booklet scan in it still has twelve good tracks.
-        #
-        # But not every failure is about the entry. A disk that fills partway
-        # through fails every entry after it, identically and silently, and what
-        # comes out the far end is an album missing its second half that plays
-        # until it doesn't. So the exit code is read: the ones that mean "this
-        # entry" carry on, and the ones that mean "this zip" or "this machine"
-        # stop and say which. Room was checked before any of this ran, so
-        # arriving here full means something else on the volume took it in the
-        # meantime — worth saying out loud rather than half-unpacking over.
-        #
-        # -P '' is not about passwords, it is about not being asked for one: an
-        # encrypted entry makes unzip prompt, and it prompts on the terminal this
-        # program has in raw mode with the panel drawn over it. Handing it an
-        # empty password up front turns a hang nobody can see into exit 82.
-        rc=0
-        unzip -qq -o -P '' "$SRC_PATH" "$esc" -d "$AUDIO_DIR" 2>/dev/null || rc=$?
-        case "$rc" in
-          0|1|2|11|81) ;;
-          50) die "ran out of room unpacking $SRC_LABEL — $(room_str "$(room_free "$AUDIO_DIR")") left in $WORK" ;;
-          51) die "$SRC_LABEL is truncated — it ends partway through $(basename "$entry")" ;;
-          9)  die "$SRC_PATH went away while it was being unpacked" ;;
-          80) die "interrupted while unpacking $SRC_LABEL" ;;
-          82) die "$SRC_LABEL is encrypted — this player cannot open it" ;;
-          *)  die "unzip gave up on $SRC_LABEL at $(basename "$entry") (exit $rc)" ;;
-        esac
-        n=$(( n + 1 ))
-        load_stage "OPENING · $(( n * 100 / total ))%" "$n" "$total" "$(basename "$entry")"
-      done < <(unzip -Z1 "$SRC_PATH" 2>/dev/null || true)
+      case "$UNPACK" in
+        tar) unpack_tar "$total" ;;
+        *)   unpack_unzip "$total" ;;
+      esac
       ;;
     *)
       die "cannot open a source of kind: $SRC_KIND"
