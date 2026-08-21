@@ -12,8 +12,10 @@
 #
 # Takes aiff, flac, mp3, ogg, wav, m4a, opus — anything ffmpeg reads, in a zip
 # or loose in a folder. Track order comes from embedded metadata, not filenames.
-# A zip is unpacked into a scratch directory that is destroyed when the app
-# closes, so what is left on disk afterwards is the zip you started with.
+# A zip is unpacked into a scratch directory under ~/.cache/player/work that is
+# destroyed when the app closes, so what is left on disk afterwards is the zip
+# you started with. Not $TMPDIR: macOS is entitled to reclaim that while a long
+# record is still playing out of it, and it does.
 #
 # An audio CD is read off the disc's own table of contents: CD-Text when the
 # disc carries it, MusicBrainz when it does not and the network is up, and
@@ -24,10 +26,23 @@
 # shift-←→ to seek further, ↑↓ to walk the list, enter to play what you are
 # looking at, n and p for the next and previous track.
 #
+# The meters are controls as well as readouts. Click the album meter to put the
+# needle anywhere in the record, whichever track that lands in; click the track
+# meter to move within the track. Dragging either one scrubs, though a drag on
+# the album meter stays inside the track it started in. Click a row to select it
+# and again to play it, and the wheel walks the list.
+#
+# The cover is drawn beside the panel when the window is wide enough to hold it,
+# fetched from the Cover Art Archive in the background and cached, so an album
+# played twice only ever costs one download. It is never waited for: if there is
+# no cover, or no network, the panel is exactly the panel it would have been.
+#
 # Env overrides:
 #   PLAYER_DIRS    colon-separated dirs the picker scans (default ~/Music:~/Downloads)
 #   PLAYER_DEV     cdrecord device for CD-Text (default: whichever the drive answers to)
 #   PLAYER_MB      set to 0 to never ask MusicBrainz about a disc
+#   PLAYER_ART     set to 0 to never fetch or draw the cover
+#   PLAYER_WORK    where zips are unpacked (default ~/.cache/player/work)
 #   PLAYER_KEEP    set to keep the scratch directory instead of destroying it
 
 set -euo pipefail
@@ -79,6 +94,9 @@ STRIP_WIDTH=$(( PANEL - 2 ))
 # cheap because almost every one of those frames redraws the analyser's own rows
 # and not the panel.
 TICK=0.05
+# The same number the other way round, because the loop rations frames by it and
+# arithmetic in bash is integers.
+TICK_HZ=20
 
 # The analyser. Sixteen bands is the most that still leaves a bar wide enough to
 # read at this panel width -- three columns each, one column between them, which
@@ -206,9 +224,30 @@ screen_off() {
   [ "$SCREEN" -eq 1 ] || return 0
   SCREEN=0
   [ -n "$SCREEN_STTY" ] && stty "$SCREEN_STTY" 2>/dev/null || true
-  printf '\033[?25h\033[?1049l'
+  printf '\033[?1006l\033[?1002l\033[?25h\033[?1049l'
   return 0
 }
+
+# The pointer, for the one part of this panel that is a control rather than a
+# readout: the meters. A bar drawn to the width of the window is a scrubber
+# already — it just had no way of being told so.
+#
+# 1002 is button-event tracking: presses, releases, and movement while a button
+# is down, which is what makes dragging along a meter a scrub rather than a
+# series of unrelated clicks. 1006 asks for the coordinates back in SGR form —
+# decimal numbers in an ordinary CSI sequence — because the original encoding
+# put the column in a single byte and gave up past column 223, which any
+# terminal wide enough to show this panel comfortably will exceed.
+#
+# Turned on for the now-playing panel alone rather than in screen_on. The picker
+# has nothing on it to point at, and a mouse report arriving there is a keystroke
+# it does not recognise and would redraw for.
+#
+# The cost, and it is worth saying plainly: while this is on, the terminal sends
+# drags to the app instead of selecting text with them. Most terminals still
+# select on shift-drag, which is the usual way out.
+mouse_on()  { [ "$SCREEN" -eq 1 ] && printf '\033[?1002h\033[?1006h'; return 0; }
+mouse_off() { [ "$SCREEN" -eq 1 ] && printf '\033[?1006l\033[?1002l'; return 0; }
 
 # Lay one frame over the screen from the home position.
 #
@@ -252,15 +291,79 @@ usage() {
 
 # Where a zip is unpacked to, and the promise that it does not outlive the app.
 #
+# Not $TMPDIR, which is the obvious place and the wrong one. macOS treats
+# everything under /var/folders/…/T as space it may take back whenever the disk
+# gets tight, and it does not care that something is playing out of it: a
+# six-hour record unpacked onto a volume with little room left can simply cease
+# to exist halfway through. What that looks like from here is every remaining
+# track failing to open inside two seconds and the album quietly "finishing".
+#
+# So it goes under the cache directory, which is ours and which nothing else
+# reclaims. That trades one risk for another — $TMPDIR does at least get swept
+# eventually, and a session killed outright, by a SIGKILL or a power cut, would
+# leave its gigabytes here for good. Hence the sweep: every session writes its
+# pid into its own directory, and every session starting up clears away the
+# directories whose pid is nobody.
+#
 # Made once, lazily, and destroyed by the exit trap however the app ends — a
 # clean quit, a die(), or a Ctrl-C. mktemp -d gives a directory nothing else is
 # in, which is what makes the rm -rf at the end safe to write at all: it is only
 # ever pointed at a path this process created.
 WORK=''
 MPV_PID=''
+
+# The cache if it will have us, $TMPDIR if it will not. A read-only or missing
+# home is a reason to take the worse directory, not a reason to refuse to play
+# a record.
+work_base() {
+  local b="${PLAYER_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/player/work}"
+  if mkdir -p "$b" 2>/dev/null && [ -w "$b" ]; then
+    printf '%s' "$b"
+  else
+    printf '%s' "${TMPDIR:-/tmp}"
+  fi
+  return 0
+}
+
+# What sessions that are not running any more left behind.
+scratch_sweep() {  # scratch_sweep <base>
+  local d pid
+  for d in "$1"/player.*; do
+    [ -d "$d" ] || continue
+    # Somebody asked for this one with PLAYER_KEEP. Theirs to delete, not ours.
+    [ -e "$d/keep" ] && continue
+    pid=''
+    if [ -f "$d/pid" ]; then read -r pid < "$d/pid" 2>/dev/null || pid=''; fi
+    case "$pid" in
+      ''|*[!0-9]*)
+        # No pid at all: a session that died between making its directory and
+        # writing into it. Given five minutes before it counts as abandoned, so
+        # that a player starting up this instant is not swept by one starting up
+        # the next.
+        if [ -n "$(find "$d" -maxdepth 0 -mmin +5 2>/dev/null)" ]; then
+          rm -rf "$d" 2>/dev/null || true
+        fi
+        ;;
+      *)
+        # A pid that answers is a player still using it. Two decks at once is
+        # allowed, and the second must not delete the first one's album out from
+        # under it — which is the whole failure this move was made to prevent.
+        kill -0 "$pid" 2>/dev/null || rm -rf "$d" 2>/dev/null || true
+        ;;
+    esac
+  done
+  return 0
+}
+
 scratch() {
+  local base
   [ -n "$WORK" ] && return 0
-  WORK=$(mktemp -d "${TMPDIR:-/tmp}/player.XXXXXX") || die "cannot make a scratch directory"
+  base=$(work_base)
+  scratch_sweep "$base"
+  WORK=$(mktemp -d "$base/player.XXXXXX") || die "cannot make a scratch directory in $base"
+  # Written before anything else goes in, because until it exists this directory
+  # is one the sweep cannot tell from an abandoned one.
+  printf '%s\n' "$$" > "$WORK/pid" || die "cannot write to $WORK"
   # The analyser's tables live here too, and go the same way at the end.
   mkdir -p "$WORK/spec" || die "cannot make a scratch directory"
   return 0
@@ -301,6 +404,9 @@ cleanup() {
   fi
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
     if [ -n "${PLAYER_KEEP:-}" ]; then
+      # Marked, or the next session's sweep would take it: this pid is about to
+      # stop answering, which is exactly what the sweep looks for.
+      : > "$WORK/keep" 2>/dev/null || true
       printf 'player: scratch kept at %s\n' "$WORK" >&2
     else
       rm -rf "$WORK"
@@ -407,12 +513,21 @@ run_check() {
     ck warn "MusicBrainz" "no ${v% } — untitled discs stay untitled. brew install ${v% }"
   fi
 
-  # Where a zip is unpacked to. A read-only or full $TMPDIR is the one failure
-  # that would otherwise not show up until an album was half open.
-  v="${TMPDIR:-/tmp}"
-  if dev=$(mktemp -d "$v/player.check.XXXXXX" 2>/dev/null); then
+  # Where a zip is unpacked to. A directory that cannot be written to is the one
+  # failure that would otherwise not show up until an album was half open, and
+  # the free space is worth printing because a record that does not fit is the
+  # other one.
+  v=$(work_base)
+  if dev=$(mktemp -d "$v/check.XXXXXX" 2>/dev/null); then
     rmdir "$dev" 2>/dev/null
-    ck ok "scratch space" "$(df -h "$v" 2>/dev/null | awk 'NR==2 { print $4 }') free in $v"
+    if [ "$v" = "${TMPDIR:-/tmp}" ] && [ -z "${PLAYER_WORK:-}" ]; then
+      # The fallback. It works, but it is the directory the OS may reclaim under
+      # a playing album, so say so rather than reporting a plain ok.
+      ck warn "scratch space" \
+        "$(df -h "$v" 2>/dev/null | awk 'NR==2 { print $4 }') free in $v — cache dir unwritable, so long albums may be reclaimed mid-play"
+    else
+      ck ok "scratch space" "$(df -h "$v" 2>/dev/null | awk 'NR==2 { print $4 }') free in $v"
+    fi
   else
     ck fail "scratch space" "cannot write to $v — zips cannot be opened"
   fi
@@ -747,7 +862,11 @@ spec_str() {
   local r=0
   SPECSTR=''
   [ "$spec_row" -gt 0 ] || return 0
-  [ "$paused" = true ] && spec_idle
+  # core-idle rather than pause, because pause is only one of the ways a deck
+  # ends up making no sound. A record that has finished, a track that would not
+  # open, mpv still filling its buffer -- all of them are silence, and columns
+  # dancing over silence is the panel lying about what you are hearing.
+  [ "$cidle" = true ] && spec_idle
   while [ "$r" -lt "$SPEC_ROWS" ]; do
     SPECSTR="${SPECSTR}\033[$(( spec_row + r ));1H\033[K  ${ETCH}▐${OFF}${SPECROWS[$r]}${ETCH}▌${OFF}"
     r=$(( r + 1 ))
@@ -981,7 +1100,7 @@ wcols() {  # wcols <string> -> $WCOLS
 # those are counted in bytes even under a UTF-8 locale. A cut title ends in … so
 # the truncation is visible.
 FIT=''
-fitv() {  # fitv <string> <columns> -> $FIT
+fitv() {  # fitv <string> <columns> [right] -> $FIT
   local s=$1 i=0 w=0 keep='' lim
   wcols "$s"
   if [ "$WCOLS" -gt "$2" ]; then
@@ -998,7 +1117,11 @@ fitv() {  # fitv <string> <columns> -> $FIT
     WCOLS=$(( w + 1 ))
   fi
   pad $(( $2 - WCOLS ))
-  FIT="$s$PAD"
+  # Right-aligned is the same fit with the slack moved to the front. It is asked
+  # for by the track list, where the artist column stands against the durations:
+  # two ragged edges facing each other read as a gap of no particular width,
+  # where two flush ones read as a margin.
+  if [ "${3:-}" = right ]; then FIT="$PAD$s"; else FIT="$s$PAD"; fi
 }
 fit() { fitv "$1" "$2"; printf '%s' "$FIT"; }
 
@@ -1458,6 +1581,407 @@ row_of_track() {
   return 1
 }
 
+# -------------------------------------------------------------------- resume --
+
+# Where you had got to, so that coming back to a record is not starting it again.
+#
+# Offered rather than applied: the panel says where it left off and waits for u.
+# A player that jumps to the middle of side two because you played it last week
+# has taken a decision that was yours to take, and the one thing you cannot do
+# once it has is un-hear the surprise.
+RESUME_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/player"
+RESUME_FILE="$RESUME_DIR/resume"
+RESUME_KEY=''
+RESUME_ROW=-1
+RESUME_POS=0
+
+# What this record is, as a string that will still mean it tomorrow.
+#
+# A disc says what it is outright. Nothing else does, so everything else is asked
+# what it contains instead of where it lives: a folder that has been moved, and a
+# zip unpacked into a different scratch directory every single run, are both
+# still the same album, and a key made out of the path would lose them both.
+resume_key() {
+  local s
+  if [ -n "${DISCID:-}" ]; then printf 'd:%s' "$DISCID"; return 0; fi
+  s=$(printf '%s|%s|%s|%s' "$ALBUM_ARTIST" "$ALBUM" "${#ORDER[@]}" "$TOTAL")
+  printf 'a:%s' "$(printf '%s' "$s" | shasum 2>/dev/null | cut -c1-16)"
+  return 0
+}
+
+resume_load() {
+  local k row pos rest
+  RESUME_ROW=-1; RESUME_POS=0
+  RESUME_KEY=$(resume_key)
+  [ -f "$RESUME_FILE" ] || return 1
+  while IFS="$(printf '\t')" read -r k row pos rest; do
+    [ "$k" = "$RESUME_KEY" ] || continue
+    case "$row" in ''|*[!0-9]*) return 1 ;; esac
+    case "$pos" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$row" -lt "${#ORDER[@]}" ] || return 1
+    # Not worth offering to put you back at the top of track one, which is where
+    # the record starts anyway, and not worth offering a position half a minute
+    # in either -- by the time reading the offer is over you could have been
+    # there. Anything further in than that was a real listening session.
+    [ "$row" -gt 0 ] || [ "$pos" -ge 30 ] || return 1
+    RESUME_ROW=$row
+    RESUME_POS=$pos
+    return 0
+  done < "$RESUME_FILE"
+  return 1
+}
+
+# Every album but this one, then this one: an upsert with no database under it.
+# Built in a temporary file and moved into place, so that a player killed halfway
+# through a write leaves the old file whole rather than half of a new one.
+resume_save() {  # resume_save <row> <pos>
+  local tmp
+  [ -n "$RESUME_KEY" ] || return 0
+  mkdir -p "$RESUME_DIR" 2>/dev/null || return 0
+  tmp="$RESUME_FILE.$$"
+  { [ -f "$RESUME_FILE" ] && awk -F"$(printf '\t')" -v k="$RESUME_KEY" \
+      '$1 != k' "$RESUME_FILE" 2>/dev/null | tail -200
+    printf '%s\t%s\t%s\t%s\n' "$RESUME_KEY" "$1" "$2" "$SRC_LABEL"
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$RESUME_FILE" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# A record played to the end has nowhere to be resumed from, and leaving the last
+# position on it would offer to put you back thirty seconds from the run-out
+# groove the next time you reached for it.
+resume_clear() {
+  local tmp
+  [ -n "$RESUME_KEY" ] || return 0
+  [ -f "$RESUME_FILE" ] || return 0
+  tmp="$RESUME_FILE.$$"
+  awk -F"$(printf '\t')" -v k="$RESUME_KEY" '$1 != k' "$RESUME_FILE" \
+    > "$tmp" 2>/dev/null && mv -f "$tmp" "$RESUME_FILE" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------- collection --
+
+# What your own catalogue has to say about the record that is playing.
+#
+# This is the one thing a general-purpose player cannot do. MusicBrainz knows
+# what a disc is; only the shelf it came off knows that you bought it used at
+# Amoeba and that it skips on track seven — and track seven skipping is precisely
+# the moment you want to be told you already knew.
+#
+# Nothing here is allowed to matter. Every failure — no file, no awk, a header
+# that has been renamed, an album that is simply not in the collection — leaves
+# the panel exactly as it would have been, because a missing note is not a reason
+# to interrupt a record.
+COLL_FILE="${PLAYER_COLLECTION:-}"
+COLL_HIT=0
+COLL_YEAR=''; COLL_GENRE=''; COLL_TAGS=''; COLL_NOTES=''; COLL_ART=''
+COLL_SHELF=''; COLL_ROWS=0
+
+# The catalogue that ships alongside this script, resolved through however many
+# symlinks stand between $0 and the file itself — this lives in scripts/player of
+# a repository whose data is two directories up, and a symlink into ~/bin is the
+# normal way to have it on a PATH.
+collection_file() {
+  local src dir
+  [ -n "$COLL_FILE" ] && { printf '%s' "$COLL_FILE"; return 0; }
+  src=$0
+  while [ -L "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" 2>/dev/null && pwd) || break
+    src=$(readlink "$src")
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  dir=$(cd -P "$(dirname "$src")" 2>/dev/null && pwd) || return 1
+  printf '%s' "$dir/../../data/collection.csv"
+  return 0
+}
+
+# Columns are found by name rather than by number, because the two CSVs in this
+# repository do not agree on whether Number or Book comes first, and a lookup
+# that silently reads the wrong column is worse than one that finds nothing.
+#
+# The quoted-field walk is there for "riot grrrl, compilation, punk rock", which
+# is one field containing two commas and would be three fields to anything that
+# split on commas alone. A quoted field containing a newline would defeat this,
+# and none of the ways this catalogue is produced can make one.
+collection_lookup() {
+  local f out
+  COLL_HIT=0
+  COLL_YEAR=''; COLL_GENRE=''; COLL_TAGS=''; COLL_NOTES=''; COLL_ART=''
+  [ -n "$ALBUM" ] || return 1
+  command -v awk >/dev/null || return 1
+  f=$(collection_file) || return 1
+  [ -f "$f" ] || return 1
+
+  out=$(awk -v want_a="$ALBUM_ARTIST" -v want_t="$ALBUM" '
+    function csvsplit(s, arr,   n,i,c,fl,inq) {
+      n=0; fl=""; inq=0
+      for (i=1;i<=length(s);i++) {
+        c=substr(s,i,1)
+        if (inq) {
+          if (c=="\"") { if (substr(s,i+1,1)=="\"") { fl=fl "\""; i++ } else inq=0 }
+          else fl=fl c
+        } else {
+          if (c=="\"") inq=1
+          else if (c==",") { arr[++n]=fl; fl="" }
+          else fl=fl c
+        }
+      }
+      arr[++n]=fl
+      return n
+    }
+    # Loose enough that "The Beatles" finds "Beatles" and punctuation and case
+    # never decide it, strict enough that two different records cannot collide.
+    function norm(s,   t) {
+      t=tolower(s); gsub(/^the +/,"",t); gsub(/[^a-z0-9]/,"",t); return t
+    }
+    NR==1 {
+      n=csvsplit($0,h)
+      for (i=1;i<=n;i++) {
+        k=tolower(h[i])
+        if (k=="artist") ca=i; else if (k=="title") ct=i
+        else if (k=="year") cy=i; else if (k=="parent genre") cg=i
+        else if (k=="tags") cs=i; else if (k=="notes") cn=i
+        else if (k=="art url") cu=i
+      }
+      next
+    }
+    {
+      n=csvsplit($0,r)
+      if (!ct || norm(r[ct])!=norm(want_t)) next
+      # Artist has to agree when we have one. When the files carried no album
+      # artist at all, a title on its own is accepted only if exactly one record
+      # in the catalogue answers to it -- two would be a coin toss.
+      if (want_a!="") { if (!ca || norm(r[ca])!=norm(want_a)) next }
+      hits++
+      y=cy?r[cy]:""; g=cg?r[cg]:""; s=cs?r[cs]:""; nt=cn?r[cn]:""; u=cu?r[cu]:""
+    }
+    END {
+      if (hits==1 || (hits>1 && want_a!="")) {
+        # US (\037) separates the fields rather than a tab, because bash treats
+        # tab as IFS whitespace: a run of them collapses to one delimiter and an
+        # empty field in the middle would shift every later field left. A record
+        # with no Notes would hand its Art URL to COLL_NOTES. US is not IFS
+        # whitespace, so one separator always means one field boundary.
+        gsub(/[\t\037]/," ",y); gsub(/[\t\037]/," ",g); gsub(/[\t\037]/," ",s)
+        gsub(/[\t\037]/," ",nt); gsub(/[\t\037]/," ",u)
+        printf "%s\037%s\037%s\037%s\037%s\n", y,g,s,nt,u
+      }
+    }' "$f" 2>/dev/null) || return 1
+
+  [ -n "$out" ] || return 1
+  IFS=$'\037' read -r COLL_YEAR COLL_GENRE COLL_TAGS COLL_NOTES COLL_ART \
+    <<EOF
+$out
+EOF
+  # Assembled once here rather than on every frame: the panel rebuilds itself
+  # once a second for as long as the record lasts, and this string never changes.
+  COLL_SHELF=''
+  [ -n "$COLL_YEAR" ]  && COLL_SHELF="$COLL_YEAR"
+  [ -n "$COLL_GENRE" ] && COLL_SHELF="${COLL_SHELF:+$COLL_SHELF · }$COLL_GENRE"
+  [ -n "$COLL_TAGS" ]  && COLL_SHELF="${COLL_SHELF:+$COLL_SHELF · }$COLL_TAGS"
+  # How much taller the faceplate just became, so that the track list gives up
+  # exactly that many rows and the panel still fits the window it is in.
+  COLL_ROWS=0
+  [ -n "$COLL_SHELF" ] && COLL_ROWS=$(( COLL_ROWS + 1 ))
+  [ -n "$COLL_NOTES" ] && COLL_ROWS=$(( COLL_ROWS + 1 ))
+  COLL_HIT=1
+  return 0
+}
+
+# ---------------------------------------------------------------- the sleeve --
+
+# The cover, drawn beside the panel out of the terminal's own colours.
+#
+# A record has a front, and a player that never shows it is missing the part of
+# the object you would actually be looking at. There is room for it: the panel is
+# a fixed 71 columns and most windows are wider than that, so the sleeve goes in
+# the space to the right that nothing else was ever going to use. On a window too
+# narrow to hold it, it simply is not drawn, and the panel is exactly the panel it
+# has always been — which is the whole reason the panel's width is fixed.
+#
+# Half blocks, not one character per pixel. ▀ paints its top half in the
+# foreground colour and its bottom half in the background, so a single cell
+# carries two pixels and the picture comes out at twice the vertical resolution
+# the character grid has rows. A cell is also about twice as tall as it is wide,
+# so two pixels per cell is exactly what makes a square cover come out square.
+#
+# Truecolour when the terminal says it has it, and the 256-colour cube when it
+# does not — see art_render for why the fallback is not a plain nearest colour.
+ART_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/player/art"
+USE_ART="${PLAYER_ART:-1}"
+MB_RELEASE=''
+ART_KEY=''; ART_FILE=''
+ART_STR=''; ART_COLS=0; ART_ROWS=0
+# Column 72 and 73 are the gutter: the panel ends at 71 and a sleeve butted
+# straight against it would read as part of the same object. Row 3 is where the
+# album title is, so the cover starts level with the name of the record.
+ART_COL0=74; ART_ROW0=3
+ART_GEOM=''
+
+# What this record is called on disk, so an album fetched once is not fetched
+# again. The release ID when a disc gave us one, because that names a pressing
+# exactly; otherwise the artist and the title folded down to letters and digits,
+# so that the same album tagged two slightly different ways lands on one file.
+art_key() {
+  local s
+  if [ -n "$MB_RELEASE" ]; then s="mbid-$MB_RELEASE"; else s="${ALBUM_ARTIST}-${ALBUM}"; fi
+  s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')
+  s=${s#-}; s=${s%-}; s=${s:0:80}; s=${s%-}
+  [ -n "$s" ] || return 1
+  printf '%s' "$s"
+  return 0
+}
+
+# Candidate releases for a record that did not come out of the drive.
+#
+# A zip or a folder has tags and nothing else, so there is no disc ID to be exact
+# with and the archive has to be asked by name. What comes back is a list rather
+# than an answer, because an album is in MusicBrainz once per pressing — the
+# original, the remaster, the European issue — and cover art is filed against a
+# pressing rather than against the album. The first hit is quite often the one
+# nobody ever scanned, so the fetch below walks the list until something has a
+# front on it.
+#
+# The terms are matched as quoted phrases, which is strict on purpose: asked for
+# an artist and an album that do not belong together, the catalogue answers with
+# nothing rather than with its best guess. That is the property this depends on —
+# a wrong cover drawn confidently beside the panel would be worse than none, and
+# this is what makes that outcome unlikely enough not to need guarding against.
+#
+# --data-urlencode rather than pasting into the URL: titles carry ampersands,
+# spaces and question marks, every one of which means something else in a query
+# string. Quotes are stripped out of the terms first — they are the Lucene syntax
+# that holds the phrase together, so a title containing one of its own would close
+# the phrase early and leave the rest of the title parsed as query operators.
+#
+# Asked twice, because an empty answer is at least as often the server as the
+# catalogue. MusicBrainz rate-limits to about a request a second and says so with
+# a 503 whose body is an error rather than a release list, and its search index
+# times out often enough to have done it twice while this was being written. Both
+# arrive here as no results, and both are usually gone a second later. A pairing
+# that genuinely is not in the catalogue answers twice over, which costs one
+# spare request on a record that was never going to have a cover anyway.
+mb_query() {  # mb_query <artist> <album>
+  local q a=${1//\"/} b=${2//\"/} out try
+  [ -n "$b" ] || return 1
+  if [ -n "$a" ]; then q="artist:\"$a\" AND release:\"$b\""; else q="release:\"$b\""; fi
+  for try in 1 2; do
+    out=$(curl -sS -m 15 -G -A 'player/1.0 ( https://github.com/gvorbeck )' \
+        --data-urlencode "query=$q" --data 'fmt=json' --data 'limit=5' \
+        'https://musicbrainz.org/ws/2/release' 2>/dev/null \
+      | jq -r '.releases[]?.id // empty' 2>/dev/null)
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    sleep 1
+  done
+  return 1
+}
+
+mb_release_search() {
+  local b
+  [ "$USE_MB" = 1 ] || return 1
+  [ -n "$ALBUM" ] || return 1
+  mb_query "$ALBUM_ARTIST" "$ALBUM" && return 0
+  # An untagged folder or zip has no title, only the name whoever made it gave
+  # the file — "Comfort Eagle (1998) [FLAC]", "OK_Computer_(Remastered)". The
+  # catalogue is matching a phrase against a real title, and none of that is in
+  # the title, so the whole query misses on one bracket.
+  b=$(printf '%s' "$ALBUM" \
+      | sed -E 's/[[({][^])}]*[])}]//g; s/_+/ /g; s/  +/ /g; s/^ +//; s/ +$//')
+  [ -n "$b" ] && [ "$b" != "$ALBUM" ] && { mb_query "$ALBUM_ARTIST" "$b" && return 0; }
+  # The other half of the same convention: the folder is "Artist - Album", which
+  # is both fields inside the one that is meant to be the title. Only worth trying
+  # when there is no artist tag standing to contradict it.
+  case "$b" in
+    *' - '*) [ -z "$ALBUM_ARTIST" ] && { mb_query "${b%% - *}" "${b#* - }" && return 0; } ;;
+  esac
+  return 1
+}
+
+# Whether what came back is actually a picture.
+#
+# The Cover Art Archive answers with a redirect to the Internet Archive, and those
+# nodes are not always well. A sick one has been seen serving an nginx error page
+# under a 200 — and, worse, serving it labelled image/jpeg. Neither the status
+# line nor the content type can be believed, so the only test worth making is
+# whether a decoder can read the bytes, and that is the test.
+art_ok() {  # art_ok <file>
+  local wh
+  [ -s "$1" ] || return 1
+  wh=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+       -of csv=p=0 "$1" 2>/dev/null || true)
+  # ffprobe prints "500,500" for a picture and "0,0" for something it opened but
+  # could not measure, which is why this cannot just look for a digit.
+  case "$wh" in ''|0,0|*,0|0,*|*[!0-9,]*) return 1 ;; esac
+  return 0
+}
+
+# A record the archive has no cover for, remembered — but not for ever. Without
+# this, an album with no scan costs two lookups on the network every single time
+# it is played. Forgotten after a fortnight, so a cover uploaded in the meantime
+# still turns up.
+art_none_fresh() {
+  local f="$ART_FILE.none"
+  [ -f "$f" ] || return 1
+  [ -n "$(find "$f" -mtime +14 2>/dev/null)" ] && { rm -f "$f"; return 1; }
+  return 0
+}
+
+# Fetch a front cover and leave it where the panel can find it.
+#
+# Every part of this is allowed to fail and none of it is allowed to be noticed.
+# It runs in the background from the moment the record starts, so the album is
+# already playing while this is still deciding whether there is a cover at all —
+# and when there is not, nothing about the panel changes.
+#
+# Downloaded beside the cache entry and moved onto it, so a file in the cache is
+# always a whole one: the panel tests for the file and nothing else, and half a
+# JPEG would be read as the cover and drawn as rubbish. The part file is named
+# after the album rather than after this process, so a fetch that is killed
+# mid-download leaves one file that the next attempt at the same record
+# overwrites, instead of a new one every time.
+art_fetch() {
+  local id ids tmp try n=0
+  set +e
+  tmp="$ART_FILE.part"
+  if [ -n "$MB_RELEASE" ]; then ids=$MB_RELEASE; else ids=$(mb_release_search); fi
+  for id in $ids; do
+    n=$(( n + 1 ))
+    [ "$n" -gt 5 ] && break
+    # Twice per candidate. A first failure is more often a sick archive node than
+    # a missing cover, and the redirect lands on a different node next time.
+    for try in 1 2; do
+      rm -f "$tmp"
+      curl -sSL -m 25 -o "$tmp" -A 'player/1.0 ( https://github.com/gvorbeck )' \
+        "https://coverartarchive.org/release/$id/front-500" 2>/dev/null
+      art_ok "$tmp" && { mv -f "$tmp" "$ART_FILE" 2>/dev/null && return 0; }
+    done
+  done
+  rm -f "$tmp"
+  : > "$ART_FILE.none" 2>/dev/null
+  return 1
+}
+
+# Decide there is a cover to look for, and go and look in the background.
+art_start() {
+  ART_STR=''; ART_KEY=''; ART_FILE=''
+  [ "$USE_ART" = 1 ] || return 0
+  [ "$UTF8" -eq 1 ] || return 0
+  command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || return 0
+  command -v curl >/dev/null && command -v jq >/dev/null || return 0
+  [ -n "$ALBUM" ] || return 0
+  mkdir -p "$ART_CACHE" 2>/dev/null || return 0
+  ART_KEY=$(art_key) || { ART_KEY=''; return 0; }
+  ART_FILE="$ART_CACHE/$ART_KEY.jpg"
+  # Already on disk from a previous session, or already known not to exist. Either
+  # way there is nothing to ask the network; art_tick finds the file by itself.
+  [ -s "$ART_FILE" ] && return 0
+  art_none_fresh && return 0
+  ( art_fetch >/dev/null 2>&1 ) &
+  return 0
+}
+
 # --------------------------------------------------------------- CD metadata --
 
 # macOS mounts an audio CD as a volume of files called "1 Audio Track.aiff",
@@ -1627,6 +2151,10 @@ mb_lookup() {
     alb=$(printf '%s' "$json" | jq -r '.releases[0].title // empty' 2>/dev/null || true)
     art=$(printf '%s' "$json" | jq -r '.releases[0]."artist-credit"[0].name // empty' 2>/dev/null || true)
     t=$(printf '%s' "$json"   | jq -r '.releases[0].date // empty' 2>/dev/null || true)
+    # Kept for the sleeve. The Cover Art Archive is keyed on a release, and a
+    # disc ID resolves to one exactly — which is the strongest identification
+    # anything here ever gets, and worth writing down while we hold it.
+    MB_RELEASE=$(printf '%s' "$json" | jq -r '.releases[0].id // empty' 2>/dev/null || true)
     # The medium this disc actually is, matched on the disc ID that was used to
     # ask the question — not every medium that has one. A release is one entry
     # per disc in the box, so taking them all concatenates disc two's track list
@@ -1704,8 +2232,55 @@ cd_metadata() {
 #
 # Everything here is read out of the caller's locals. np_frame is called from
 # inside the event loop, which is where all the state lives.
+# How the columns between the track number and the duration are divided between
+# the title and the artist — and whether there is an artist column at all.
+#
+# On an album there is not. Every row would carry the same name, and that name is
+# already printed at the top of the panel under ARTIST: a column that repeats one
+# fact fifty times is not a column, it is a margin with writing on it. Dropping it
+# hands the title fifty-two columns instead of thirty-two, which is the difference
+# between "Libet's all joyful camarad…" and the title the record actually has.
+#
+# On a compilation it is a real column, because there the artist changes per row
+# and is the second thing you read. It is then sized to the longest name the
+# record actually contains rather than to the worst case, so the titles still get
+# whatever the names do not use.
+#
+# Either way it is decided once for the session and not per row, so the list
+# stays a grid: this gives the titles the slack, it does not make the edges
+# ragged.
+NP_TITLE_W=32
+NP_ARTIST_W=18
+np_columns() {
+  local k one='' first=1 same=1 max=0
+  for k in "${ORDER[@]:-}"; do
+    [ -n "$k" ] || continue
+    if [ "$first" -eq 1 ]; then
+      one=${ARTISTS[$k]:-}; first=0
+    elif [ "${ARTISTS[$k]:-}" != "$one" ]; then
+      same=0
+    fi
+    wcols "${ARTISTS[$k]:-}"
+    [ "$WCOLS" -gt "$max" ] && max=$WCOLS
+  done
+  # One artist all the way down, and it is the one already on the faceplate. The
+  # test is against ALBUM_ARTIST rather than just "they all agree", because a
+  # record whose tracks say "Miles Davis Quintet" under an album credited to
+  # "Miles Davis" is not repeating the header — it is saying something else, and
+  # dropping the column would throw that away.
+  if [ "$same" -eq 1 ] && { [ -z "$one" ] || [ "$one" = "$ALBUM_ARTIST" ]; }; then
+    NP_ARTIST_W=0
+    NP_TITLE_W=52
+    return 0
+  fi
+  [ "$max" -gt 18 ] && max=18
+  NP_ARTIST_W=$max
+  NP_TITLE_W=$(( 50 - max ))
+  return 0
+}
+
 np_frame() {
-  local k i row body meta mark lbl want lo hi
+  local k i row body meta mark lbl art artc want lo hi
   local last=$(( np_top + np_rows ))
 
   printf -v meta '%s · %d TRACKS%s' "$mode_label" "${#ORDER[@]}" "$meta_tail"
@@ -1717,6 +2292,15 @@ np_frame() {
   # from, and saying it twice on one screen reads like two different facts.
   printf '    %b%-8s%b %b%s%b\n' "$ETCH" SOURCE "$OFF" "$DIM" \
     "$(fit "$SRC_LABEL" 52)" "$OFF"
+  # What the shelf says, when this record is on it. The note is in amber and the
+  # rest is dim, because the note is the half you wrote down yourself and the
+  # only line here you cannot get from any other player.
+  if [ "$COLL_HIT" -eq 1 ]; then
+    [ -n "$COLL_SHELF" ] && printf '    %b%-8s%b %b%s%b\n' "$ETCH" SHELF "$OFF" \
+      "$DIM" "$(fit "$COLL_SHELF" 52)" "$OFF"
+    [ -n "$COLL_NOTES" ] && printf '    %b%-8s%b %b%s%b\n' "$ETCH" NOTE "$OFF" \
+      "$AMBER" "$(fit "$COLL_NOTES" 52)" "$OFF"
+  fi
   printf '\n'
 
   k=$np_top
@@ -1733,16 +2317,26 @@ np_frame() {
       mark=' '
     fi
     printf -v row '%02d' $(( k + 1 ))
-    fitv "${TITLES[$i]}" 32; lbl=$FIT
-    fitv "${ARTISTS[$i]}" 18
+    fitv "${TITLES[$i]}" "$NP_TITLE_W"; lbl=$FIT
+    # The artist field carries its own leading gap, so that a record with no
+    # artist column leaves no gap where one would have been — the title simply
+    # runs on to where the artist used to start. Twice over because the cursor
+    # row is drawn inside one reverse-video run and cannot have colours in it.
+    if [ "$NP_ARTIST_W" -gt 0 ]; then
+      fitv "${ARTISTS[$i]}" "$NP_ARTIST_W" right
+      art="  $FIT"
+      printf -v artc '  %b%s%b' "$DIM" "$FIT" "$OFF"
+    else
+      art=''; artc=''
+    fi
     mmssv "${DURS[$i]}"
     if [ "$k" -eq "$np_cur" ]; then
-      printf -v body '%s %s  %s  %s  %5s' "$mark" "$row" "$lbl" "$FIT" "$MMSS"
+      printf -v body '%s %s  %s%s  %5s' "$mark" "$row" "$lbl" "$art" "$MMSS"
       printf '  %b▶%b %b%s%b\n' "$AMBER" "$OFF" "$INV" "$body" "$OFF"
     else
-      printf '    %b%s%b %b%s%b  %s  %b%s%b  %b%5s%b\n' \
+      printf '    %b%s%b %b%s%b  %s%s  %b%5s%b\n' \
         "$AMBER" "$mark" "$OFF" "$ETCH" "$row" "$OFF" "$lbl" \
-        "$DIM" "$FIT" "$OFF" "$ETCH" "$MMSS" "$OFF"
+        "$artc" "$ETCH" "$MMSS" "$OFF"
     fi
     k=$(( k + 1 ))
   done
@@ -1813,7 +2407,7 @@ np_frame() {
 np_fit_rows() {  # np_fit_rows <status> -> $NP_ROWS
   local budget
   term_size
-  budget=$(( TERM_LINES - NP_CHROME ))
+  budget=$(( TERM_LINES - NP_CHROME - COLL_ROWS ))
   [ -n "$1" ] && budget=$(( budget - 2 ))
   [ "${#ORDER[@]}" -gt "$budget" ] && budget=$(( budget - 1 ))
   [ "$budget" -lt 1 ] && budget=1
@@ -1823,13 +2417,21 @@ np_fit_rows() {  # np_fit_rows <status> -> $NP_ROWS
 
 # ------------------------------------------------------------------ engine --
 
-# mpv, driven over its JSON IPC socket, one track at a time.
+# mpv, driven over its JSON IPC socket, holding the whole record at once.
 #
-# mpv has a playlist of its own and this deliberately does not use it. Shuffle,
-# repeat and "play the row I am looking at" are this program's ideas about what
-# comes next, and a playlist held in two places is a playlist that disagrees with
-# itself. mpv is asked to play one file; when it reports that file finished, the
-# next one is chosen here and loaded.
+# The playlist is mpv's, in the order the panel shows it, and every track is
+# handed over before the first one has finished. That is the only arrangement in
+# which mpv can read ahead into the next file while the current one is still
+# playing, and reading ahead is the whole of gapless — a file opened at the
+# moment the previous one ends is a file being opened during the silence.
+#
+# What that costs is that mpv now has an opinion about what comes next, and the
+# panel used to be the only thing that did. The two are kept from disagreeing by
+# having exactly one source of truth: mpv's playlist-pos. This program never
+# assumes a track change, it asks for one and waits to be told — and a track that
+# simply ran out arrives by the same route as one picked with the cursor. Shuffle
+# and REPEAT ALBUM are still this program's ideas, applied by moving playlist-pos
+# when mpv reports where it went by itself.
 SOCK=''; CMDFIFO=''
 
 engine_start() {
@@ -1842,8 +2444,21 @@ engine_start() {
 
   # --idle so mpv survives the end of every track and waits to be told the next
   # one. --no-terminal so it never writes on the panel or steals a keystroke.
+  # --gapless-audio=yes and --prefetch-playlist=yes are what make a record play
+  # like a record. mpv's own default is "weak", which only bridges a boundary
+  # when the two files agree on rate and channel layout — true of a clean rip and
+  # not true of a folder with one track at 48k in it, which is exactly the album
+  # you would notice the gap on. "yes" bridges it either way.
+  #
+  # The prefetch is the half that actually matters. Gapless is a promise mpv can
+  # only keep about a file it has already opened, so without it the next track is
+  # still being found at the moment the last sample of this one goes out, and the
+  # seam is however long that took. burncd writes these discs disc-at-once so
+  # there is no gap between tracks; playing them back with one is the same album
+  # told wrong.
   mpv --no-video --idle=yes --no-terminal --no-config \
       --keep-open=no \
+      --gapless-audio=yes --prefetch-playlist=yes \
       --input-ipc-server="$SOCK" >/dev/null 2>&1 &
   MPV_PID=$!
 
@@ -1899,6 +2514,26 @@ play() {
   local shuffle=0 repeat=0 mode_label=PLAYING meta_tail='' np_follow=1
   local rec key frame i last_pos=-1 last_draw='' drew=0
   local ptenth=0
+  # asked distinguishes a move this loop asked for from one mpv made by itself at
+  # the end of a track — the two look identical by the time they come back as a
+  # property change, and shuffle has to tell them apart. started is what stops
+  # mpv's opening "nothing is playing" from being read as the end of the record.
+  local plpos=-1 asked=0 started=0
+  # Whether anything is actually coming out of the deck, which is not the same
+  # question as whether it is paused, and whether a track has failed to open --
+  # which latches, because mpv answers an unreadable file by walking straight on
+  # to the next one and a whole record can go past in a second that way.
+  local cidle=false failed=0
+  # How many frames this second has already had, so a backlog of ticks that
+  # built up behind a terminal that stopped reading can be dropped rather than
+  # drawn.
+  local tick_sec=-1 tick_n=0
+  # A seek waiting for the track it belongs to to actually be playing, and the
+  # last whole second written to the resume file, so that writing it again is
+  # cheap to decide against.
+  local pend_seek=-1 saved_at=-1
+  # A mouse report, taken apart.
+  local mrep mend mb mx my mrest
   local -a DUR_BY_ROW PRE
 
   # The bands are the tracks of the album, fixed for the whole session, and only
@@ -1917,10 +2552,14 @@ play() {
   else
     bands 0
   fi
+  # Same reasoning, and the same once: the track list's columns are a property of
+  # the record, so they are measured here rather than on every frame.
+  np_columns
 
   printf -v meta_tail ' · %s' "$META_SOURCE"
 
   tui_block
+  mouse_on
   {
     key_reader & KR=$!
     while :; do printf '%s\r' "$SCAN_MARK"; sleep "$TICK"; done & TK=$!
@@ -1954,12 +2593,41 @@ play() {
     mpv_cmd '{"command":["observe_property",1,"time-pos"]}'
     mpv_cmd '{"command":["observe_property",2,"pause"]}'
     mpv_cmd '{"command":["observe_property",3,"duration"]}'
-    load_track "$cur_track"
+    # Which track is playing is mpv's answer now, not this loop's assumption.
+    # Everything that moves the record — the n key, a row picked with enter,
+    # shuffle, and a track simply running out — arrives back here as a change to
+    # this one property, and there is exactly one piece of code that acts on it.
+    mpv_cmd '{"command":["observe_property",4,"playlist-pos"]}'
+    # Whether sound is coming out. The analyser is drawn from this rather than
+    # from pause, so that a record which has finished, or one whose next track
+    # will not open, shows a deck at rest instead of columns dancing to nothing.
+    mpv_cmd '{"command":["observe_property",5,"core-idle"]}'
+    playlist_build
 
     while IFS= read -r -d $'\r' rec || [ -n "$rec" ]; do
       case "$rec" in
 
         "$SCAN_MARK")
+          # A tick that has been sitting in the pipe is a tick about a moment
+          # that has already gone. Nothing throttles the generator: it writes
+          # one every fiftieth of a second whether or not anything has read the
+          # last, and a terminal is free to stop draining -- a window behind
+          # another window on macOS is drained slowly enough that a second of
+          # frames does not fit through it. The ticks then queue instead of
+          # being lost, and when the window comes forward the panel replays
+          # every frame it missed, one at a time, racing the meters up to where
+          # the music already is. That is the lag you can watch catching up.
+          #
+          # So the frames are rationed against the clock rather than against the
+          # queue: past the tick rate in any one second, the surplus goes on the
+          # floor. Draining a backlog then costs a case and two additions each
+          # instead of a rendered frame, and the panel arrives at the truth in
+          # the time it takes to read the pipe rather than in the time it took
+          # to fall behind. SECONDS is a builtin, so this asks the clock without
+          # starting a process twenty times a second to do it.
+          if [ "$SECONDS" != "$tick_sec" ]; then tick_sec=$SECONDS; tick_n=0; fi
+          tick_n=$(( tick_n + 1 ))
+          [ "$tick_n" -gt "$TICK_HZ" ] && continue
           frame_no=$(( frame_no + 1 ))
           # Advanced before anything is drawn and outside the two branches
           # below, so the columns move at the tick's rate whether this frame
@@ -1967,14 +2635,14 @@ play() {
           # Rendered here too, not just advanced, so that both branches below —
           # the panel rebuild and the analyser-only repaint — print the same
           # rows without either of them building them twice.
-          [ "$paused" != true ] && { spec_advance "$frame_no"; spec_render; }
+          [ "$cidle" != true ] && { spec_advance "$frame_no"; spec_render; }
           # A whole frame twenty times over to advance one digit is nineteen
           # redraws wasted. The panel is rebuilt when a number on it changed;
           # every other tick repaints the analyser's rows alone, in place.
           if [ "$pos" != "$last_pos" ]; then
             last_pos=$pos
             np_draw
-          elif [ "$drew" -eq 1 ] && [ "$paused" != true ] && [ "$spec_row" -gt 0 ]; then
+          elif [ "$drew" -eq 1 ] && [ "$cidle" != true ] && [ "$spec_row" -gt 0 ]; then
             spec_str
             printf '%b' "$SPECSTR"
           fi
@@ -2001,12 +2669,50 @@ play() {
             s|S)            shuffle=$(( 1 - shuffle ))
                             status="▪ SHUFFLE $( [ "$shuffle" -eq 1 ] && printf ON || printf OFF )" ;;
             r|R)            repeat=$(( (repeat + 1) % 3 ))
+                            # REPEAT TRACK is mpv's own loop-file rather than a
+                            # reload when the track ends: a track told to start
+                            # again after it has already finished is a file being
+                            # opened during the silence, which is the gap this
+                            # whole arrangement exists to avoid. REPEAT ALBUM
+                            # stays ours — album_ended has to ask shuffle what
+                            # comes next, and mpv's loop-playlist would not.
                             case $repeat in
-                              0) status='▪ REPEAT OFF' ;;
-                              1) status='▪ REPEAT ALBUM' ;;
-                              2) status='▪ REPEAT TRACK' ;;
+                              0) mpv_cmd '{"command":["set_property","loop-file","no"]}'
+                                 status='▪ REPEAT OFF' ;;
+                              1) mpv_cmd '{"command":["set_property","loop-file","no"]}'
+                                 status='▪ REPEAT ALBUM' ;;
+                              2) mpv_cmd '{"command":["set_property","loop-file","inf"]}'
+                                 status='▪ REPEAT TRACK' ;;
                             esac ;;
+            u|U)            [ "$RESUME_ROW" -ge 0 ] || continue
+                            # The seek cannot go out with the track change. mpv
+                            # moves playlist-pos before it has opened the file,
+                            # and a seek into a file that is not yet playing is
+                            # a seek into the one that still is. Left pending and
+                            # spent on the first time-pos of the new track, which
+                            # is a thing mpv only sends once it is really there.
+                            np_follow=1
+                            pend_seek=$RESUME_POS
+                            load_track "$RESUME_ROW"
+                            RESUME_ROW=-1 ;;
             q|Q)            mpv_cmd '{"command":["quit"]}' ;;
+            # A mouse report, in the SGR form asked for by mouse_on:
+            # ESC [ < button ; column ; row M for a press or a drag, m for a
+            # release. read_key already brings these in whole — it runs a CSI
+            # sequence to its first letter, and M and m are letters.
+            #
+            # Taken apart with substitutions rather than a regex because this is
+            # in the event loop and a drag delivers one of these per pixel row
+            # the pointer crosses. Each field is checked on its own: a truncated
+            # report would otherwise leave a field empty, and an empty one goes
+            # into the arithmetic below as a zero rather than as a mistake.
+            $'\033[<'*)     mrep=${key:3}
+                            mend=${mrep: -1}; mrep=${mrep%?}
+                            IFS=';' read -r mb mx my mrest <<< "$mrep"
+                            case "$mb" in ''|*[!0-9]*) continue ;; esac
+                            case "$mx" in ''|*[!0-9]*) continue ;; esac
+                            case "$my" in ''|*[!0-9]*) continue ;; esac
+                            mouse_at "$mb" "$mx" "$my" "$mend" || continue ;;
             *)              continue ;;
           esac
           np_draw
@@ -2022,6 +2728,22 @@ play() {
                 # rows to the second, so the first decimal has to survive too.
                 ptenth="${BASH_REMATCH[2]:0:1}"
                 [ -z "$ptenth" ] && ptenth=0
+                if [ "$pend_seek" -ge 0 ]; then
+                  # The track is genuinely playing now — this is the first thing
+                  # mpv says that proves it — so the resume seek can be spent.
+                  # Cleared before it is sent, because the seek itself comes
+                  # straight back through here as another time-pos.
+                  i=$pend_seek
+                  pend_seek=-1
+                  mpv_cmd "{\"command\":[\"seek\",$i,\"absolute\"]}"
+                # Five seconds rather than every one of them: a file write a
+                # second for the length of a record is a lot of writing to save a
+                # number that is only ever read once, and five seconds is inside
+                # the margin of where you would say you had got to anyway.
+                elif [ "$pos" -ge $(( saved_at + 5 )) ] || [ "$pos" -le $(( saved_at - 5 )) ]; then
+                  saved_at=$pos
+                  resume_save "$cur_track" "$pos"
+                fi
               fi ;;
             *'"name":"duration"'*)
               if [[ "$rec" =~ \"data\":([0-9]+)\.?([0-9]*) ]]; then
@@ -2029,13 +2751,66 @@ play() {
               fi ;;
             *'"name":"pause"'*)
               [[ "$rec" =~ \"data\":(true|false) ]] && paused="${BASH_REMATCH[1]}"
-              mode_label=$( [ "$paused" = true ] && printf PAUSED || printf PLAYING )
+              # The pause a failure puts on is not the pause the space bar puts
+              # on, and the faceplate should not claim otherwise.
+              [ "$failed" -eq 1 ] \
+                || mode_label=$( [ "$paused" = true ] && printf PAUSED || printf PLAYING )
               np_draw ;;
+            *'"name":"core-idle"'*)
+              # Only read. Nothing is redrawn off it, because it goes true for a
+              # fraction of a second at every gapless seam and a redraw there
+              # would put a stutter into the one place this player exists to
+              # keep smooth. The next tick picks it up.
+              [[ "$rec" =~ \"data\":(true|false) ]] && cidle="${BASH_REMATCH[1]}" ;;
+            *'"name":"playlist-pos"'*)
+              # The one place a track change is acted on, whatever caused it.
+              if [[ "$rec" =~ \"data\":(-?[0-9]+) ]]; then
+                plpos="${BASH_REMATCH[1]}"
+                if [ "$plpos" -lt 0 ]; then
+                  # -1 is also what mpv says while it is idle with nothing loaded,
+                  # which it says once at startup before the first entry has been
+                  # appended. Only a -1 that comes after something has actually
+                  # played is the end of the record; the opening one is not the
+                  # album finishing before it began.
+                  # And a record that stopped because its files would not open
+                  # has not finished either, whatever mpv fell off the end of.
+                  [ "$started" -eq 1 ] && [ "$failed" -eq 0 ] && album_ended
+                elif [ "$failed" -eq 1 ]; then
+                  # mpv is still walking off the entries behind a failure. The
+                  # panel stays on the track that actually stopped, because that
+                  # is the one worth telling you about.
+                  :
+                elif [ "$started" -eq 0 ]; then
+                  # The first track of the session is taken as it comes. It is
+                  # nobody's idea of an advance — nothing has played yet for it
+                  # to be following — and sending it through shuffle would jump
+                  # off the opening track before a note of it was out.
+                  started=1
+                  asked=0
+                  enter_track "$plpos"
+                  # After enter_track, not before: starting a track clears the
+                  # status line, and the offer is the one thing on it that has to
+                  # outlive the track starting.
+                  if [ "$RESUME_ROW" -ge 0 ]; then
+                    status="▪ RESUME AT ${TRKNOS[${ORDER[$RESUME_ROW]}]} · $(mmss "$RESUME_POS") — PRESS U"
+                    np_draw
+                  fi
+                elif [ "$asked" -eq 1 ]; then
+                  # A move this loop asked for is the move it asked for, and is
+                  # not put back through shuffle.
+                  asked=0
+                  enter_track "$plpos"
+                else
+                  auto_advanced "$plpos"
+                fi
+              fi ;;
+            # A file that ended because it finished is not handled here: mpv
+            # walks on to the next entry by itself, and acting on that as well
+            # would advance the record twice for every track that played. A file
+            # that ended because it would not open is another matter entirely.
             *'"event":"end-file"'*)
-              # eof is a track that finished; anything else is a track that was
-              # replaced by the next loadfile and must not advance anything.
               case "$rec" in
-                *'"reason":"eof"'*) track_ended ;;
+                *'"reason":"error"'*) track_failed "$rec" ;;
               esac ;;
           esac
           continue
@@ -2128,19 +2903,361 @@ np_draw() {
   # Counted first, so the analyser knows its rows before the frame is painted
   # and both can go out in one write.
   [ "${#SPECROWS[@]}" -eq 0 ] && spec_render   # the first frame of all
+  # After spec_row, because the sleeve's height is bounded by where the analyser
+  # starts, and before the paint that both of them go out in.
+  art_tick
   spec_str
-  paint "$frame" "$SPECSTR"
+  paint "$frame" "$SPECSTR$ART_STR"
   drew=1
   return 0
 }
 
-# Hand mpv one file and reset everything that is about to be wrong about it.
-load_track() {  # load_track <row>
+# The cover as one string of cursor moves and half blocks, addressed to the empty
+# column beside the panel.
+#
+# Built as a string and emitted inside the same write as the panel, for the same
+# reason the analyser is: the paint that draws a frame ends every line with an
+# erase-to-end-of-line, which wipes everything to the right of the panel as it
+# goes. A cover printed after that write would be visibly absent for as long as
+# the terminal took to get between the two, once a second, for the whole record.
+#
+# The 256-colour fallback is not a plain nearest neighbour over the cube. That
+# palette is a coarse 6×6×6 cube with a fine 24-step grey ramp beside it, and a
+# nearly-grey pixel is quantised far better by the ramp than by the cube — which
+# is precisely the case of a black and white sleeve, where the cube alone bands it
+# into steps you can count. So each pixel is offered to both and takes whichever
+# lands closer, with a saturation guard so that a colour with any real chroma in
+# it is never dragged into the greys.
+#
+# No dithering. It was tried, at three amplitudes, and every one of them read as
+# visible checkerboard noise rather than as smoother colour — because the thing
+# being dithered here is not a pixel but a whole character cell, and at 32 cells
+# across there is nowhere for the error to hide.
+art_render() {  # art_render <cols> <rows>
+  local w=$1 h=$2 tc=0
+  case "${COLORTERM:-}" in truecolor|24bit) tc=1 ;; esac
+  ART_STR=$(
+    ffmpeg -v error -nostdin -i "$ART_FILE" \
+        -vf "scale=$w:$(( h * 2 )):flags=bilinear,format=rgb24" \
+        -f rawvideo -pix_fmt rgb24 - 2>/dev/null \
+      | od -An -tu1 -v \
+      | awk -v w="$w" -v h="$h" -v r0="$ART_ROW0" -v c0="$ART_COL0" -v tc="$tc" '
+        BEGIN {
+          split("0 95 135 175 215 255", LV, " ")     # the six levels of the cube
+          for (g = 0; g < 24; g++) GR[g] = 8 + g * 10
+        }
+        # Every working variable here is declared as an extra parameter, because
+        # awk has no other way to make one local — and a stray global in this
+        # file would be shared with the pixel counter below.
+        function near(v,   best, bd, k, d) {
+          best = 0; bd = 1e9
+          for (k = 1; k <= 6; k++) { d = v - LV[k]; if (d < 0) d = -d
+            if (d < bd) { bd = d; best = k - 1 } }
+          return best
+        }
+        function idx256(r, g, b,   cr, cg, cb, dc, gi, gv, dg, mx, mn) {
+          cr = near(r); cg = near(g); cb = near(b)
+          dc = (r-LV[cr+1])^2 + (g-LV[cg+1])^2 + (b-LV[cb+1])^2
+          mx = r; if (g > mx) mx = g; if (b > mx) mx = b
+          mn = r; if (g < mn) mn = g; if (b < mn) mn = b
+          if (mx - mn > 20) return 16 + 36*cr + 6*cg + cb   # too coloured to be grey
+          gi = int(((r + g + b) / 3 - 8) / 10 + 0.5)
+          if (gi < 0) gi = 0; if (gi > 23) gi = 23
+          gv = GR[gi]
+          dg = (r-gv)^2 + (g-gv)^2 + (b-gv)^2
+          if (dg < dc) return 232 + gi
+          return 16 + 36*cr + 6*cg + cb
+        }
+        { for (i = 1; i <= NF; i++) P[n++] = $i }
+        function sgr(kind, x, y,   o, r, g, b) {
+          o = (y * w + x) * 3; r = P[o]; g = P[o+1]; b = P[o+2]
+          if (tc == 1) return sprintf("\033[%d;2;%d;%d;%dm", kind, r, g, b)
+          return sprintf("\033[%d;5;%dm", kind, idx256(r, g, b))
+        }
+        END {
+          # A short read means ffmpeg could not decode it. Drawing what did
+          # arrive would put a black square beside the panel, which is a worse
+          # answer than no sleeve at all.
+          if (n < w * h * 6) exit
+          out = ""
+          for (ry = 0; ry < h; ry++) {
+            out = out sprintf("\033[%d;%dH", r0 + ry, c0)
+            # Colour changes are what this costs, not characters: the two SGRs
+            # for a cell are twelve times the size of the cell itself, and a
+            # sleeve has long runs that do not change. Only emit one when it
+            # actually differs from the one already in force.
+            pf = ""; pb = ""
+            for (x = 0; x < w; x++) {
+              fg = sgr(38, x, ry * 2); bg = sgr(48, x, ry * 2 + 1)
+              if (fg != pf) { out = out fg; pf = fg }
+              if (bg != pb) { out = out bg; pb = bg }
+              out = out "\342\226\200"                     # U+2580 UPPER HALF BLOCK
+            }
+            out = out "\033[0m"
+          }
+          printf "%s", out
+        }'
+  ) || { ART_STR=''; return 1; }
+  [ -n "$ART_STR" ] || return 1
+  return 0
+}
+
+# Whether there is a cover to draw yet, how big it can be, and — the once it
+# matters — drawing it.
+#
+# Called from every panel rebuild, which is about once a second, because the fetch
+# runs in the background and there is no other moment at which to notice that it
+# finished. What that costs on the frames where nothing has changed is one stat
+# and some arithmetic; the render itself happens once.
+#
+# The height is bounded by where the analyser starts. On a tall window that bound
+# never binds, but on a short one the analyser's rows would otherwise sit under
+# the bottom of the sleeve — and the analyser repaints its own rows nineteen times
+# a second with an erase-to-end-of-line on each, which would strobe a hole through
+# the picture. Keeping the sleeve above it means the only thing that ever erases
+# the cover is the full rebuild that redraws it in the same write.
+art_tick() {
+  local w h avail cap g
+  [ -n "$ART_FILE" ] || return 0
+  [ "$spec_row" -gt 0 ] || return 0
+  term_size
+  avail=$(( TERM_COLS - ART_COL0 + 1 ))
+  w=$avail
+  [ "$w" -gt 32 ] && w=32
+  # Two pixel rows to a cell and a cell twice as tall as it is wide, so a square
+  # cover is twice as many columns as rows.
+  h=$(( w / 2 ))
+  cap=$(( spec_row - ART_ROW0 ))
+  [ "$h" -gt "$cap" ] && h=$cap
+  w=$(( h * 2 ))
+  if [ "$w" -lt 12 ] || [ "$w" -gt "$avail" ]; then
+    ART_STR=''; ART_COLS=0; ART_ROWS=0; ART_GEOM=''
+    return 0
+  fi
+  g="$w.$h"
+  # A window that changed shape needs the picture resampled, not merely moved.
+  [ "$g" != "$ART_GEOM" ] && { ART_GEOM=$g; ART_STR=''; }
+  [ -n "$ART_STR" ] && return 0
+  [ -s "$ART_FILE" ] || return 0
+  if art_render "$w" "$h"; then
+    ART_COLS=$w; ART_ROWS=$h
+  else
+    # A cache entry that will not decode is one that will not decode next second
+    # either, so stop asking. It is cleared rather than deleted: another player
+    # may be part way through writing it.
+    ART_COLS=0; ART_ROWS=0; ART_FILE=''
+  fi
+  return 0
+}
+
+# What is under the pointer, and what that means.
+#
+# The panel's height is not fixed — the track list grows into the window, the
+# shelf lines come and go with the record, the status line appears and clears —
+# so none of these rows can be a constant. They are all counted off spec_row,
+# which np_draw has already worked out from the finished frame, and off the
+# header block, whose only variable part is the shelf. Reading the geometry from
+# the same two facts the drawing uses means the pointer cannot drift out of
+# agreement with what is actually on the screen.
+#
+# Relative to the analyser's first row, walking back up np_frame: the album meter
+# is one above it, its label two, a blank three, and the track meter four.
+mouse_at() {  # mouse_at <button> <col> <row> <M-or-m>
+  local b=$1 x=$2 y=$3 e=$4 j k first
+  [ "$e" = M ] || return 1          # releases say nothing a press has not said
+  [ "$spec_row" -gt 0 ] || return 1
+
+  # The wheel is not a button, whatever the encoding says. Over a panel whose
+  # one long list is the track list, scrolling means the same as the arrow keys.
+  case "$b" in
+    64) np_cur=$(( np_cur - 1 )); np_clamp; np_follow=0; return 0 ;;
+    65) np_cur=$(( np_cur + 1 )); np_clamp; np_follow=0; return 0 ;;
+  esac
+  # Left button only, pressed (0) or dragged (32). Middle and right have no
+  # meaning here, and answering them with a seek would be a nasty surprise.
+  [ "$b" -eq 0 ] || [ "$b" -eq 32 ] || return 1
+
+  # The meters. Both are drawn as two spaces, a bezel, $STRIP_WIDTH cells and the
+  # far bezel, so the first cell is column four and cell j is column 4 + j.
+  j=$(( x - 4 ))
+  if [ "$j" -ge 0 ] && [ "$j" -lt "$STRIP_WIDTH" ]; then
+    if [ "$y" -eq $(( spec_row - 1 )) ]; then
+      album_seek $(( j * TOTAL / STRIP_WIDTH )) $(( b == 32 )) || return 1
+      return 0
+    fi
+    if [ "$y" -eq $(( spec_row - 4 )) ] && [ "$tdur" -gt 0 ]; then
+      mpv_cmd "{\"command\":[\"seek\",$(( j * tdur / STRIP_WIDTH )),\"absolute\"]}"
+      return 0
+    fi
+  fi
+
+  # The track list. Five fixed header lines, the shelf lines when the record is
+  # on it, and the blank under them.
+  #
+  # A drag across the list is not a series of choices, so only a press counts
+  # here. And a press selects rather than plays: the first click moves the cursor
+  # and the second one on the same row starts it, which is the difference between
+  # reading the list with the pointer and being made to listen to whatever the
+  # pointer happened to land on.
+  [ "$b" -eq 0 ] || return 1
+  first=$(( 7 + COLL_ROWS ))
+  k=$(( y - first ))
+  if [ "$k" -ge 0 ] && [ "$k" -lt "$np_rows" ] \
+     && [ $(( np_top + k )) -lt "${#ORDER[@]}" ]; then
+    k=$(( np_top + k ))
+    if [ "$k" -eq "$np_cur" ]; then
+      np_follow=1
+      load_track "$k"
+    else
+      np_cur=$k
+      np_clamp
+      np_follow=0
+    fi
+    return 0
+  fi
+  return 1
+}
+
+# The whole record handed over at once, in the order the panel shows it, so that
+# the row a track sits on and its number in mpv's playlist are the same integer.
+# That identity is the reason the rest of this is short: the panel can follow the
+# music by watching one property instead of driving it a file at a time.
+#
+# append-play rather than append, because the first entry to land is the one that
+# starts the record and every one after it queues behind what is already playing.
+# Handing mpv the list in advance is also the only way the prefetch has anything
+# to prefetch — a file asked for at the moment the previous one ends is a file
+# being opened during the silence you were trying not to have.
+playlist_build() {
   local i f
+  mpv_cmd '{"command":["playlist-clear"]}'
+  i=0
+  while [ "$i" -lt "${#ORDER[@]}" ]; do
+    f=${FILES[${ORDER[$i]}]}
+    # JSON, so the path has to survive being one. Backslashes first, then quotes,
+    # or the escaping of the quotes gets escaped in turn.
+    f=${f//\\/\\\\}
+    f=${f//\"/\\\"}
+    mpv_cmd "{\"command\":[\"loadfile\",\"$f\",\"append-play\"]}"
+    i=$(( i + 1 ))
+  done
+  return 0
+}
+
+# Ask for a row. Nothing on the panel moves here: mpv answers by moving
+# playlist-pos, and enter_track — which is listening for that anyway, because a
+# track running out moves it too — does the work. One path in and out of a track
+# change, so a track started by hand and a track started by the record itself
+# cannot come to disagree about what is playing.
+load_track() {  # load_track <row>
+  [ "$1" -ge 0 ] && [ "$1" -lt "${#ORDER[@]}" ] || return 1
+  # Asking for a track by hand is how you say you want the deck running again,
+  # so it clears a failure and takes off the pause that failure put on. Without
+  # the unpause, picking another track after a bad one looks like a second
+  # failure: the row changes and nothing plays.
+  if [ "$failed" -eq 1 ]; then
+    failed=0
+    mpv_cmd '{"command":["set_property","pause",false]}'
+  fi
+  asked=1
+  mpv_cmd "{\"command\":[\"set_property\",\"playlist-pos\",$1]}"
+  return 0
+}
+
+# mpv could not open a file. Its answer is to walk straight on to the next entry,
+# which for a record whose tracks have all become unreadable means fifty failures
+# in about two seconds, playlist-pos falling off the end, and a panel that says
+# END OF ALBUM — the same thing it says when a record has simply finished. The
+# difference between "you have heard this" and "this is gone" is the whole of
+# what the panel is for, so the first failure stops the record where it stands.
+#
+# The file is looked at rather than guessed about, because the interesting case
+# is not a bad rip: it is a whole unpacked album disappearing underneath itself.
+# That is why scratch() no longer puts one in $TMPDIR — but a disk can still fill
+# and a directory can still be deleted by hand, and "the tracks are gone" is a
+# far more useful thing to be told than "the track would not play". It is also
+# the one that says what to do about it.
+# Which row is the failing one is not worth guessing at — mpv names no file in
+# the event, and whether the move to the entry that failed has come back through
+# playlist-pos yet is a matter of which order two messages happened to arrive in.
+# So the whole record is counted instead. It is fifty stats on a path that only
+# runs when something has already gone wrong.
+track_failed() {  # track_failed <the end-file record>
+  local i gone=0 what=''
+  [ "$failed" -eq 0 ] || return 0
+  failed=1
+  mpv_cmd '{"command":["set_property","pause",true]}'
+  # Not PAUSED, which is a deck waiting for you. This one is not waiting.
+  mode_label=STOPPED
+  for i in "${ORDER[@]:-}"; do
+    [ -n "$i" ] || continue
+    [ -f "${FILES[$i]}" ] || gone=$(( gone + 1 ))
+  done
+  if [ "$gone" -gt 0 ]; then
+    status="▪ $gone OF ${#ORDER[@]} TRACKS ARE NO LONGER ON DISK"
+    if [ -n "$WORK" ] && [ "$SRC_KIND" = zip ]; then
+      status="$status — THE UNPACKED COPY IS GONE. Q, THEN PLAY IT AGAIN"
+    else
+      status="$status — STOPPED HERE"
+    fi
+  else
+    [[ "$1" =~ \"file_error\":\"([^\"]*)\" ]] && what=" · ${BASH_REMATCH[1]}"
+    status="▪ CANNOT READ THIS TRACK$what — STOPPED HERE, ⏎ TO TRY ANOTHER"
+  fi
+  np_draw
+  return 0
+}
+
+# A point on the album meter, as somewhere to actually put the needle.
+#
+# The meter is the whole record, so a position on it is not a position in a file
+# — it names a track and an offset into that track, and landing on it may mean
+# changing tracks first. PRE is the running total of everything before each row,
+# so the row wanted is the last one that starts at or before the target.
+#
+# Within the track already playing this is a plain seek. Anywhere else it is a
+# track change with the offset left pending, for the same reason the resume key
+# leaves one: mpv moves playlist-pos before the new file is open, and a seek sent
+# alongside the move lands in the track being left rather than the one arriving.
+# The second argument is what a drag passes, and it means "only if this lands in
+# the track already playing". A drag reports a position for every cell the
+# pointer crosses, so without it one sweep of the meter would ask for a track
+# change per band it went over — and the loop can only have one such request
+# outstanding at a time. asked is a flag, not a queue: the reply to the second
+# request would arrive with the flag already spent and be read as the record
+# advancing on its own, which under shuffle means jumping somewhere nobody asked
+# for. So a drag scrubs inside the current track, where every position is a plain
+# seek and none of that arises, and a press is what moves between tracks.
+album_seek() {  # album_seek <album-seconds> [same-track-only]
+  local t=$1 r=0 n=${#ORDER[@]}
+  [ "$n" -gt 0 ] && [ "$TOTAL" -gt 0 ] || return 1
+  [ "$t" -lt 0 ] && t=0
+  [ "$t" -ge "$TOTAL" ] && t=$(( TOTAL - 1 ))
+  while [ $(( r + 1 )) -lt "$n" ] && [ "${PRE[$(( r + 1 ))]}" -le "$t" ]; do
+    r=$(( r + 1 ))
+  done
+  t=$(( t - PRE[r] ))
+  [ "$t" -lt 0 ] && t=0
+  if [ "$r" -eq "$cur_track" ]; then
+    mpv_cmd "{\"command\":[\"seek\",$t,\"absolute\"]}"
+  else
+    [ "${2:-0}" -eq 1 ] && return 1
+    # Pointing at a track is choosing it, so the cursor goes back to following
+    # the music — the same thing pressing Return on a row does.
+    np_follow=1
+    pend_seek=$t
+    load_track "$r"
+  fi
+  return 0
+}
+
+# A row became the one playing. Everything the panel was saying was about the
+# track before it, and this is where that is put right.
+enter_track() {  # enter_track <row>
+  local i
   [ "$1" -ge 0 ] && [ "$1" -lt "${#ORDER[@]}" ] || return 1
   cur_track=$1
   i=${ORDER[$cur_track]}
-  f=${FILES[$i]}
   pos=0
   ptenth=0
   tdur=${DURS[$i]}
@@ -2154,15 +3271,23 @@ load_track() {  # load_track <row>
   # The columns belong to the track that just ended, and starting the next one
   # at whatever height that one finished at reads as a glitch.
   spec_reset
+  # Where the record is now, written down before a note of the new track has
+  # played, so that quitting between tracks still comes back to the right one.
+  # saved_at moves with it, so the periodic write below has a truth to compare to
+  # rather than the last track's second count.
+  saved_at=0
+  resume_save "$cur_track" 0
   # Whatever the panel was saying was about the track before this one -- including
   # "end of album", which a track starting has just made untrue.
   status=''
   mode_label=$( [ "$paused" = true ] && printf PAUSED || printf PLAYING )
-  # JSON, so the path has to survive being one. Backslashes first, then quotes,
-  # or the escaping of the quotes gets escaped in turn.
-  f=${f//\\/\\\\}
-  f=${f//\"/\\\"}
-  mpv_cmd "{\"command\":[\"loadfile\",\"$f\",\"replace\"]}"
+  # The cursor follows the music unless you have gone off browsing on your own.
+  # Here rather than in a caller, because a track that started on its own has to
+  # move the cursor exactly as one started by hand does.
+  if [ "$np_follow" -eq 1 ] && [ "$np_cur" -ne "$cur_track" ]; then
+    np_cur=$cur_track
+    np_clamp
+  fi
   np_draw
   return 0
 }
@@ -2170,7 +3295,13 @@ load_track() {  # load_track <row>
 # The next row to play, which is not the same question as the next row down.
 next_track() {
   local n
-  if [ "$repeat" -eq 2 ]; then load_track "$cur_track"; return 0; fi
+  # Under REPEAT TRACK, "next" is this one from the top — asked for as a seek
+  # rather than as a move, because setting playlist-pos to the row it is already
+  # on is a no-op and the track would just carry on playing.
+  if [ "$repeat" -eq 2 ]; then
+    mpv_cmd '{"command":["seek",0,"absolute"]}'
+    return 0
+  fi
   if [ "$shuffle" -eq 1 ] && [ "${#ORDER[@]}" -gt 1 ]; then
     # A different track, chosen without a fork: $RANDOM is a builtin.
     n=$cur_track
@@ -2182,6 +3313,26 @@ next_track() {
     if [ "$repeat" -eq 1 ]; then n=0; else return 1; fi
   fi
   load_track "$n"
+  return 0
+}
+
+# Chosen for us: mpv has just walked on to the next entry by itself. Sequential
+# play is already right and already gapless, so the only thing worth interrupting
+# is shuffle — and interrupting it costs the seam, which is the trade shuffle
+# makes by its nature anyway.
+auto_advanced() {  # auto_advanced <row mpv moved to>
+  local n
+  if [ "$shuffle" -eq 1 ] && [ "${#ORDER[@]}" -gt 1 ]; then
+    # Anything but the track that just played. The row mpv moved to is the wrong
+    # one to rule out: it is merely the next one down the list, nobody has heard
+    # it, and excluding it while leaving cur_track in the draw is what lets the
+    # track that has this second finished come straight back round again.
+    n=$cur_track
+    while [ "$n" -eq "$cur_track" ]; do n=$(( RANDOM % ${#ORDER[@]} )); done
+    load_track "$n"
+    return 0
+  fi
+  enter_track "$1"
   return 0
 }
 
@@ -2198,19 +3349,33 @@ prev_track() {
   return 0
 }
 
-# A track ran out on its own. The end of the last one is the end of the album,
-# and the panel says so rather than quietly sitting there looking like it hung.
-track_ended() {
-  if next_track; then
-    # The cursor follows the music unless you have gone off browsing on your own.
-    # After the move, because next_track has already drawn the panel once.
-    if [ "$np_follow" -eq 1 ] && [ "$np_cur" -ne "$cur_track" ]; then
-      np_cur=$cur_track
-      np_clamp
-      np_draw
-    fi
+# The record ran out: mpv reached the end of the playlist and went idle, which it
+# reports by putting playlist-pos back to -1. The panel says so rather than
+# quietly sitting there looking like it hung.
+album_ended() {
+  local n
+  # Shuffle is not over just because the bottom row has played. mpv walks the
+  # playlist in order and falls off the end of it; under shuffle that means it
+  # ran out of entries to walk to, not that every track has had its turn — and
+  # the row it happened to fall off is only the last one by accident. Asked
+  # first, because a shuffled record ignores where the list ends.
+  if [ "$shuffle" -eq 1 ] && [ "${#ORDER[@]}" -gt 1 ]; then
+    n=$cur_track
+    while [ "$n" -eq "$cur_track" ]; do n=$(( RANDOM % ${#ORDER[@]} )); done
+    load_track "$n"
     return 0
   fi
+  # REPEAT ALBUM is handled here rather than by mpv's own loop-playlist, because
+  # this is also where shuffle has to be asked, and one place that decides what
+  # follows the last track is easier to be sure of than two.
+  if [ "$repeat" -eq 1 ] && [ "${#ORDER[@]}" -gt 0 ]; then
+    load_track 0
+    return 0
+  fi
+  # A record heard to the end is not a record you are partway through. Left as it
+  # was, the next time you reached for this one it would offer to drop you thirty
+  # seconds from the run-out groove.
+  resume_clear
   mode_label=FINISHED
   status='▪ END OF ALBUM — PRESS Q TO QUIT, ⏎ TO PLAY A TRACK'
   # The last reading mpv sent was a fraction before the end, and leaving it there
@@ -2268,6 +3433,16 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 [ "$SCREEN" -eq 1 ] || die "the panel needs a terminal at least ${NP_MIN_LINES} rows by $(( PANEL + 2 )) columns"
+
+# Both before the engine, because both are on the very first frame the panel
+# draws — and both after everything that names the album, because each is looked
+# up by what the record turned out to be rather than by where it came from.
+collection_lookup || true
+resume_load || true
+# The sleeve goes looking on its own and arrives whenever it arrives. Started
+# here so that a cover already in the cache is on the very first frame, and one
+# that has to be fetched does not hold the record up for a second of network.
+art_start || true
 
 engine_start
 play
