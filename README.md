@@ -135,7 +135,7 @@ See also [`data/`](data/README.md) and [`vendor/`](vendor/README.md).
 
 ## Also in this repo
 
-Four tools, none part of the site — the rest of the hobby, in order:
+Five tools, none part of the site — the rest of the hobby, in order:
 
 - **[bandcamp-wishlist](scripts/bandcamp-wishlist/README.md)** — bookmarklet
   that prices a Bandcamp wishlist, cheapest first.
@@ -145,6 +145,8 @@ Four tools, none part of the site — the rest of the hobby, in order:
   to CD-R. Gapless, CD-Text, track order from tags.
 - **[player](scripts/player/README.md)** — `player album.zip` plays a zip,
   folder, or the disc in the drive. burncd's twin.
+- **[aiff2flac](scripts/aiff2flac/README.md)** — `aiff2flac` repacks the AIFF
+  zips in `~/Downloads` as FLAC. Half the bytes, same audio.
 
 burncd and player draw the same panel out of the same
 [`scripts/lib/panel.sh`](scripts/lib/panel.sh), so neither is a single file you

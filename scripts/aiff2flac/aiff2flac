@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+#
+# aiff2flac — rewrite the AIFF zips in a folder as FLAC zips.
+#
+#   aiff2flac                  look through ~/Downloads, show the plan, ask
+#   aiff2flac ~/Music/inbox    somewhere else
+#   aiff2flac -n               dry run: list what would change, touch nothing
+#   aiff2flac -y               don't ask
+#   aiff2flac --keep           leave the AIFF zip where it is
+#   aiff2flac --rm             delete the AIFF zip outright, not to the Trash
+#   aiff2flac -j 4             how many tracks to encode at once (default: cores)
+#   aiff2flac -l 5             flac compression level 0-12 (default 8)
+#
+# A zip qualifies if it holds at least one .aiff or .aif. Everything else in it
+# — cover art, logs, cue sheets, the folder layout — is carried across
+# untouched; only the AIFF becomes FLAC, with its tags and embedded artwork.
+# Same audio, about half the bytes.
+#
+# Nothing is thrown away on a hope. The replacement zip is built beside the
+# original, unpacked again and tested, and only then does the original go to
+# the Trash and the new one take its name. A zip that fails anywhere in that
+# sequence is left exactly as it was found and reported at the end.
+#
+# macOS: the Trash is ~/.Trash and sizes come from BSD stat.
+
+set -euo pipefail
+
+APP=aiff2flac
+die() { printf '%s: %s\n' "$APP" "$1" >&2; exit 1; }
+
+# ---------------------------------------------------------------- arguments
+
+DIR=$HOME/Downloads
+DRY=0 ASSUME_YES=0 KEEP=0 HARD_RM=0 LEVEL=8
+JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    --keep)       KEEP=1 ;;
+    --rm)         HARD_RM=1 ;;
+    -j|--jobs)    JOBS=${2:?-j needs a number}; shift ;;
+    -l|--level)   LEVEL=${2:?-l needs a number}; shift ;;
+    -h|--help)    sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)           die "unknown option $1 (try --help)" ;;
+    *)            DIR=$1 ;;
+  esac
+  shift
+done
+
+[ -d "$DIR" ] || die "no such folder: $DIR"
+# Absolute from here on: the zip is written from inside the scratch directory,
+# so every path this script hands out has to survive a cd.
+DIR=$(cd "$DIR" && pwd -P) || die "cannot read $DIR"
+case $JOBS in ''|*[!0-9]*) die "-j wants a whole number" ;; esac
+case $LEVEL in ''|*[!0-9]*) die "-l wants a whole number" ;; esac
+[ "$JOBS" -ge 1 ] || JOBS=1
+[ "$KEEP" = 1 ] && HARD_RM=0
+
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is not installed (brew install ffmpeg)"
+command -v zip    >/dev/null 2>&1 || die "zip is not installed"
+command -v unzip  >/dev/null 2>&1 || die "unzip is not installed"
+
+if [ -t 1 ]; then B=$'\033[1m'; D=$'\033[2m'; G=$'\033[32m'; R=$'\033[31m'; Z=$'\033[0m'
+else B= D= G= R= Z=; fi
+
+# ------------------------------------------------------------------ helpers
+
+# Listing and unpacking both have two spellings, because zips written by
+# Windows tools and by Google Drive trip Info-ZIP often enough to be worth a
+# second opinion. bsdtar reads what unzip refuses to.
+list_zip() { unzip -Z1 -- "$1" 2>/dev/null || bsdtar -tf "$1" 2>/dev/null; }
+
+unpack_zip() {  # unpack_zip <zip> <dir>
+  unzip -qq -o -- "$1" -d "$2" 2>/dev/null && return 0
+  rm -rf "${2:?}"/* 2>/dev/null || true
+  ( cd "$2" && bsdtar -xf "$1" ) 2>/dev/null
+}
+
+has_aiff() { list_zip "$1" | grep -qiE '\.aiff?$'; }
+count_aiff() { list_zip "$1" | grep -ciE '\.aiff?$' || true; }
+
+bytes() { stat -f%z "$1" 2>/dev/null || echo 0; }
+
+tracks() { [ "$1" = 1 ] && printf '1 track' || printf '%s tracks' "$1"; }
+
+avail() { df -k "$1" | tail -1 | awk '{print $4 * 1024}'; }
+
+human() {  # human <bytes>
+  awk -v b="$1" 'BEGIN{
+    split("B KB MB GB TB",u," "); i=1
+    while (b>=1024 && i<5) { b/=1024; i++ }
+    printf (i==1 ? "%d %s" : "%.1f %s"), b, u[i]
+  }'
+}
+
+# One AIFF in, one FLAC out, source removed only once the FLAC exists. The
+# first pass carries any embedded cover across as an attached picture; some
+# ID3-in-AIFF art isn't something the flac muxer will take, so a failure there
+# falls back to audio and tags alone rather than losing the track.
+convert_one() {
+  local src=$1 dst=${1%.*}.flac
+  if ffmpeg -nostdin -v error -y -i "$src" \
+       -map 0:a -map '0:v?' -c:a flac -compression_level "$LEVEL" \
+       -c:v copy -map_metadata 0 "$dst" >/dev/null 2>&1 && [ -s "$dst" ]; then
+    rm -f "$src"; return 0
+  fi
+  rm -f "$dst"
+  if ffmpeg -nostdin -v error -y -i "$src" \
+       -map 0:a -c:a flac -compression_level "$LEVEL" -map_metadata 0 \
+       "$dst" >/dev/null 2>&1 && [ -s "$dst" ]; then
+    rm -f "$src"; return 0
+  fi
+  rm -f "$dst"
+  printf '  %s\n' "could not convert ${src##*/}" >&2
+  return 1
+}
+export -f convert_one
+export LEVEL
+
+# The name says AIFF as often as the files do. Rewrite the word where it
+# appears, and if it doesn't, the new zip simply inherits the old one's name.
+flac_name() {
+  printf '%s' "$1" | sed -e 's/AIFF/FLAC/g' -e 's/Aiff/Flac/g' -e 's/aiff/flac/g'
+}
+
+free_path() {  # free_path <path> — same name, or the next unused (2), (3)…
+  local p=$1 base=${1%.zip} n=2
+  while [ -e "$p" ]; do p="$base ($n).zip"; n=$((n + 1)); done
+  printf '%s' "$p"
+}
+
+# Trash, not rm, unless asked. A failure here is reported rather than quietly
+# promoted to a delete — losing an original is the one outcome worth aborting a
+# zip over, and Full Disk Access is a real reason mv into ~/.Trash can fail.
+to_trash() {  # to_trash <file>
+  [ "$HARD_RM" = 1 ] && { rm -f -- "$1"; return 0; }
+  local base; base=$(basename "$1")
+  # -n so an album already in the Trash isn't overwritten by this one, and the
+  # source is what gets tested afterwards: whether ~/.Trash can be read back
+  # depends on Full Disk Access, whether the file left doesn't.
+  mv -n -- "$1" "$HOME/.Trash/$base" 2>/dev/null || true
+  [ -e "$1" ] || return 0
+  mv -n -- "$1" "$HOME/.Trash/${base%.zip} $(date +%Y%m%d-%H%M%S).zip" 2>/dev/null || true
+  [ -e "$1" ] && return 1
+  return 0
+}
+
+# -------------------------------------------------------------------- survey
+
+printf '%sLooking through %s%s\n' "$B" "$DIR" "$Z"
+
+ZIPS=() ; COUNTS=() ; SIZES=()
+total_in=0
+while IFS= read -r -d '' z; do
+  has_aiff "$z" || continue
+  n=$(count_aiff "$z"); s=$(bytes "$z")
+  ZIPS+=("$z"); COUNTS+=("$n"); SIZES+=("$s")
+  total_in=$((total_in + s))
+  printf '  %s  %s%s, %s%s\n' "$(basename "$z")" "$D" "$(tracks "$n")" "$(human "$s")" "$Z"
+done < <(find "$DIR" -maxdepth 1 -type f -iname '*.zip' -print0 | sort -z)
+
+[ ${#ZIPS[@]} -eq 0 ] && { printf '%sNo AIFF zips here.%s\n' "$D" "$Z"; exit 0; }
+
+printf '\n%s%s, %s%s  %s%s free%s\n' \
+       "$B" "$([ ${#ZIPS[@]} = 1 ] && echo '1 zip' || echo "${#ZIPS[@]} zips")" \
+       "$(human "$total_in")" "$Z" "$D" "$(human "$(avail "$DIR")")" "$Z"
+
+if [ "$DRY" = 1 ]; then
+  printf '%sDry run — nothing touched.%s\n' "$D" "$Z"
+  exit 0
+fi
+
+if [ "$KEEP" = 1 ]; then       fate="originals kept"
+elif [ "$HARD_RM" = 1 ]; then  fate="originals deleted"
+else                           fate="originals to the Trash"
+fi
+
+if [ "$ASSUME_YES" != 1 ]; then
+  printf 'Convert to FLAC, %s? [y/N] ' "$fate"
+  read -r reply </dev/tty 2>/dev/null || reply=n
+  case $reply in [yY]*) ;; *) printf '%sNothing done.%s\n' "$D" "$Z"; exit 0 ;; esac
+fi
+
+# ------------------------------------------------------------------ the work
+
+WORK=
+cleanup() { [ -n "$WORK" ] && rm -rf -- "$WORK"; return 0; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
+
+done_n=0 failed=() total_out=0 total_conv=0
+
+for i in $(seq 0 $((${#ZIPS[@]} - 1))); do
+  zip_path=${ZIPS[$i]}
+  name=$(basename "$zip_path")
+  printf '\n%s%s%s\n' "$B" "$name" "$Z"
+
+  # Unpacked AIFF plus the FLAC being written alongside it comes to something
+  # under twice the zip; ask for twice and stop before filling the disk. The
+  # Trash sits on the same volume, so emptying it is what actually buys room.
+  need=$((${SIZES[$i]} * 2)); free=$(avail "$DIR")
+  if [ "$free" -lt "$need" ]; then
+    printf '  %sneeds %s free, %s left — skipped%s\n' \
+           "$R" "$(human "$need")" "$(human "$free")" "$Z"
+    failed+=("$name (disk space)"); continue
+  fi
+
+  # Beside the original, so the finished zip lands on the same volume and the
+  # move at the end is a rename rather than a copy of several hundred MB.
+  WORK=$(mktemp -d "$DIR/.aiff2flac.XXXXXX") || die "cannot write to $DIR"
+  src=$WORK/src; out=$WORK/out.zip
+  mkdir -p "$src"
+
+  if ! unpack_zip "$zip_path" "$src"; then
+    printf '  %sunreadable zip — left alone%s\n' "$R" "$Z"
+    failed+=("$name (unreadable)"); rm -rf "$WORK"; WORK=; continue
+  fi
+
+  printf '  %sencoding %s…%s\n' "$D" "$(tracks "${COUNTS[$i]}")" "$Z"
+  if ! find "$src" -type f \( -iname '*.aiff' -o -iname '*.aif' \) -print0 \
+       | xargs -0 -P "$JOBS" -I {} bash -c 'convert_one "$@"' _ {}; then
+    printf '  %sconversion failed — left alone%s\n' "$R" "$Z"
+    failed+=("$name (ffmpeg)"); rm -rf "$WORK"; WORK=; continue
+  fi
+
+  # FLAC and cover art are already compressed; deflating them again buys
+  # nothing and costs minutes across a folder this size.
+  #
+  # Names are fed in sorted, because zip -r would store the tracks in whatever
+  # order the parallel encode happened to finish and a zip listing itself out
+  # of order looks broken. A name with a newline in it can't go down that path,
+  # so count the files two ways, and take zip -r for the one case that differs.
+  nfiles=$(find "$src" -type f | wc -l)
+  nzero=$(find "$src" -type f -print0 | tr -cd '\0' | wc -c)
+  if [ "$nfiles" -eq "$nzero" ]; then
+    zipped=$( cd "$src" && find . -type f ! -name '.DS_Store' ! -path './__MACOSX/*' \
+              | sed 's|^\./||' | LC_ALL=C sort | zip -0 -q -X "$out" -@ && echo ok )
+  else
+    zipped=$( cd "$src" && zip -r -0 -q -X "$out" . -x '*.DS_Store' '__MACOSX/*' >/dev/null && echo ok )
+  fi
+  if [ "$zipped" != ok ]; then
+    printf '  %scould not write the new zip — left alone%s\n' "$R" "$Z"
+    failed+=("$name (zip)"); rm -rf "$WORK"; WORK=; continue
+  fi
+
+  # Read it back: the archive has to open, and it has to hold every file that
+  # went into it. A zip that unpacks cleanly but is a track short is the one
+  # failure that would otherwise go unnoticed until the original was gone.
+  want=$(find "$src" -type f ! -name '.DS_Store' ! -path "$src/__MACOSX/*" | wc -l)
+  got=$(unzip -Z1 "$out" 2>/dev/null | grep -cv '/$' || true)
+  if ! unzip -tqq "$out" >/dev/null 2>&1 || [ "$(($want))" -ne "$(($got))" ]; then
+    printf '  %snew zip did not verify — left alone%s\n' "$R" "$Z"
+    failed+=("$name (verify)"); rm -rf "$WORK"; WORK=; continue
+  fi
+
+  dest=$DIR/$(flac_name "$name")
+  if [ "$KEEP" = 1 ]; then
+    [ "$dest" = "$zip_path" ] && dest=${zip_path%.zip}" (FLAC).zip"
+    dest=$(free_path "$dest")
+  elif ! to_trash "$zip_path"; then
+    printf '  %scould not move the original out of the way — left alone%s\n' "$R" "$Z"
+    failed+=("$name (trash)"); rm -rf "$WORK"; WORK=; continue
+  else
+    [ "$dest" != "$zip_path" ] && dest=$(free_path "$dest")
+  fi
+
+  mv -- "$out" "$dest"
+  after=$(bytes "$dest"); total_out=$((total_out + after))
+  total_conv=$((total_conv + ${SIZES[$i]}))
+  done_n=$((done_n + 1))
+  printf '  %s✓%s %s  %s%s → %s%s\n' "$G" "$Z" "$(basename "$dest")" \
+         "$D" "$(human "${SIZES[$i]}")" "$(human "$after")" "$Z"
+
+  rm -rf "$WORK"; WORK=
+done
+
+# ------------------------------------------------------------------- report
+
+printf '\n%s%d of %d converted%s' "$B" "$done_n" "${#ZIPS[@]}" "$Z"
+[ "$done_n" -gt 0 ] && printf ' %s(%s → %s)%s' "$D" "$(human "$total_conv")" "$(human "$total_out")" "$Z"
+printf '\n'
+
+if [ ${#failed[@]} -gt 0 ]; then
+  printf '%sLeft as they were:%s\n' "$R" "$Z"
+  for f in "${failed[@]}"; do printf '  %s\n' "$f"; done
+  exit 1
+fi
+
+exit 0
