@@ -283,9 +283,27 @@ usage() {
 # to test: bash 3.2 is what ships with macOS, and printf '%d' "'字" there gives
 # the first byte of the character as a signed char, not its code point. Range
 # patterns over multibyte characters do work, so that is the mechanism.
+#
+# And some characters take no columns at all. macOS hands back decomposed text —
+# a filename or a tag written on this machine spells "Hôtel" as an o followed by
+# a combining circumflex — so ${#s} is one too many for every accent in a title,
+# and the durations on the row slide a place left for each of them. Variation
+# selectors are the same story with emoji.
+#
+# These ranges are written as byte escapes rather than as themselves, because a
+# combining mark typed into this file would land on the bracket in front of it
+# and the source would read as mojibake. In order: Combining Diacritical Marks,
+# their Extended and Supplement blocks, the marks for symbols, and the variation
+# selectors together with the combining half marks.
+ZW1=$'[\xcc\x80-\xcd\xaf]'
+ZW2=$'[\xe1\xaa\xb0-\xe1\xab\xbf]'
+ZW3=$'[\xe1\xb7\x80-\xe1\xb7\xbf]'
+ZW4=$'[\xe2\x83\x90-\xe2\x83\xb0]'
+ZW5=$'[\xef\xb8\x80-\xef\xb8\xaf]'
 CW=1
 cwidth() {  # cwidth <character> -> $CW
   case "$1" in
+    $ZW1|$ZW2|$ZW3|$ZW4|$ZW5) CW=0 ;;
     [⺀-〿]|[぀-ヿ]|[一-鿿]|[가-힣]|[！-｠]|[🀀-🿿]) CW=2 ;;
     *) CW=1 ;;
   esac
@@ -295,11 +313,13 @@ cwidth() {  # cwidth <character> -> $CW
 # character in it anywhere, and for that ${#s} is already the answer — so ask
 # that question of the whole string once, and only walk it character by character
 # if the answer is yes. Same ranges as cwidth, written as a substring test; they
-# have to stay in step.
+# have to stay in step — the zero-column ones included, or an accented title
+# takes the fast path and comes back one column too wide for every accent.
 WCOLS=0
 wcols() {  # wcols <string> -> $WCOLS
   local s=$1 i=0 n=0
   case "$s" in
+    *$ZW1*|*$ZW2*|*$ZW3*|*$ZW4*|*$ZW5*) ;;
     *[⺀-〿]*|*[぀-ヿ]*|*[一-鿿]*|*[가-힣]*|*[！-｠]*|*[🀀-🿿]*) ;;
     *) WCOLS=${#s}; return 0 ;;
   esac
