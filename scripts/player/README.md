@@ -242,9 +242,16 @@ few seconds and press `r`. If it never mounts, `drutil status` says whether the
 drive sees it at all. A data disc is correctly ignored; this plays CDDA, not a
 folder of mp3s on a CD-R (point `player` at the mounted volume for that).
 
-**A CD plays but every track is "Track 01".** No CD-Text and MusicBrainz didn't
-recognise it. Check the network, then that `curl` and `jq` are installed. Some
-discs genuinely aren't in the database.
+**A CD plays but every track is "Track 01".** No CD-Text, and MusicBrainz didn't
+recognise the disc. If *every* disc does this, you're on a build from before the
+disc ID was fixed: it hashed the wrong bytes, so every lookup asked about a
+fingerprint no catalogue has ever held and nothing was ever going to come back.
+Update, and don't go hunting through your network or your `jq` install — this
+entry used to send people there, and it was never the cause. If it's one disc
+among others that resolve fine, then it's a real miss: the ID fingerprints the
+*pressing*, so a reissue or a different mastering is a different disc, and plenty
+of them simply aren't in the database. `curl` and `jq` still have to be installed
+for the answer to be read at all — `--check` lists both.
 
 **CD-Text is there but player doesn't see it.** cdrtools has to be able to open
 the drive, and `--check` only confirms it's installed. Run `cdrecord -scanbus`

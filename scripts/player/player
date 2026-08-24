@@ -2161,7 +2161,7 @@ mb_discid() {  # mb_discid -> $DISCID, $MB_TOC
   done
 
   # base64 of the raw SHA-1, then MusicBrainz's own alphabet: + / = become . _ -
-  DISCID=$(printf '%s' "$hex" | xxd -r -p 2>/dev/null | shasum -b 2>/dev/null \
+  DISCID=$(printf '%s' "$hex" | shasum -b 2>/dev/null \
     | cut -d' ' -f1 | xxd -r -p 2>/dev/null | base64 2>/dev/null \
     | tr '+/=' '._-' | tr -d '\n')
   [ -n "$DISCID" ] || return 1
