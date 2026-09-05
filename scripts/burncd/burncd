@@ -455,7 +455,14 @@ while IFS= read -r f; do
   # Dates are often full ISO stamps; the year is the only part anyone labels with.
   [ -z "$YEAR" ] && YEAR="${year%%-*}"
 done < <(
-  find "$DIR" -maxdepth 1 -type f \
+  # "._Track.flac" beside "Track.flac" is an AppleDouble sidecar: the resource
+  # fork and Finder metadata, split out into its own 4K file because the volume
+  # has no forks of its own. Every album copied to an exFAT or FAT drive carries
+  # a full set of them, and they end in .flac like the real thing, so the name
+  # filter alone lets all thirteen of them through and the first one kills the
+  # run. They are filesystem bookkeeping, not tracks — drop them here, quietly,
+  # the way .DS_Store is dropped everywhere else.
+  find "$DIR" -maxdepth 1 -type f ! -name '._*' \
     \( -iname '*.aif' -o -iname '*.aiff' -o -iname '*.flac' -o -iname '*.mp3' \
     -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav'  -o -iname '*.m4a' \
     -o -iname '*.wma' -o -iname '*.ape'  -o -iname '*.alac' \) | LC_ALL=C sort

@@ -1000,8 +1000,17 @@ AUDIO_GLOB=( -iname '*.aif' -o -iname '*.aiff' -o -iname '*.flac' -o -iname '*.m
              -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wav' -o -iname '*.m4a'
              -o -iname '*.wma' -o -iname '*.ape'  -o -iname '*.alac' -o -iname '*.mp4' )
 
+# "._Track.flac" beside "Track.flac" is an AppleDouble sidecar: the resource fork
+# and Finder metadata, split into their own 4K file because the volume has no
+# forks of its own. Any album copied to an exFAT or FAT drive carries a full set,
+# and they end in .flac like the real thing — left in, they double every folder's
+# track count in the picker and stretch the reading bar over files that were
+# never going to play. Filesystem bookkeeping, dropped the way .DS_Store is.
+NO_SIDECAR=( ! -name '._*' )
+
 audio_count() {  # audio_count <dir>
-  find "$1" -maxdepth 1 -type f \( "${AUDIO_GLOB[@]}" \) 2>/dev/null | wc -l | tr -d ' '
+  find "$1" -maxdepth 1 -type f "${NO_SIDECAR[@]}" \( "${AUDIO_GLOB[@]}" \) 2>/dev/null \
+    | wc -l | tr -d ' '
 }
 
 # ------------------------------------------------------------------ picker --
@@ -1372,7 +1381,8 @@ read_metadata() {
   FILES=(); DURS=(); TITLES=(); ARTISTS=(); TRKNOS=(); DISCNOS=()
   ALBUM=""; ALBUM_ARTIST=""; YEAR=""; UNTAGGED=0; TOTAL=0
 
-  total=$(find "$AUDIO_DIR" -type f \( "${AUDIO_GLOB[@]}" \) 2>/dev/null | wc -l | tr -d ' ')
+  total=$(find "$AUDIO_DIR" -type f "${NO_SIDECAR[@]}" \( "${AUDIO_GLOB[@]}" \) 2>/dev/null \
+    | wc -l | tr -d ' ')
   [ "${total:-0}" -gt 0 ] || die "no audio in $SRC_LABEL"
 
   while IFS= read -r f; do
@@ -1442,7 +1452,8 @@ read_metadata() {
 
     n=$(( n + 1 ))
     load_stage "READING · $(( n * 100 / total ))%" "$n" "$total" "$(basename "$f")"
-  done < <(find "$AUDIO_DIR" -type f \( "${AUDIO_GLOB[@]}" \) 2>/dev/null | LC_ALL=C sort)
+  done < <(find "$AUDIO_DIR" -type f "${NO_SIDECAR[@]}" \( "${AUDIO_GLOB[@]}" \) 2>/dev/null \
+    | LC_ALL=C sort)
 
   [ "${#FILES[@]}" -gt 0 ] || die "no readable audio in $SRC_LABEL"
 
