@@ -12,7 +12,9 @@ screen. Space pauses, arrows seek, `q` quits — and the scratch directory goes
 with it, leaving only the zip you started with.
 
 burncd's twin, literally: same panel, same amber, same meters, out of the same
-[`../lib/panel.sh`](../lib/panel.sh).
+[`../lib/panel.sh`](../lib/panel.sh). It shares a second file with
+[ripper](../ripper) too — [`../lib/disc.sh`](../lib/disc.sh), which is what both
+of them ask what album is in the drive.
 
 ## Setup
 

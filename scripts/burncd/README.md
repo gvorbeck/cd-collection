@@ -23,7 +23,9 @@ You also need a USB optical drive — no Mac has had a built-in burner in years.
 
 burncd is two files, not one: the panel — geometry, palette, meters, key
 reading — lives in [`../lib/panel.sh`](../lib/panel.sh), shared with
-[player](../player). The symlink above is resolved back to the real path, so it
+[player](../player) and [ripper](../ripper). ripper is this one backwards: it
+reads a disc into exactly the folder burncd takes, so the two of them copy a CD
+between them. The symlink above is resolved back to the real path, so it
 finds it; copying `burncd` somewhere on its own doesn't.
 
 ## Usage

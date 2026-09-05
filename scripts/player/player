@@ -67,9 +67,14 @@ while [ -L "$SELF" ]; do
   case "$LINK" in /*) SELF=$LINK ;; *) SELF=$(dirname "$SELF")/$LINK ;; esac
 done
 LIB=$( (cd "$(dirname "$SELF")/../lib" && pwd) 2>/dev/null || true )
-[ -n "$LIB" ] && [ -r "$LIB/panel.sh" ] \
+[ -n "$LIB" ] && [ -r "$LIB/panel.sh" ] && [ -r "$LIB/disc.sh" ] \
   || { printf 'player: cannot find lib/panel.sh alongside %s\n' "$SELF" >&2; exit 1; }
 . "$LIB/panel.sh"
+# What the disc in the drive is, and what its sleeve looks like: the table of
+# contents, CD-Text, MusicBrainz and the Cover Art Archive. Shared with ripper,
+# which asks the same drive the same questions a moment earlier. Sourced after
+# panel.sh, which is where its qgrep and detect_dev come from.
+. "$LIB/disc.sh"
 
 # Both tools talk to the same drive, so a device pinned for one is a device
 # pinned for the other. PLAYER_DEV still wins where someone has set only that.
@@ -339,6 +344,11 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# The library holds the switch that keeps every lookup off the network; --no-mb
+# is this tool's name for it. Assigned here rather than at the declaration above
+# because the flag has only just been read.
+DISC_USE_MB="$USE_MB"
 
 # ------------------------------------------------------------- health check --
 
@@ -953,71 +963,14 @@ spec_synth() {  # spec_synth <frame>
 # the picker prints, detail the dim column on its right.
 SRC=()
 
-# An audio CD, as macOS presents one: mounted as a volume of .aiff tracks by the
-# CDDA filesystem, which is what makes a disc playable with no ripping step at
-# all. drutil is asked first because it knows about a disc that has not finished
-# mounting, and it is what tells a blank CD-R apart from an album.
-CD_VOLUME=''
-
-# Whether the drive has anything in it at all. drutil answers for the drive
-# rather than for the filesystem, so it is the one thing that can tell an empty
-# bay from a disc that has not finished mounting.
-optical_media() {
-  local t
-  command -v drutil >/dev/null || return 1
-  t=$( (drutil status 2>/dev/null || true) | awk -F: '/Type:/ { print $2; exit }' )
-  t=$( printf '%s' "$t" | tr -d ' ' )
-  case "$t" in ''|[Nn]o*) return 1 ;; esac
-  return 0
-}
-
-find_cd() {
-  local line dev rest mp opts v n
-  CD_VOLUME=''
-
-  # The answer that comes from the kernel rather than from what a directory
-  # happens to hold: macOS mounts an audio CD with the CDDA filesystem, and
-  # nothing else on the machine uses it.
-  #
-  # Split off the device on the first " on " and the options on the last " (":
-  # a device node has no spaces in it, so the front is exact, and taking the
-  # last bracket leaves a volume called "Live (Remastered)" with its own name.
-  while IFS= read -r line; do
-    case "$line" in *' on '*) ;; *) continue ;; esac
-    dev=${line%% on *}; rest=${line#* on }
-    mp=${rest% (*}; opts=${rest##* (}
-    case "$opts" in cddafs,*|cddafs\)*) ;; *) continue ;; esac
-    [ -d "$mp" ] || continue
-    CD_VOLUME="$mp"; return 0
-  done < <(mount 2>/dev/null || true)
-
-  # Some discs mount as a plain volume of named tracks instead, so a volume of
-  # nothing but .aiff files is still worth offering — but only once the drive
-  # has said it has a disc in it. A directory listing cannot tell an album from
-  # an external drive of field recordings; the drive can, and without asking it
-  # that drive gets announced as "in the drive" and then has CD-Text and
-  # MusicBrainz answers about some entirely other disc applied to its files.
-  optical_media || return 1
-
-  for v in /Volumes/*; do
-    [ -d "$v" ] || continue
-    n=$( (ls "$v" 2>/dev/null || true) | grep -ic '\.aiff\?$' || true )
-    [ "${n:-0}" -gt 0 ] || continue
-    if (ls "$v" 2>/dev/null || true) | qgrep -i 'Audio Track'; then
-      CD_VOLUME="$v"; return 0
-    fi
-    [ "${n:-0}" -ge 2 ] && { CD_VOLUME="$v"; return 0; }
-  done
-  return 1
-}
 
 scan_sources() {
   local d z n dirs
   SRC=()
 
   if find_cd; then
-    n=$( (ls "$CD_VOLUME" 2>/dev/null || true) | grep -ic '\.aiff\?$' || true )
-    SRC+=("cd	$CD_VOLUME	$(basename "$CD_VOLUME")	${n:-0} tracks · in the drive")
+    n=$( (ls "$DISC_VOLUME" 2>/dev/null || true) | grep -ic '\.aiff\?$' || true )
+    SRC+=("cd	$DISC_VOLUME	$(basename "$DISC_VOLUME")	${n:-0} tracks · in the drive")
   fi
 
   dirs="${PLAYER_DIRS:-$HOME/Music:$HOME/Downloads}"
@@ -1548,7 +1501,7 @@ RESUME_POS=0
 # still the same album, and a key made out of the path would lose them both.
 resume_key() {
   local s
-  if [ -n "${DISCID:-}" ]; then printf 'd:%s' "$DISCID"; return 0; fi
+  if [ -n "${DISC_DISCID:-}" ]; then printf 'd:%s' "$DISC_DISCID"; return 0; fi
   s=$(printf '%s|%s|%s|%s' "$ALBUM_ARTIST" "$ALBUM" "${#ORDER[@]}" "$TOTAL")
   printf 'a:%s' "$(printf '%s' "$s" | shasum 2>/dev/null | cut -c1-16)"
   return 0
@@ -1765,210 +1718,16 @@ EOF
 # terminal says it has it and the 256-colour cube when it does not — see
 # art_render_blocks for why that fallback is not a plain nearest colour.
 ART_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/player/art"
-MB_RELEASE=''
 
 # USE_ART and ART_PROTO are settled much earlier, above the --check gate, because
 # the health check reports which renderer this terminal is getting.
-ART_KEY=''; ART_FILE=''
+ART_FILE=''
 ART_STR=''; ART_COLS=0; ART_ROWS=0
 ART_GEOM=''
 # What is on the screen, as against what has been rendered: ART_STR is the sleeve
 # and ART_OUT is the part of it this frame actually has to say.
 ART_OUT=''; ART_SHOWN=''; ART_SHOWN_H=0
 
-# What this record is called on disk, so an album fetched once is not fetched
-# again. The release ID when a disc gave us one, because that names a pressing
-# exactly; otherwise the artist and the title folded down to letters and digits,
-# so that the same album tagged two slightly different ways lands on one file.
-art_key() {
-  local s
-  if [ -n "$MB_RELEASE" ]; then s="mbid-$MB_RELEASE"; else s="${ALBUM_ARTIST}-${ALBUM}"; fi
-  s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')
-  s=${s#-}; s=${s%-}; s=${s:0:80}; s=${s%-}
-  [ -n "$s" ] || return 1
-  printf '%s' "$s"
-  return 0
-}
-
-# Candidate releases for a record that did not come out of the drive.
-#
-# A zip or a folder has tags and nothing else, so there is no disc ID to be exact
-# with and the archive has to be asked by name. What comes back is a list rather
-# than an answer, because an album is in MusicBrainz once per pressing — the
-# original, the remaster, the European issue — and cover art is filed against a
-# pressing rather than against the album. The first hit is quite often the one
-# nobody ever scanned, so the fetch below walks the list until something has a
-# front on it.
-#
-# The terms are matched as quoted phrases, which is strict on purpose: asked for
-# an artist and an album that do not belong together, the catalogue answers with
-# nothing rather than with its best guess. That is the property this depends on —
-# a wrong cover drawn confidently beside the panel would be worse than none, and
-# this is what makes that outcome unlikely enough not to need guarding against.
-#
-# --data-urlencode rather than pasting into the URL: titles carry ampersands,
-# spaces and question marks, every one of which means something else in a query
-# string. Quotes are stripped out of the terms first — they are the Lucene syntax
-# that holds the phrase together, so a title containing one of its own would close
-# the phrase early and leave the rest of the title parsed as query operators.
-#
-# Asked twice, because an empty answer is at least as often the server as the
-# catalogue. MusicBrainz rate-limits to about a request a second and says so with
-# a 503 whose body is an error rather than a release list, and its search index
-# times out often enough to have done it twice while this was being written. Both
-# arrive here as no results, and both are usually gone a second later. A pairing
-# that genuinely is not in the catalogue answers twice over, which costs one
-# spare request on a record that was never going to have a cover anyway.
-mb_query() {  # mb_query <artist> <album>
-  local q a=${1//\"/} b=${2//\"/} out try
-  [ -n "$b" ] || return 1
-  if [ -n "$a" ]; then q="artist:\"$a\" AND release:\"$b\""; else q="release:\"$b\""; fi
-  for try in 1 2; do
-    out=$(curl -sS -m 15 -G -A 'player/1.0 ( https://github.com/gvorbeck )' \
-        --data-urlencode "query=$q" --data 'fmt=json' --data 'limit=5' \
-        'https://musicbrainz.org/ws/2/release' 2>/dev/null \
-      | jq -r '.releases[]?.id // empty' 2>/dev/null)
-    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
-    sleep 1
-  done
-  return 1
-}
-
-mb_release_search() {
-  local b
-  [ "$USE_MB" = 1 ] || return 1
-  [ -n "$ALBUM" ] || return 1
-  mb_query "$ALBUM_ARTIST" "$ALBUM" && return 0
-  # An untagged folder or zip has no title, only the name whoever made it gave
-  # the file — "Comfort Eagle (1998) [FLAC]", "OK_Computer_(Remastered)". The
-  # catalogue is matching a phrase against a real title, and none of that is in
-  # the title, so the whole query misses on one bracket.
-  b=$(printf '%s' "$ALBUM" \
-      | sed -E 's/[[({][^])}]*[])}]//g; s/_+/ /g; s/  +/ /g; s/^ +//; s/ +$//')
-  [ -n "$b" ] && [ "$b" != "$ALBUM" ] && { mb_query "$ALBUM_ARTIST" "$b" && return 0; }
-  # The other half of the same convention: the folder is "Artist - Album", which
-  # is both fields inside the one that is meant to be the title. Only worth trying
-  # when there is no artist tag standing to contradict it.
-  case "$b" in
-    *' - '*) [ -z "$ALBUM_ARTIST" ] && { mb_query "${b%% - *}" "${b#* - }" && return 0; } ;;
-  esac
-  return 1
-}
-
-# Whether what came back is actually a picture.
-#
-# The Cover Art Archive answers with a redirect to the Internet Archive, and those
-# nodes are not always well. A sick one has been seen serving an nginx error page
-# under a 200 — and, worse, serving it labelled image/jpeg. Neither the status
-# line nor the content type can be believed, so the only test worth making is
-# whether a decoder can read the bytes, and that is the test.
-art_ok() {  # art_ok <file> [min-side]
-  local wh
-  [ -s "$1" ] || return 1
-  wh=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
-       -of csv=p=0 "$1" 2>/dev/null || true)
-  # ffprobe prints "500,500" for a picture and "0,0" for something it opened but
-  # could not measure, which is why this cannot just look for a digit.
-  case "$wh" in ''|0,0|*,0|0,*|*[!0-9,]*) return 1 ;; esac
-  # The archive only ever sends one size, so the floor is for the pictures found
-  # lying next to the record, where a logo or a thumbnail is as likely as a scan.
-  [ -n "${2:-}" ] || return 0
-  [ "${wh%%,*}" -ge "$2" ] && [ "${wh##*,}" -ge "$2" ]
-}
-
-# A record the archive has no cover for, remembered — but not for ever. Without
-# this, an album with no scan costs two lookups on the network every single time
-# it is played. Forgotten after a fortnight, so a cover uploaded in the meantime
-# still turns up.
-art_none_fresh() {
-  local f="$ART_FILE.none"
-  [ -f "$f" ] || return 1
-  [ -n "$(find "$f" -mtime +14 2>/dev/null)" ] && { rm -f "$f"; return 1; }
-  return 0
-}
-
-# Fetch a front cover and leave it where the panel can find it.
-#
-# Every part of this is allowed to fail and none of it is allowed to be noticed.
-# It runs in the background from the moment the record starts, so the album is
-# already playing while this is still deciding whether there is a cover at all —
-# and when there is not, nothing about the panel changes.
-#
-# Downloaded beside the cache entry and moved onto it, so a file in the cache is
-# always a whole one: the panel tests for the file and nothing else, and half a
-# JPEG would be read as the cover and drawn as rubbish. The part file is named
-# after the album rather than after this process, so a fetch that is killed
-# mid-download leaves one file that the next attempt at the same record
-# overwrites, instead of a new one every time.
-art_fetch() {
-  local id ids tmp try n=0
-  set +e
-  tmp="$ART_FILE.part"
-  if [ -n "$MB_RELEASE" ]; then ids=$MB_RELEASE; else ids=$(mb_release_search); fi
-  for id in $ids; do
-    n=$(( n + 1 ))
-    [ "$n" -gt 5 ] && break
-    # Twice per candidate. A first failure is more often a sick archive node than
-    # a missing cover, and the redirect lands on a different node next time.
-    for try in 1 2; do
-      rm -f "$tmp"
-      curl -sSL -m 25 -o "$tmp" -A 'player/1.0 ( https://github.com/gvorbeck )' \
-        "https://coverartarchive.org/release/$id/front-500" 2>/dev/null
-      art_ok "$tmp" && { mv -f "$tmp" "$ART_FILE" 2>/dev/null && return 0; }
-    done
-  done
-  rm -f "$tmp"
-  : > "$ART_FILE.none" 2>/dev/null
-  return 1
-}
-
-ART_GLOB=( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp'
-           -o -iname '*.gif' -o -iname '*.bmp'  -o -iname '*.tif' -o -iname '*.tiff' )
-
-# The sleeve the record came with, if it came with one.
-#
-# Worth looking for before the network is asked anything, and worth preferring to
-# what comes back: this is the artwork that shipped with this copy, where the
-# archive can only offer a scan of whichever release the album name matched — and
-# the name is the weakest thing there is to match on.
-#
-# What it is called is the whole difficulty. Rips settle on cover or folder or
-# front; Bandcamp names its picture "Artist - Album.jpg", which is no convention
-# at all. So the known names are ranked first and everything else is still
-# allowed after them, shallowest path first. The scans that are definitely not
-# the front — the back, the booklet, the face of the disc — are thrown out
-# rather than ranked last, because drawing one of those confidently beside the
-# panel is worse than the network answer they would have displaced.
-art_local() {
-  local f
-  [ -n "$AUDIO_DIR" ] && [ -d "$AUDIO_DIR" ] || return 1
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    # 200 is well under the 500 the archive sends and well over anything that is
-    # really a thumbnail or a label logo.
-    if art_ok "$f" 200; then printf '%s' "$f"; return 0; fi
-  done < <(
-    find "$AUDIO_DIR" -maxdepth 3 -type f \( "${ART_GLOB[@]}" \) 2>/dev/null |
-      awk -F/ '
-        {
-          base = tolower($NF)
-          sub(/\.[^.]*$/, "", base)
-          # Separators folded to spaces so the words can be matched as words:
-          # "front-cover" is a front cover, and "discovery" is not a disc.
-          gsub(/[_ -]+/, " ", base)
-          if (base ~ /(^| )(back|inlay|booklet|tray|obi|spine|label|matrix|inside|thumb|thumbnail)( |$)/) next
-          if (base ~ /(^| )(disc|cd|dvd)[0-9]*( |$)/) next
-          if (base ~ /^(cover|front|folder|album|albumart|artwork|sleeve)$/) rank = 1
-          else if (base ~ /(^| )(cover|front)( |$)/) rank = 2
-          else if (base ~ /(cover|front)/) rank = 3
-          else rank = 4
-          print rank "\t" NF "\t" $0
-        }' |
-      LC_ALL=C sort -t"$(printf '\t')" -k1,1n -k2,2n -k3,3 |
-      cut -f3-
-  )
-  return 1
-}
 
 # The picture inside the tags, when there is no picture beside the record.
 #
@@ -2003,7 +1762,7 @@ art_embedded() {
 
 # Decide there is a cover to look for, and go and look in the background.
 art_start() {
-  ART_STR=''; ART_KEY=''; ART_FILE=''
+  ART_STR=''; ART_FILE=''
   [ "$USE_ART" = 1 ] || return 0
   [ "$UTF8" -eq 1 ] || return 0
   command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || return 0
@@ -2017,22 +1776,24 @@ art_start() {
   # has both usually has the scan in the file and the thumbnail in the tag. When
   # it is the other way round the size floor in art_ok catches it: the small one
   # is refused and the next candidate down is tried.
-  if ART_FILE=$(art_local); then return 0; fi
+  if ART_FILE=$(art_local "$AUDIO_DIR"); then return 0; fi
   # Here rather than inside art_embedded, which is run in a command substitution:
   # scratch() reports the directory it made by setting $WORK, and a $WORK set in
   # a subshell is a scratch directory nothing afterwards knows to clean up.
   scratch
   if ART_FILE=$(art_embedded); then return 0; fi
-  command -v curl >/dev/null && command -v jq >/dev/null || return 0
-  [ -n "$ALBUM" ] || return 0
-  mkdir -p "$ART_CACHE" 2>/dev/null || return 0
-  ART_KEY=$(art_key) || { ART_KEY=''; return 0; }
-  ART_FILE="$ART_CACHE/$ART_KEY.jpg"
-  # Already on disk from a previous session, or already known not to exist. Either
-  # way there is nothing to ask the network; art_tick finds the file by itself.
-  [ -s "$ART_FILE" ] && return 0
-  art_none_fresh && return 0
-  ( art_fetch >/dev/null 2>&1 ) &
+  # Nothing beside the record and nothing in its tags, so the archive is the only
+  # answer left and the library goes and asks it. What comes back is a path that
+  # may not exist yet — art_tick tests for the file every rebuild, and that stat
+  # is the whole of the handshake.
+  #
+  # A record off the drive has already had these filled in by the disc lookup,
+  # and for a zip or a folder they are what the tags said; either way the cache
+  # key is worked out from them, so they are handed over before the fork rather
+  # than read out of player's own names afterwards.
+  DISC_ALBUM="$ALBUM"; DISC_ALBUM_ARTIST="$ALBUM_ARTIST"
+  disc_cover_start "$ART_CACHE"
+  ART_FILE="$DISC_COVER_FILE"
   return 0
 }
 
@@ -2053,187 +1814,16 @@ art_start() {
 #
 # Whichever answered is printed on the faceplate. A track list is only as good as
 # its source, and "CD-TEXT" and "MUSICBRAINZ" are different degrees of certain.
-# CD-Text off the disc, into TITLES/ARTISTS/ALBUM. cdrtools prints it in a couple
-# of shapes depending on version, so both are matched and neither is required.
 #
-# Every value on the disc arrives inside single quotes, and the quote that ends
-# one is the one before " from '" or the one at the end of the line — not simply
-# the next one along. Matching to the next one along cuts "Don't Stop Me Now"
-# down to "Don", which is a title the disc does not have and no way to tell that
-# from a disc that really is called that.
-cd_text() {
-  local out line name n i got=0 titles=0
-  command -v cdrecord >/dev/null || command -v cdda2wav >/dev/null || return 1
-  detect_dev || true
-
-  out=''
-  if command -v cdda2wav >/dev/null; then
-    out=$( (cdda2wav dev="$DEV" -J -v titles 2>&1) || true )
-  fi
-  if ! printf '%s' "$out" | qgrep -i 'title'; then
-    command -v cdrecord >/dev/null && out=$( (cdrecord dev="$DEV" -toc -v 2>&1) || true )
-  fi
-  [ -n "$out" ] || return 1
-
-  # "Album title: 'Nonagon Infinity' from 'King Gizzard'"
-  line=$(printf '%s\n' "$out" \
-    | sed -n -e "s/^Album title:[ ]*'\(.*\)'[ ]*from[ ]*'.*'[ ]*\$/\1/p" \
-             -e "s/^Album title:[ ]*'\(.*\)'[ ]*\$/\1/p" | head -1)
-  [ -n "$line" ] && { ALBUM="$line"; got=1; }
-  line=$(printf '%s\n' "$out" \
-    | sed -n "s/^Album title:.*'[ ]*from[ ]*'\(.*\)'[ ]*\$/\1/p" | head -1)
-  [ -n "$line" ] && { ALBUM_ARTIST="$line"; got=1; }
-
-  # "Track  1 title: 'Robot Stop' from 'King Gizzard'"
-  while IFS= read -r line; do
-    n=$(printf '%s' "$line" | sed -n "s/^Track[ ]*\([0-9]*\).*/\1/p")
-    case "$n" in ''|*[!0-9]*) continue ;; esac
-    i=$(row_of_track $(( 10#$n )) ) || continue
-    # Read into a local first: a shape this does not match would otherwise blank
-    # the tidy "Track 07" cd_metadata has already put there, and a row with no
-    # title at all is worse than a row with a dull one.
-    name=$(printf '%s' "$line" \
-      | sed -n -e "s/^Track[ ]*[0-9]*[ ]*title:[ ]*'\(.*\)'[ ]*from[ ]*'.*'[ ]*\$/\1/p" \
-               -e "s/^Track[ ]*[0-9]*[ ]*title:[ ]*'\(.*\)'[ ]*\$/\1/p")
-    [ -n "$name" ] || continue
-    TITLES[$i]="${name//[$'\t\n\r']/ }"
-    name=$(printf '%s' "$line" \
-      | sed -n "s/^Track[ ]*[0-9]*[ ]*title:.*'[ ]*from[ ]*'\(.*\)'[ ]*\$/\1/p")
-    [ -n "$name" ] && ARTISTS[$i]="${name//[$'\t\n\r']/ }"
-    got=1; titles=$(( titles + 1 ))
-  done < <(printf '%s\n' "$out" | grep -i '^Track[ ]*[0-9]*[ ]*title:' || true)
-
-  # Not $got: an album title on its own is not a track list, and returning 0 for
-  # one would both stamp CD-TEXT on the faceplate over a column of bare track
-  # numbers and rob the disc of the MusicBrainz lookup that could have named
-  # them. Whatever album and artist were found stay put either way — mb_lookup
-  # overwrites what it knows better and leaves the rest alone.
-  [ "$titles" -gt 0 ] || return 1
-  META_SOURCE="CD-Text"
-  return 0
-}
-
-# The MusicBrainz disc ID: SHA-1 over the first track, the last track, the
-# lead-out offset and all 99 track offsets, each as uppercase hex, then base64
-# with a URL-safe alphabet. It is a fingerprint of the pressing, which is why it
-# can tell two masterings of the same album apart.
-#
-# The offsets come from the drive's table of contents in frames, plus the 150
-# frame pre-gap that every CD address is measured from.
-mb_discid() {  # mb_discid -> $DISCID, $MB_TOC
-  local out line n off first=0 last=0 leadout=0 hex='' i
-  local -a OFFS
-  DISCID=''; MB_TOC=''
-  command -v cdrecord >/dev/null || return 1
-  command -v shasum   >/dev/null || return 1
-  detect_dev || true
-
-  out=$( (cdrecord dev="$DEV" -toc 2>&1) || true )
-  OFFS=()
-  # "track:   1 lba:         0 (       0) 00:02:00 adr: 1 control: 0 mode: -1"
-  while IFS= read -r line; do
-    n=$(printf '%s' "$line" | sed -n 's/^track:[ ]*\([0-9]*\).*/\1/p')
-    off=$(printf '%s' "$line" | sed -n 's/.*lba:[ ]*\(-*[0-9]*\).*/\1/p')
-    case "$n$off" in ''|*[!0-9-]*) continue ;; esac
-    case "$n" in ''|*[!0-9]*) continue ;; esac
-    case "$off" in ''|*[!0-9-]*) continue ;; esac
-    n=$(( 10#$n ))
-    OFFS[$n]=$(( off + 150 ))
-    [ "$first" -eq 0 ] && first=$n
-    [ "$n" -gt "$last" ] && last=$n
-  done < <(printf '%s\n' "$out" | grep '^track:' || true)
-
-  # The lead-out is track 0xAA in the TOC, printed by cdrtools as "lout".
-  leadout=$(printf '%s\n' "$out" \
-    | sed -n 's/^track:[ ]*lout[ ]*lba:[ ]*\([0-9]*\).*/\1/p' | head -1)
-  case "$leadout" in ''|*[!0-9]*) return 1 ;; esac
-  leadout=$(( leadout + 150 ))
-
-  [ "$first" -gt 0 ] && [ "$last" -ge "$first" ] || return 1
-
-  printf -v hex '%02X%02X%08X' "$first" "$last" "$leadout"
-  MB_TOC="$first $last $leadout"
-  i=1
-  while [ "$i" -le 99 ]; do
-    printf -v hex '%s%08X' "$hex" "${OFFS[$i]:-0}"
-    [ "$i" -ge "$first" ] && [ "$i" -le "$last" ] && MB_TOC="$MB_TOC ${OFFS[$i]:-0}"
-    i=$(( i + 1 ))
-  done
-
-  # base64 of the raw SHA-1, then MusicBrainz's own alphabet: + / = become . _ -
-  DISCID=$(printf '%s' "$hex" | shasum -b 2>/dev/null \
-    | cut -d' ' -f1 | xxd -r -p 2>/dev/null | base64 2>/dev/null \
-    | tr '+/=' '._-' | tr -d '\n')
-  [ -n "$DISCID" ] || return 1
-  return 0
-}
-
-# Ask MusicBrainz what disc this is. Deliberately forgiving: no network, a disc
-# nobody has submitted, a rate limit or a malformed answer all mean the same
-# thing here — the track numbers stay, and the panel says so.
-mb_lookup() {
-  local json titles artists alb art i n=0 t
-  [ "$USE_MB" = 1 ] || return 1
-  command -v curl >/dev/null || return 1
-  mb_discid || return 1
-
-  json=$(curl -sS -m 12 -A 'player/1.0 ( https://github.com/gvorbeck )' \
-    "https://musicbrainz.org/ws/2/discid/${DISCID}?fmt=json&inc=recordings+artist-credits" \
-    2>/dev/null || true)
-  [ -n "$json" ] || return 1
-  printf '%s' "$json" | qgrep '"releases"' || return 1
-
-  if command -v jq >/dev/null; then
-    alb=$(printf '%s' "$json" | jq -r '.releases[0].title // empty' 2>/dev/null || true)
-    art=$(printf '%s' "$json" | jq -r '.releases[0]."artist-credit"[0].name // empty' 2>/dev/null || true)
-    t=$(printf '%s' "$json"   | jq -r '.releases[0].date // empty' 2>/dev/null || true)
-    # Kept for the sleeve. The Cover Art Archive is keyed on a release, and a
-    # disc ID resolves to one exactly — which is the strongest identification
-    # anything here ever gets, and worth writing down while we hold it.
-    MB_RELEASE=$(printf '%s' "$json" | jq -r '.releases[0].id // empty' 2>/dev/null || true)
-    # The medium this disc actually is, matched on the disc ID that was used to
-    # ask the question — not every medium that has one. A release is one entry
-    # per disc in the box, so taking them all concatenates disc two's track list
-    # onto disc one's, and the loop below then hands disc one's titles to
-    # whichever disc is in the drive. Bracketed and indexed rather than piped
-    # through select, because a medium carries several disc IDs for the same
-    # pressing and select would emit it once per ID.
-    titles=$(printf '%s' "$json" | jq -r --arg id "$DISCID" \
-      '[.releases[0].media[]? | select([.discs[]?.id] | index($id))][0] | .tracks[]?.title' \
-      2>/dev/null || true)
-    # A release with one medium and no disc IDs listed against it is still that
-    # medium, so a single-disc answer is worth taking on its own.
-    [ -n "$titles" ] || titles=$(printf '%s' "$json" | jq -r \
-      'select((.releases[0].media | length) == 1) | .releases[0].media[0].tracks[]?.title' \
-      2>/dev/null || true)
-  else
-    return 1
-  fi
-
-  [ -n "$alb" ] && ALBUM="$alb"
-  [ -n "$art" ] && ALBUM_ARTIST="$art"
-  [ -n "$t" ]   && YEAR="${t%%-*}"
-
-  # The list comes back in track order, so the nth title belongs to track n --
-  # which is not row n, hence the lookup.
-  n=0
-  while IFS= read -r t; do
-    [ -n "$t" ] || continue
-    n=$(( n + 1 ))
-    i=$(row_of_track "$n") || continue
-    TITLES[$i]="${t//[$'\t\n\r']/ }"
-    [ -n "$ALBUM_ARTIST" ] && ARTISTS[$i]="$ALBUM_ARTIST"
-  done < <(printf '%s\n' "$titles")
-
-  [ "$n" -gt 0 ] || return 1
-  META_SOURCE="MusicBrainz"
-  return 0
-}
+# Both questions are asked by lib/disc.sh, which answers in track numbers because
+# that is what a disc is numbered in. The rows here are in the order the volume
+# was scanned, and those are not the same thing, so the copy at the end of this
+# function goes through row_of_track and nothing indexes by "n - 1".
 
 # A mounted CD has no tags at all, so everything the panel shows has to come from
 # somewhere else. Tried in order of trust, and whichever answers is recorded.
 cd_metadata() {
-  local i
+  local i n rc=1
   META_SOURCE="track numbers"
   # macOS numbers them "1 Audio Track.aiff"; make that a clean default first, so
   # a failure below still leaves a tidy list rather than filenames.
@@ -2247,12 +1837,39 @@ cd_metadata() {
   done
   [ -z "$ALBUM" ] && ALBUM="$(basename "$SRC_PATH")"
 
+  # The album name the volume was mounted under, handed over as the starting
+  # point: CD-Text and MusicBrainz each overwrite what they know better and
+  # leave the rest alone, so a disc that answers with titles but no album title
+  # keeps this one rather than ending up with none.
+  DISC_ALBUM="$ALBUM"; DISC_ALBUM_ARTIST="$ALBUM_ARTIST"
+
   load_stage "READING DISC" 1 3 "looking for CD-Text"
-  cd_text && return 0
-  load_stage "READING DISC" 2 3 "asking MusicBrainz"
-  mb_lookup && return 0
-  load_stage "READING DISC" 3 3 "no titles on this disc"
-  return 1
+  disc_cd_text && rc=0
+  if [ "$rc" -ne 0 ]; then
+    load_stage "READING DISC" 2 3 "asking MusicBrainz"
+    disc_mb_lookup && rc=0
+  fi
+  [ "$rc" -eq 0 ] || load_stage "READING DISC" 3 3 "no titles on this disc"
+
+  # Whatever either of them managed, even on the failing path: an album title
+  # off a disc that had no track titles is still worth having on the faceplate.
+  [ -n "$DISC_ALBUM" ]        && ALBUM="$DISC_ALBUM"
+  [ -n "$DISC_ALBUM_ARTIST" ] && ALBUM_ARTIST="$DISC_ALBUM_ARTIST"
+  [ -n "$DISC_YEAR" ]         && YEAR="$DISC_YEAR"
+  [ -n "$DISC_SOURCE" ]       && META_SOURCE="$DISC_SOURCE"
+
+  # Track numbers into rows. A disc whose titles came back short, or which skips
+  # a number, simply leaves those rows holding the "Track 07" put there above.
+  n=1
+  while [ "$n" -le 99 ]; do
+    if [ -n "${DISC_TITLE[$n]:-}" ] && i=$(row_of_track "$n"); then
+      TITLES[$i]="${DISC_TITLE[$n]}"
+      [ -n "${DISC_ARTIST[$n]:-}" ] && ARTISTS[$i]="${DISC_ARTIST[$n]}"
+    fi
+    n=$(( n + 1 ))
+  done
+
+  return "$rc"
 }
 
 # ------------------------------------------------------------ now playing --
@@ -3526,7 +3143,7 @@ if [ -n "$SOURCE_ARG" ]; then
   fi
 elif [ "$WANT_CD" -eq 1 ]; then
   find_cd || die "no audio CD in the drive"
-  PICKED="cd	$CD_VOLUME	$(basename "$CD_VOLUME")	in the drive"
+  PICKED="cd	$DISC_VOLUME	$(basename "$DISC_VOLUME")	in the drive"
 else
   scan_sources
   pick_source || { screen_off; exit 0; }

@@ -1,0 +1,1311 @@
+#!/usr/bin/env bash
+#
+# ripper — rip the audio CD in the drive to a folder of tagged FLAC.
+#
+#   ripper --check                 check this machine is ready to rip
+#   ripper                         rip the disc in the drive to ./
+#   ripper -o ~/Music              rip it somewhere else
+#   ripper -n                      dry run: show the plan, write nothing
+#   ripper --tracks 1,4-7          only those tracks
+#   ripper --no-mb                 don't ask MusicBrainz what this disc is
+#
+# The other direction from burncd, and the folder it leaves behind is the folder
+# burncd takes: flat, one file a track, tags rather than filenames carrying the
+# running order. So `ripper && burncd <folder>` copies a disc, and `player
+# <folder>` plays what came off it with the sleeve already beside it.
+#
+# What the tracks are called is the whole difficulty, and a CD does not know. The
+# disc is asked first — CD-Text is written on it by whoever pressed it, and when
+# it is there it is the answer. Most discs do not carry it, so MusicBrainz is
+# asked next, with a disc ID computed from the table of contents: that identifies
+# a pressing rather than an album, which is how it can tell the 1984 CD from the
+# 2011 remaster with the bonus tracks. Whichever answered is on the faceplate,
+# because a track list is only as good as where it came from.
+#
+# Nothing is written until you have looked at it. The plan screen is an editor:
+# MusicBrainz picks a release and sometimes it picks the wrong pressing of a
+# compilation, and finding that out here costs one keystroke, where finding it
+# out afterwards costs a folder full of files named after somebody else's record.
+#
+# Read twice where the drive allows it. cdparanoia if it is installed, otherwise
+# cdda2wav with the same libparanoia inside it, otherwise the tracks macOS
+# already mounted — which has no error correction at all and says so. --check
+# names which of the three this machine is going to use.
+#
+# Interrupted is not lost. Every track is encoded beside its destination and
+# moved onto it, so a folder never holds half a file, and a second run finds what
+# the first one finished and offers to do the rest.
+#
+# Env overrides:
+#   RIPPER_DIR     where albums go (default: the current directory)
+#   RIPPER_DEV     cdrecord device (default: whichever one the drive answers to)
+#   RIPPER_ENGINE  paranoia, cdda2wav, mount, or auto (default auto)
+#   RIPPER_MB      set to 0 to never ask MusicBrainz about a disc
+#   RIPPER_ART     set to 0 to never fetch a cover
+#   RIPPER_LEVEL   flac compression level 0-12 (default 8)
+#   RIPPER_WORK    where tracks are read to (default ~/.cache/ripper/work)
+#   RIPPER_KEEP    set to keep the scratch directory instead of destroying it
+#   RIPPER_EJECT   set to 0 to leave the disc in the drive when it is done
+
+set -euo pipefail
+
+# The faceplate, shared with burncd and player: the locale repair, the panel's
+# geometry and palette, the alternate screen, the width primitives, the meter,
+# raw key reading and the health-check scaffolding all live in lib/panel.sh. The
+# disc itself — its table of contents, its CD-Text, what MusicBrainz and the
+# Cover Art Archive say about it — lives in lib/disc.sh, which player reads too.
+# Three tools, one instrument, at the three moments of a disc.
+#
+# Resolved through however many symlinks stand between $0 and the real file: the
+# install is a symlink into /usr/local/bin, and BSD readlink has no -f to lean on.
+APP=ripper
+SELF=$0
+while [ -L "$SELF" ]; do
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF=$LINK ;; *) SELF=$(dirname "$SELF")/$LINK ;; esac
+done
+LIB=$( (cd "$(dirname "$SELF")/../lib" && pwd) 2>/dev/null || true )
+[ -n "$LIB" ] && [ -r "$LIB/panel.sh" ] && [ -r "$LIB/disc.sh" ] \
+  || { printf 'ripper: cannot find lib/panel.sh alongside %s\n' "$SELF" >&2; exit 1; }
+. "$LIB/panel.sh"
+. "$LIB/disc.sh"
+
+# All three tools talk to the same drive, so a device pinned for one is a device
+# pinned for the others.
+DEV="${RIPPER_DEV:-${BURNCD_DEV:-}}"
+# cdparanoia does not take that name. It wants the BSD node, which is a different
+# way of saying the same drive and has to be worked out separately.
+RAW_DEV=''
+
+OUT_ROOT="${RIPPER_DIR:-.}"
+ENGINE="${RIPPER_ENGINE:-auto}"
+USE_MB="${RIPPER_MB:-1}"
+USE_ART="${RIPPER_ART:-1}"
+FLAC_LEVEL="${RIPPER_LEVEL:-8}"
+DO_EJECT="${RIPPER_EJECT:-1}"
+
+DRY_RUN=0
+CHECK=0
+TRACKS=''
+REDO=0
+
+WORK=''
+OUT=''
+FFLOG=''
+ART_EMBED=''
+
+# 44100 × 2 channels × 2 bytes. One second of CD audio, and the number every
+# meter here is built on.
+BYTES_PER_SEC=176400
+# One sector: 588 stereo frames of 4 bytes. A track's length in sectors times
+# this is exactly how many bytes should come off it.
+SECTOR=2352
+
+NTRACKS=0
+ORDER=()                 # track numbers, in disc order, audio only
+declare -a SEL           # 1 if this track is in the rip
+declare -a HAVE          # 1 if a sound file for it is already in $OUT
+declare -a DEST          # where each track's file goes
+declare -a DUR           # seconds, from the TOC
+declare -a ERRS          # per-track note, empty when it came off clean
+FAILED=()
+
+RIP_SRC=''
+RIP_PID=''
+ENC_PID=''
+ENC_TRK=0
+
+TUI_MIN_LINES=20
+
+# --------------------------------------------------------------- arguments --
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)      CHECK=1 ;;
+    -n|--dry-run) DRY_RUN=1 ;;
+    -o|--output)  shift; OUT_ROOT="${1:-}"
+                  [ -n "$OUT_ROOT" ] || die "--output needs a directory" ;;
+    --output=*)   OUT_ROOT="${1#--output=}" ;;
+    --tracks)     shift; TRACKS="${1:-}"
+                  [ -n "$TRACKS" ] || die "--tracks needs a list, like 1,4-7" ;;
+    --tracks=*)   TRACKS="${1#--tracks=}" ;;
+    --no-mb)      USE_MB=0 ;;
+    -h|--help)    usage 0 ;;
+    -*)           die "unknown option: $1 (try --help)" ;;
+    *)            die "ripper reads the disc in the drive, so there is nothing to name.
+    To choose where the files go: ripper -o $1" ;;
+  esac
+  shift
+done
+
+DISC_USE_MB="$USE_MB"
+case "$ENGINE" in
+  auto|paranoia|cdda2wav|mount) ;;
+  *) die "RIPPER_ENGINE must be auto, paranoia, cdda2wav or mount — got: $ENGINE" ;;
+esac
+case "$FLAC_LEVEL" in ''|*[!0-9]*) die "RIPPER_LEVEL must be a number 0-12" ;; esac
+[ "$FLAC_LEVEL" -le 12 ] || die "RIPPER_LEVEL must be a number 0-12"
+
+# ------------------------------------------------------------------- drive --
+
+# The BSD node behind the drive, which is what cdparanoia wants and what nothing
+# else here uses. drutil prints it on the Type line, two columns to a row:
+# "Type: CD-ROM  Name: /dev/disk8". The raw node is the buffered one with an r
+# in front, and cdparanoia is happier with it.
+raw_dev() {
+  local n
+  RAW_DEV=''
+  command -v drutil >/dev/null || return 1
+  n=$( (drutil status 2>/dev/null || true) \
+       | sed -n 's/.*Name:[ ]*\(\/dev\/[A-Za-z0-9]*\).*/\1/p' | head -1 )
+  [ -n "$n" ] || return 1
+  case "$n" in /dev/disk*) RAW_DEV="/dev/r${n#/dev/}" ;; *) RAW_DEV="$n" ;; esac
+  return 0
+}
+
+# Which of the three ways of getting audio off this disc is available.
+#
+# cdparanoia first because it is the reference implementation, but it is not in
+# Homebrew and most machines will not have it. cdda2wav is: it ships inside
+# cdrtools, which burncd already needs, and -paranoia puts the same libparanoia
+# behind it. The mounted volume is last because it is the only one with no error
+# correction at all — a scratch comes off it as whatever the drive happened to
+# return, with nothing to say it happened.
+pick_engine() {
+  case "$ENGINE" in
+    paranoia)  raw_dev || true
+               command -v cdparanoia >/dev/null || die "RIPPER_ENGINE=paranoia, but cdparanoia is not installed"
+               return 0 ;;
+    cdda2wav)  command -v cdda2wav >/dev/null || die "RIPPER_ENGINE=cdda2wav, but cdda2wav is not installed"
+               return 0 ;;
+    mount)     return 0 ;;
+  esac
+  if command -v cdparanoia >/dev/null && raw_dev; then ENGINE=paranoia; return 0; fi
+  if command -v cdda2wav >/dev/null; then ENGINE=cdda2wav; return 0; fi
+  ENGINE=mount
+  return 0
+}
+
+engine_label() {
+  case "$ENGINE" in
+    paranoia) printf 'cdparanoia' ;;
+    cdda2wav) printf 'cdda2wav -paranoia' ;;
+    mount)    printf 'mounted disc — no error correction' ;;
+  esac
+}
+
+# ----------------------------------------------------------------- scratch --
+
+# The cache if it will have us, $TMPDIR if it will not. A rip runs for ten
+# minutes and writes most of a gigabyte, and macOS is entitled to reclaim
+# $TMPDIR while it is still going — which is exactly the kind of failure that
+# would show up as one corrupt track in the middle of an album.
+work_base() {
+  local b="${RIPPER_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/ripper/work}"
+  if mkdir -p "$b" 2>/dev/null && [ -w "$b" ]; then
+    printf '%s' "$b"
+  else
+    printf '%s' "${TMPDIR:-/tmp}"
+  fi
+  return 0
+}
+
+# What runs that are not running any more left behind. Same reasoning as
+# player's: two of these at once is allowed, and the second must not delete the
+# first one's half-read album out from under it.
+scratch_sweep() {  # scratch_sweep <base>
+  local d pid
+  for d in "$1"/ripper.*; do
+    [ -d "$d" ] || continue
+    [ -e "$d/keep" ] && continue
+    pid=''
+    if [ -f "$d/pid" ]; then read -r pid < "$d/pid" 2>/dev/null || pid=''; fi
+    case "$pid" in
+      ''|*[!0-9]*)
+        if [ -n "$(find "$d" -maxdepth 0 -mmin +5 2>/dev/null)" ]; then
+          rm -rf "$d" 2>/dev/null || true
+        fi ;;
+      *) kill -0 "$pid" 2>/dev/null || rm -rf "$d" 2>/dev/null || true ;;
+    esac
+  done
+  return 0
+}
+
+scratch() {
+  local base
+  [ -n "$WORK" ] && return 0
+  base=$(work_base)
+  scratch_sweep "$base"
+  WORK=$(mktemp -d "$base/ripper.XXXXXX") || die "cannot make a scratch directory in $base"
+  printf '%s\n' "$$" > "$WORK/pid" || die "cannot write to $WORK"
+  [ -n "${RIPPER_KEEP:-}" ] && : > "$WORK/keep"
+  FFLOG="$WORK/ffmpeg.log"
+  return 0
+}
+
+int_nl() {
+  [ "$SCREEN" -eq 1 ] || printf '\n'
+  return 0
+}
+
+cleanup() {
+  screen_off
+  # The children first, and only the ones this run started: a rip left running
+  # after the panel is gone would keep the drive spinning with nothing to read
+  # its output.
+  [ -n "$RIP_PID" ] && kill "$RIP_PID" 2>/dev/null || true
+  [ -n "$ENC_PID" ] && kill "$ENC_PID" 2>/dev/null || true
+  # Half a file, wherever it got to. Named .part so burncd's *.flac glob could
+  # never have picked it up, but a folder with rubbish in it is still rubbish.
+  [ -n "$OUT" ] && [ -d "$OUT" ] && rm -f "$OUT"/.ripper-*.flac.part 2>/dev/null || true
+  if [ -n "${RIPPER_KEEP:-}" ] && [ -n "$WORK" ] && [ -d "$WORK" ]; then
+    printf '\n  work kept in %s\n' "$WORK"
+  elif [ -n "$WORK" ]; then
+    rm -rf "$WORK" 2>/dev/null || true
+  fi
+  [ -t 1 ] && printf '\033[?25h'
+  return 0
+}
+trap cleanup EXIT
+trap 'int_nl; cleanup; exit 130' INT
+
+# ------------------------------------------------------------- health check --
+
+run_check() {
+  local v e
+  check_open
+
+  if v=$(ffmpeg -version 2>/dev/null | head -1 | cut -c1-40); then
+    ck ok "ffmpeg" "$v"
+  else
+    ck fail "ffmpeg" "missing — brew install ffmpeg"
+  fi
+  if command -v ffprobe >/dev/null; then
+    ck ok "ffprobe" "$(ffprobe -version 2>/dev/null | head -1 | cut -c1-40)"
+  else
+    ck fail "ffprobe" "missing — brew install ffmpeg"
+  fi
+  if ffmpeg -hide_banner -encoders 2>/dev/null | qgrep ' flac '; then
+    ck ok "flac encoder" "built into ffmpeg, level $FLAC_LEVEL"
+  else
+    ck fail "flac encoder" "this ffmpeg cannot write flac"
+  fi
+
+  # --- reading the disc ---
+  # drutil before anything opens the drive exclusively: an exclusive open makes
+  # macOS let go of the media, and drutil then reports an empty tray about a
+  # disc that never moved. So the drive is asked first and printed later.
+  local dstat=''
+  command -v drutil >/dev/null && dstat=$(drutil status 2>/dev/null || true)
+
+  pick_engine
+  e=$(engine_label)
+  case "$ENGINE" in
+    mount) ck warn "rip engine" "$e" ;;
+    *)     ck ok   "rip engine" "$e" ;;
+  esac
+  if command -v cdparanoia >/dev/null; then
+    ck ok "cdparanoia" "$(cdparanoia -V 2>&1 | head -1 | cut -c1-40)"
+  elif command -v cdda2wav >/dev/null; then
+    ck warn "cdparanoia" "not in Homebrew; cdda2wav has the same libparanoia"
+  else
+    ck fail "cdparanoia" "and no cdda2wav either — brew install cdrtools"
+  fi
+  if command -v cdrecord >/dev/null; then
+    ck ok "cdrecord" "$(cdrecord -version 2>/dev/null | head -1 | cut -c1-40)"
+  else
+    ck warn "cdrecord" "missing — no table of contents, so no disc ID and no titles"
+  fi
+
+  if detect_dev; then
+    ck ok "drive" "$DEV"
+  else
+    ck fail "drive" "nothing answered — try cdrecord -scanbus, or set RIPPER_DEV"
+  fi
+  if raw_dev; then
+    ck ok "raw device" "$RAW_DEV"
+  else
+    ck warn "raw device" "not resolvable — cdparanoia cannot be used"
+  fi
+
+  local t
+  t=$( printf '%s' "$dstat" | awk -F: '/Type:/ { print $2; exit }' | tr -d ' ' )
+  case "$t" in
+    ''|[Nn]o*)  ck warn "media" "no disc in the drive" ;;
+    *)          if printf '%s' "$dstat" | qgrep -i 'blank'; then
+                  ck warn "media" "that is a blank — burncd writes those"
+                else
+                  ck ok "media" "$t"
+                fi ;;
+  esac
+  if find_cd; then
+    ck ok "mounted volume" "$DISC_VOLUME"
+  else
+    ck warn "mounted volume" "not mounted — the fallback path is unavailable"
+  fi
+
+  # --- titles and sleeve ---
+  if [ "$USE_MB" != 1 ]; then
+    ck warn "MusicBrainz" "off (RIPPER_MB=0) — untitled discs stay untitled"
+  elif command -v curl >/dev/null && command -v jq >/dev/null; then
+    ck ok "MusicBrainz" "curl and jq present"
+  else
+    ck warn "MusicBrainz" "needs curl and jq — brew install jq"
+  fi
+
+  # --- room ---
+  local root="$OUT_ROOT"
+  [ -d "$root" ] || root=$(dirname "$root")
+  if [ -w "$root" ]; then
+    ck ok "output" "$(room_str "$(free_bytes "$root")") free in $root"
+  else
+    ck fail "output" "cannot write to $root"
+  fi
+  local base; base=$(work_base)
+  if [ -w "$base" ]; then
+    v=$(free_bytes "$base")
+    if [ "$v" -lt 900000000 ]; then
+      ck warn "scratch space" "$(room_str "$v") free in $base — a disc needs about 800M"
+    else
+      ck ok "scratch space" "$(room_str "$v") free in $base"
+    fi
+  else
+    ck fail "scratch space" "cannot write to $base"
+  fi
+
+  # --- display ---
+  term_size
+  if [ "$UTF8" -eq 1 ]; then
+    ck ok "terminal" "UTF-8 (${LC_CTYPE:-${LC_ALL:-${LANG:-?}}}), ${TERM_COLS}x${TERM_LINES}"
+  else
+    ck warn "terminal" "not UTF-8 — the panel will draw wrong"
+  fi
+
+  check_summary 'Ready to rip.' 'Not ready to rip.'
+}
+
+# Bytes as something a person can read.
+room_str() {  # room_str <bytes>
+  awk -v b="${1:-0}" 'BEGIN {
+    split("B K M G T", u, " ")
+    i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf (b >= 10 || i == 1) ? "%.0f%s" : "%.1f%s", b, u[i]
+  }'
+}
+
+free_bytes() {  # free_bytes <path>
+  df -k "$1" 2>/dev/null | awk 'NR == 2 { print $4 * 1024; exit }' || printf '0'
+}
+
+if [ "$CHECK" -eq 1 ]; then
+  run_check || exit 1
+  exit 0
+fi
+
+# ------------------------------------------------------------ requirements --
+
+command -v ffmpeg  >/dev/null || die "ffmpeg not found. brew install ffmpeg"
+command -v ffprobe >/dev/null || die "ffprobe not found. brew install ffmpeg"
+ffmpeg -hide_banner -encoders 2>/dev/null | qgrep ' flac ' \
+  || die "this ffmpeg cannot write flac"
+
+# ------------------------------------------------------------------- names --
+
+# A tag turned into a filename. Four separate hazards, and only the first is the
+# one people think of.
+SAFE=''
+safe_namev() {  # safe_namev <string> [max-chars] -> $SAFE
+  local s=$1 max=${2:-60}
+  # The flatten every sibling does as text comes in. A newline in a filename is
+  # legal on APFS and ruins every `while read` that ever looks at the folder.
+  s=${s//[$'\t\n\r']/ }
+  # A slash is a path. A colon is a slash: the POSIX layer takes it and Finder
+  # draws it as one, so "AC/DC" and "AC:DC" are the same lie told two ways.
+  s=${s//\//-}; s=${s//:/-}
+  case $s in
+    *[[:cntrl:]]*) s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\037\177') ;;
+  esac
+  # Cut by characters, not bytes. ${s:0:60} counts characters under a UTF-8
+  # ctype — which panel.sh has already guaranteed — so sixty of them is at most
+  # 240 bytes and cannot land inside one; LC_ALL=C cut -b would take half of a
+  # ō and hand the filesystem a name it will refuse.
+  s=${s:0:$max}
+  # Trailing dots and spaces are legal here and are not legal on the exFAT stick
+  # this folder gets copied to, where they come off silently and collide.
+  s=${s%"${s##*[! .]}"}
+  s=${s#"${s%%[! ]*}"}
+  # A leading dot hides the file from Finder and from every glob the user will
+  # try. It does not hide it from burncd, which is worse: an album that looks
+  # empty and burns eleven tracks.
+  case $s in .*) s="_${s#.}" ;; esac
+  SAFE=$s
+  return 0
+}
+
+file_size() {  # file_size <path>
+  local n
+  n=$(stat -f %z "$1" 2>/dev/null || printf '0')
+  printf '%s' "${n:-0}"
+}
+
+# ------------------------------------------------------------------- media --
+
+# What is in the drive, asked before anything opens it exclusively.
+media_check() {
+  local dstat t
+  command -v drutil >/dev/null || return 0
+  dstat=$(drutil status 2>/dev/null || true)
+  t=$( printf '%s' "$dstat" | awk -F: '/Type:/ { print $2; exit }' | tr -d ' ' )
+  case "$t" in
+    ''|[Nn]o*) die "the drive is empty. Put an album in it." ;;
+  esac
+  printf '%s' "$dstat" | qgrep -i 'blank' \
+    && die "that is a blank disc — burncd writes those, ripper reads albums"
+  return 0
+}
+
+# ---------------------------------------------------------------- identity --
+
+# The disc, as far as anything can tell: how long its tracks are, what it is
+# called, and who by. Everything here is allowed to come up empty — a disc
+# nobody ever submitted still rips, it just rips as "Track 01".
+read_disc() {
+  local n
+  disc_reset
+  DISC_USE_MB="$USE_MB"
+
+  find_cd || true
+  if ! disc_toc; then
+    # No TOC means no disc ID, so no MusicBrainz and no lengths. The mounted
+    # volume can still say how long each track is, which is enough to rip by.
+    [ -n "$DISC_VOLUME" ] || die "cannot read the table of contents, and the disc is not mounted"
+    ENGINE=mount
+    toc_from_mount || die "cannot work out what is on this disc"
+  fi
+
+  ORDER=()
+  for n in $(seq "$DISC_FIRST" "$DISC_LAST"); do
+    [ -n "${DISC_FRAMES[$n]:-}" ] || continue
+    if ! disc_is_audio "$n"; then continue; fi
+    ORDER+=("$n")
+    DUR[$n]=$(( DISC_FRAMES[n] / 75 ))
+  done
+  NTRACKS=${#ORDER[@]}
+  [ "$NTRACKS" -gt 0 ] || die "no audio tracks on this disc"
+
+  return 0
+}
+
+# Lengths off the mounted volume, for a drive that would not give up its TOC.
+toc_from_mount() {
+  local f lead n d
+  DISC_FIRST=0; DISC_LAST=0
+  for f in "$DISC_VOLUME"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in *.[Aa][Ii][Ff]|*.[Aa][Ii][Ff][Ff]) ;; *) continue ;; esac
+    lead=$(basename "$f"); lead=${lead%%[!0-9]*}
+    case "$lead" in ''|*[!0-9]*) continue ;; esac
+    n=$(( 10#$lead ))
+    d=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$f" 2>/dev/null || true)
+    case "$d" in ''|N/A) continue ;; esac
+    DISC_FRAMES[$n]=$(awk -v d="$d" 'BEGIN { printf "%d", d * 75 }')
+    DISC_CONTROL[$n]=0
+    [ "$DISC_FIRST" -eq 0 ] && DISC_FIRST=$n
+    [ "$n" -gt "$DISC_LAST" ] && DISC_LAST=$n
+  done
+  [ "$DISC_FIRST" -gt 0 ] || return 1
+  return 0
+}
+
+# Ask the disc, then the catalogue. Whichever answers is what the faceplate says,
+# because a track list is only as good as its source.
+disc_identity() {
+  local n
+  DISC_SOURCE="track numbers"
+  stage "READING DISC" "$(plan_fields)" ''
+  note "$(printf '%blooking for CD-Text%b' "$DIM" "$OFF")"
+  if disc_cd_text; then
+    note "$(printf '  %b✓%b CD-Text — %s' "$AMBER" "$OFF" "${DISC_ALBUM:-titles only}")"
+  else
+    note "$(printf '%basking MusicBrainz%b' "$DIM" "$OFF")"
+    if disc_mb_lookup; then
+      note "$(printf '  %b✓%b MusicBrainz — %s' "$AMBER" "$OFF" "${DISC_ALBUM:-untitled}")"
+      [ "$DISC_TOTAL" -gt 1 ] \
+        && note "$(printf '  %b·%b disc %d of %d' "$AMBER" "$OFF" "$DISC_NO" "$DISC_TOTAL")"
+    else
+      note "$(printf '  \033[33m!\033[0m no titles for this disc — track numbers it is')"
+    fi
+  fi
+
+  # Whatever came back, every track needs something to be called.
+  for n in "${ORDER[@]}"; do
+    [ -n "${DISC_TITLE[$n]:-}" ] || DISC_TITLE[$n]=$(printf 'Track %02d' "$n")
+    [ -n "${DISC_ARTIST[$n]:-}" ] || DISC_ARTIST[$n]="$DISC_ALBUM_ARTIST"
+  done
+  [ -n "$DISC_ALBUM" ] || DISC_ALBUM="Unknown Album"
+
+  # Fired here, before the first track is read, rather than at encode time.
+  # Track one takes the better part of a minute and the download takes two
+  # seconds, so by the time there is a file to tag the sleeve is already in
+  # hand — where the other order would miss track one on every single disc.
+  if [ "$USE_ART" = 1 ]; then
+    disc_cover_start "${XDG_CACHE_HOME:-$HOME/.cache}/ripper/art" || true
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------- plan --
+
+# Which tracks --tracks asked for. Absent, all of them.
+parse_tracks() {
+  local spec part a b n
+  for n in "${ORDER[@]}"; do SEL[$n]=1; done
+  [ -n "$TRACKS" ] || return 0
+  for n in "${ORDER[@]}"; do SEL[$n]=0; done
+  spec=${TRACKS//,/ }
+  for part in $spec; do
+    case "$part" in
+      *-*) a=${part%%-*}; b=${part##*-}
+           case "$a$b" in ''|*[!0-9]*) die "--tracks: cannot read \"$part\"" ;; esac
+           [ "$a" -le "$b" ] || die "--tracks: $part runs backwards"
+           for n in $(seq "$a" "$b"); do [ -n "${SEL[$n]:-}" ] && SEL[$n]=1; done ;;
+      *)   case "$part" in ''|*[!0-9]*) die "--tracks: cannot read \"$part\"" ;; esac
+           [ -n "${SEL[$part]:-}" ] || die "--tracks: this disc has no track $part"
+           SEL[$part]=1 ;;
+    esac
+  done
+  local any=0
+  for n in "${ORDER[@]}"; do [ "${SEL[$n]}" -eq 1 ] && any=1; done
+  [ "$any" -eq 1 ] || die "--tracks: that leaves nothing to rip"
+  return 0
+}
+
+# Where the album goes, and what each track in it is called. Rebuilt after every
+# edit, because renaming a track in the editor renames its file.
+plan_build() {
+  local n folder base ndig
+  # No stand-in for an artist nobody knows. Writing "Unknown Artist" into the
+  # folder name would put a fact in it that is not in the tags — and the folder
+  # is the thing somebody reads a year later.
+  safe_namev "$DISC_ALBUM_ARTIST" 80; folder="$SAFE"
+  safe_namev "$DISC_ALBUM" 80
+  if [ -n "$folder" ] && [ -n "$SAFE" ]; then folder="$folder - $SAFE"
+  else folder="${folder}${SAFE}"; fi
+  [ -n "$folder" ] || folder="Unknown Album"
+  OUT="$OUT_ROOT/$folder"
+
+  for n in "${ORDER[@]}"; do
+    safe_namev "${DISC_TITLE[$n]}" 60
+    base="$SAFE"
+    [ -n "$base" ] || base=$(printf 'Track %02d' "$n")
+    if [ "$DISC_TOTAL" -gt 1 ]; then
+      DEST[$n]=$(printf '%s/%d-%02d %s.flac' "$OUT" "$DISC_NO" "$n" "$base")
+    else
+      DEST[$n]=$(printf '%s/%02d %s.flac' "$OUT" "$n" "$base")
+    fi
+  done
+  return 0
+}
+
+# What is already here, and sound. Not a manifest: a manifest can be right about
+# a folder somebody has since edited, which is the failure it would exist to
+# prevent. Every question is asked of the file that would be overwritten.
+resume_scan() {
+  local n f d
+  for n in "${ORDER[@]}"; do
+    HAVE[$n]=0
+    f=${DEST[$n]}
+    [ -f "$f" ] || continue
+    d=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$f" 2>/dev/null || true)
+    case "$d" in ''|N/A) continue ;; esac
+    # Within a second and a half of the table of contents. A truncated FLAC is
+    # exactly what an interrupted run would leave if the atomic move below were
+    # ever got wrong, so it is checked rather than trusted.
+    awk -v a="$d" -v b="${DUR[$n]}" 'BEGIN { exit !(a > b - 1.5 && a < b + 1.5) }' || continue
+    HAVE[$n]=1
+  done
+  return 0
+}
+
+have_count() {
+  local n c=0
+  for n in "${ORDER[@]}"; do [ "${HAVE[$n]}" -eq 1 ] && c=$(( c + 1 )); done
+  printf '%d' "$c"
+}
+
+todo_count() {
+  local n c=0
+  for n in "${ORDER[@]}"; do
+    [ "${SEL[$n]}" -eq 1 ] || continue
+    if [ "$REDO" -eq 1 ] || [ "${HAVE[$n]}" -eq 0 ]; then c=$(( c + 1 )); fi
+  done
+  printf '%d' "$c"
+}
+
+total_secs() {
+  local n t=0
+  for n in "${ORDER[@]}"; do t=$(( t + DUR[n] )); done
+  printf '%d' "$t"
+}
+
+# ------------------------------------------------------------------ panel --
+
+STAGE_META='' STAGE_BODY='' STAGE_FOOT=''
+LOG=()
+
+stage() {  # stage <meta> <body> [foot]
+  STAGE_META=$1; STAGE_BODY=$2; STAGE_FOOT=${3:-}
+  stage_paint
+  return 0
+}
+
+stage_paint() {
+  local frame
+  [ "$SCREEN" -eq 1 ] && [ -n "$STAGE_META" ] || return 0
+  frame=$(stage_frame)
+  paint "$frame"
+  return 0
+}
+
+stage_frame() {
+  local nls used=3 room i n
+  faceplate "$STAGE_META"
+  printf '\n'
+  if [ -n "$STAGE_BODY" ]; then
+    printf '%s\n' "$STAGE_BODY"
+    nls=${STAGE_BODY//[!$'\n']/}
+    used=$(( used + ${#nls} + 1 ))
+  fi
+  if [ -n "$STAGE_FOOT" ]; then
+    nls=${STAGE_FOOT//[!$'\n']/}
+    used=$(( used + ${#nls} + 2 ))
+  fi
+  n=${#LOG[@]}
+  term_size
+  room=$(( TERM_LINES - 2 - used ))
+  if [ "$n" -gt 0 ] && [ "$room" -gt 0 ]; then
+    printf '\n'
+    i=0
+    [ "$n" -gt "$room" ] && i=$(( n - room ))
+    while [ "$i" -lt "$n" ]; do
+      printf '  %b\n' "${LOG[$i]}"
+      i=$(( i + 1 ))
+    done
+  fi
+  [ -n "$STAGE_FOOT" ] && printf '\n%s\n' "$STAGE_FOOT"
+  return 0
+}
+
+note() {  # note <line>
+  LOG+=("$1")
+  if [ "$SCREEN" -eq 1 ]; then stage_paint; else printf '  %b\n' "$1"; fi
+  return 0
+}
+
+wait_key() {  # wait_key -> $KEY
+  local rc=0
+  tui_block
+  read_key || rc=1
+  tui_cooked
+  return "$rc"
+}
+
+# The three fields every screen opens with.
+plan_fields() {
+  printf '    %b%-8s%b %s\n' "$ETCH" ALBUM  "$OFF" "${DISC_ALBUM:-—}"
+  printf '    %b%-8s%b %s\n' "$ETCH" ARTIST "$OFF" "${DISC_ALBUM_ARTIST:-—}"
+  printf '    %b%-8s%b %s' "$ETCH" TITLES "$OFF" "${DISC_SOURCE:-—}"
+  return 0
+}
+
+# ------------------------------------------------------------------- rip --
+
+rip_paranoia() {  # rip_paranoia <trackno> <wav>
+  cdparanoia -d "$RAW_DEV" -e -w "$1" "$2"
+}
+
+rip_cdda2wav() {  # rip_cdda2wav <trackno> <wav>
+  cdda2wav dev="$DEV" -paranoia -t "$1" -O wav -q -H -no-textfile "$2"
+}
+
+# The track macOS already mounted.
+#
+# Not a lesser version of the other two so much as their complement: the raw path
+# wants the drive and the mount wants the filesystem, and macOS will not always
+# give both at once. When the volume is there, the raw open is the one that can
+# fail, and the same audio is sitting right here.
+#
+# Matched on the leading digits rather than by sorting, which is player's rule
+# and for player's reason: a plain sort puts track 10 between 1 and 2, and every
+# title CD-Text and MusicBrainz hand back is keyed by track number.
+rip_mount() {  # rip_mount <trackno> -> $RIP_SRC
+  local f lead
+  RIP_SRC=''
+  [ -n "$DISC_VOLUME" ] || return 1
+  for f in "$DISC_VOLUME"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in *.[Aa][Ii][Ff]|*.[Aa][Ii][Ff][Ff]) ;; *) continue ;; esac
+    lead=$(basename "$f"); lead=${lead%%[!0-9]*}
+    case "$lead" in ''|*[!0-9]*) continue ;; esac
+    [ $(( 10#$lead )) -eq "$1" ] && { RIP_SRC=$f; return 0; }
+  done
+  return 1
+}
+
+# The album meter: every track on the disc end to end, with the head where the
+# rip has got to. No run-out — unlike a disc being planned there is no empty
+# tail, because the rip is over when the last track is read. Worked out once,
+# before the first track; only the head moves after that.
+RIP_DONE_SECS=0
+rip_meter() {  # rip_meter <this-track-bytes>
+  local this head total
+  total=$(total_secs)
+  [ "$total" -gt 0 ] || return 0
+  this=$(( ${1:-0} / BYTES_PER_SEC ))
+  head=$(( ( RIP_DONE_SECS + this ) * STRIP_WIDTH * 8 / total ))
+  [ "$head" -gt $(( STRIP_WIDTH * 8 )) ] && head=$(( STRIP_WIDTH * 8 ))
+  bandbar "$head"
+  printf '  %b▐%b%s%b▌%b' "$AMBER" "$OFF" "$BANDBAR" "$AMBER" "$OFF"
+  return 0
+}
+
+SPIN='|/-\'
+SPIN_I=0
+
+# Draw the rip screen for one track while the engine works, once a second.
+#
+# The meter is driven from the size of the file on disk, which every engine
+# agrees about and none of them has to be asked. cdparanoia's progress format
+# differs by version and cdda2wav's by mode, and a meter built on either is one
+# that goes wrong quietly on a machine we have never seen. The file is the file.
+#
+# The spinner is not decoration: while cdparanoia is verifying an overlap the
+# byte count sits still for several seconds, and a panel with nothing moving on
+# it looks like a panel that has died.
+rip_render() {  # rip_render <trackno> <wav> <pid>
+  local n=$1 wav=$2 pid=$3 last=-1 sz want body mb tmb
+  want=$(( ${DISC_FRAMES[$n]:-0} * SECTOR ))
+  tmb=$(( want / 1048576 ))
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$SECONDS" -ne "$last" ]; then
+      last=$SECONDS
+      SPIN_I=$(( (SPIN_I + 1) % 4 ))
+      sz=$(file_size "$wav")
+      mb=$(( sz / 1048576 ))
+      body=$(printf '%s\n\n    %b%-8s%b %02d OF %02d  %s\n    %b%-8s%b %d OF %d MB  %s  %b%s%b\n    %b%-8s%b %s\n\n%s' \
+        "$(plan_fields)" \
+        "$ETCH" TRACK "$OFF" "$n" "$NTRACKS" "${DISC_TITLE[$n]}" \
+        "$ETCH" READ "$OFF" "$mb" "$tmb" "$(engine_label)" \
+        "$DIM" "${SPIN:$SPIN_I:1}" "$OFF" \
+        "$ETCH" ERRORS "$OFF" "$(rip_errs_str)" \
+        "$(rip_meter "$sz")")
+      stage "RIPPING · TRACK $(printf '%02d' "$n") OF $NTRACKS" "$body" ''
+    fi
+    # No sub-second read in bash 3.2, and nothing here needs one: a rip is ten
+    # minutes long and the numbers on it move about once a second.
+    sleep 1
+  done
+  return 0
+}
+
+rip_errs_str() {
+  local n c=0
+  for n in "${ORDER[@]}"; do [ -n "${ERRS[$n]:-}" ] && c=$(( c + 1 )); done
+  [ "$c" -eq 0 ] && { printf 'none'; return 0; }
+  printf '%d track%s' "$c" "$( [ "$c" -eq 1 ] || printf s )"
+  return 0
+}
+
+# One track off the disc. Leaves what to encode in $RIP_SRC.
+rip_track() {  # rip_track <trackno>
+  local n=$1 wav rc=0 want got
+  RIP_SRC=''
+
+  if [ "$ENGINE" = mount ]; then
+    rip_mount "$n" || { ERRS[$n]="not on the mounted disc"; return 1; }
+    return 0
+  fi
+
+  scratch
+  wav="$WORK/track-$(printf '%02d' "$n").wav"
+  rm -f "$wav"
+
+  case "$ENGINE" in
+    paranoia) ( rip_paranoia "$n" "$wav" ) >"$WORK/rip-$n.log" 2>&1 & ;;
+    cdda2wav) ( rip_cdda2wav "$n" "$wav" ) >"$WORK/rip-$n.log" 2>&1 & ;;
+  esac
+  RIP_PID=$!
+  rip_render "$n" "$wav" "$RIP_PID"
+  set +e
+  wait "$RIP_PID"
+  rc=$?
+  set -e
+  RIP_PID=''
+
+  # The engine's own exit status is worth something but not much: cdparanoia
+  # exits 0 having skipped a sector it could not read. What settles it is the
+  # length, against what the table of contents said the track was.
+  want=$(( ${DISC_FRAMES[$n]:-0} * SECTOR ))
+  got=$(( $(file_size "$wav") - 44 ))
+  if [ "$rc" -ne 0 ] && [ "$got" -le 0 ]; then
+    ERRS[$n]="the drive gave up"
+    return 1
+  fi
+  if [ "$want" -gt 0 ] && [ "$got" -lt $(( want - SECTOR )) ]; then
+    ERRS[$n]=$(printf 'short read: %d of %d bytes' "$got" "$want")
+    return 1
+  fi
+  [ "$rc" -eq 0 ] || ERRS[$n]="read errors — see the log"
+  RIP_SRC="$wav"
+  return 0
+}
+
+# ---------------------------------------------------------------- encode --
+
+# The sleeve, once, at a size worth embedding twelve times.
+#
+# The archive's fronts are commonly a few hundred KB, and one copy in every track
+# is several megabytes of the same picture in one album. So the full-size file is
+# what goes in the folder, where player will find it and draw it, and a smaller
+# one is made once for the tags.
+cover_place() {
+  local src=$DISC_COVER_FILE
+  ART_EMBED=''
+  [ -n "$src" ] && [ -s "$src" ] || return 0
+  [ -d "$OUT" ] || return 0
+  cp -f "$src" "$OUT/cover.jpg" 2>/dev/null || return 0
+  if [ "$(file_size "$src")" -gt 400000 ]; then
+    scratch
+    if ffmpeg -v error -nostdin -y -i "$src" -vf "scale=600:-1" \
+         "$WORK/embed.jpg" >/dev/null 2>&1; then
+      ART_EMBED="$WORK/embed.jpg"
+      return 0
+    fi
+  fi
+  ART_EMBED="$src"
+  return 0
+}
+
+# Whether a finished track already carries its sleeve.
+has_art() {  # has_art <flac>
+  local v
+  v=$(ffprobe -v error -select_streams v -show_entries stream=codec_name \
+      -of csv=p=0 "$1" 2>/dev/null || true)
+  [ -n "$v" ]
+}
+
+# The tracks that were written before the cover arrived.
+#
+# On a real disc this does nothing: the fetch takes two seconds and the first
+# track takes the better part of a minute, so the sleeve is always in hand by the
+# time there is a file to put it in. It runs on the short albums, on a slow
+# network, and on the run where the picture only turned up at the end — and
+# without it those are the albums that silently have no art.
+#
+# A remux, not a re-encode: -c copy on both streams, so the audio that came off
+# the disc is the audio that ends up in the file, byte for byte.
+cover_backfill() {
+  local n dst tmp done_n=0
+  [ -n "$ART_EMBED" ] && [ -s "$ART_EMBED" ] || return 0
+  for n in "${ORDER[@]}"; do
+    [ "${HAVE[$n]}" -eq 1 ] || continue
+    dst=${DEST[$n]}
+    [ -f "$dst" ] || continue
+    has_art "$dst" && continue
+    tmp="$OUT/.ripper-$(printf '%02d' "$n").flac.part"
+    if ffmpeg -nostdin -v error -y -i "$dst" -i "$ART_EMBED" \
+         -map 0:a -map 1:v -c copy -disposition:v attached_pic \
+         -metadata:s:v "title=Album cover" -metadata:s:v "comment=Cover (front)" \
+         -f flac "$tmp" 2>>"$FFLOG"; then
+      mv -f "$tmp" "$dst" && done_n=$(( done_n + 1 ))
+    else
+      rm -f "$tmp"
+    fi
+  done
+  [ "$done_n" -gt 0 ] \
+    && note "$(printf '  %b·%b cover added to %d track%s' "$AMBER" "$OFF" \
+             "$done_n" "$( [ "$done_n" -eq 1 ] || printf s )")"
+  return 0
+}
+
+# Give a fetch that is still in flight a moment to land.
+#
+# Only ever waited for at the end, and only briefly: the sleeve is worth a few
+# seconds once the audio is safe, and it is not worth one second before that.
+cover_wait() {
+  local i
+  [ "$USE_ART" = 1 ] || return 0
+  [ -n "$DISC_COVER_FILE" ] || return 0
+  [ -s "$DISC_COVER_FILE" ] && return 0
+  # Fifteen, not five: the fetch itself takes about two seconds, but MusicBrainz
+  # rate-limits to roughly a request a second and the search retries when it is
+  # told so. On any rip long enough to matter the file is already there and this
+  # returns on the first test.
+  for i in $(seq 1 15); do
+    [ -s "$DISC_COVER_FILE" ] && return 0
+    [ -f "$DISC_COVER_FILE.none" ] && return 0
+    sleep 1
+  done
+  return 0
+}
+
+# One track, into the folder, with everything known about it attached.
+encode_track() {  # encode_track <trackno> <src> <dst>
+  local n=$1 src=$2 dst=$3 title artist
+  local -a META ART
+
+  title=${DISC_TITLE[$n]:-}
+  [ -n "$title" ] || printf -v title 'Track %02d' "$n"
+  artist=${DISC_ARTIST[$n]:-$DISC_ALBUM_ARTIST}
+
+  # Built rather than written out, because -metadata with an empty value writes
+  # an empty tag, and an empty ARTIST is not the same thing as no ARTIST: the
+  # first is a field the next tool along has to decide what to do about.
+  META=(-metadata "title=$title" -metadata "track=$n/$NTRACKS")
+  [ -n "$DISC_ALBUM" ]  && META+=(-metadata "album=$DISC_ALBUM")
+  [ -n "$artist" ]      && META+=(-metadata "artist=$artist")
+  # album_artist and nothing else. Setting albumartist as well does not add a
+  # synonym, it concatenates — ffmpeg merges the pair into "A;B" — and burncd,
+  # which reads either one, would take that two-headed thing and press it onto
+  # the disc as CD-Text.
+  [ -n "$DISC_ALBUM_ARTIST" ] && META+=(-metadata "album_artist=$DISC_ALBUM_ARTIST")
+  [ -n "$DISC_YEAR" ]   && META+=(-metadata "date=$DISC_YEAR")
+  [ "$DISC_TOTAL" -gt 1 ] && META+=(-metadata "disc=$DISC_NO/$DISC_TOTAL")
+  # Free, and it is what makes this folder identifiable as this pressing a year
+  # from now — including to ripper itself, when the second disc of the set turns
+  # up and has to find the first one's folder.
+  [ -n "$DISC_DISCID" ]     && META+=(-metadata "MUSICBRAINZ_DISCID=$DISC_DISCID")
+  [ -n "$DISC_MB_RELEASE" ] && META+=(-metadata "MUSICBRAINZ_ALBUMID=$DISC_MB_RELEASE")
+
+  ART=()
+  if [ -n "$ART_EMBED" ] && [ -s "$ART_EMBED" ]; then
+    ART=(-i "$ART_EMBED" -map 1:v -c:v copy -disposition:v attached_pic
+         -metadata:s:v "title=Album cover" -metadata:s:v "comment=Cover (front)")
+  fi
+
+  # No filters. What came off the disc is already 16-bit 44.1k stereo, so this is
+  # a container change and nothing else — deliberately unlike burncd, which
+  # dithers because its sources may be 24-bit and truncation would be audible. A
+  # resampler in this line would put noise on a copy that is otherwise exact.
+  # ${a[@]+"${a[@]}"} rather than "${a[@]}": bash 3.2 counts an empty array as an
+  # unset variable, and under set -u expanding one is a fatal error rather than
+  # the nothing it ought to be. A disc with no cover would otherwise take the
+  # whole rip down at the first track.
+  ffmpeg -nostdin -v error -y -i "$src" ${ART[@]+"${ART[@]}"} -map 0:a \
+    -c:a flac -compression_level "$FLAC_LEVEL" \
+    ${META[@]+"${META[@]}"} -f flac "$dst" 2>>"$FFLOG"
+}
+
+# Collect the encode that has been running behind the last rip.
+#
+# One deep, and no deeper. bash 3.2 has no `wait -n`, so a pool needs kill -0
+# polling and a parallel array of pids to track numbers — and the second unit of
+# parallelism buys nothing anyway, because the drive is the bottleneck and more
+# encoders would only contend for the I/O the rip is using.
+encode_reap() {
+  local rc=0 dst part
+  [ -n "$ENC_PID" ] || return 0
+  set +e
+  wait "$ENC_PID"
+  rc=$?
+  set -e
+  ENC_PID=''
+  part="$OUT/.ripper-$(printf '%02d' "$ENC_TRK").flac.part"
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$part"
+    die "ffmpeg failed encoding track $ENC_TRK
+$(tail -8 "$FFLOG" 2>/dev/null | sed 's/^/    /')"
+  fi
+  dst=${DEST[$ENC_TRK]}
+  # Same directory, so the rename is atomic: the folder holds either the whole
+  # track or no track, and never half of one.
+  mv -f "$part" "$dst" || die "cannot write $dst"
+  HAVE[$ENC_TRK]=1
+  note "$(printf '  %b✓%b %02d  %s%s' "$AMBER" "$OFF" "$ENC_TRK" \
+        "$(fit "${DISC_TITLE[$ENC_TRK]}" 34)" \
+        "$( [ -n "${ERRS[$ENC_TRK]:-}" ] && printf '  \033[33m%s\033[0m' "${ERRS[$ENC_TRK]}" )")"
+  ENC_TRK=0
+  return 0
+}
+
+# ------------------------------------------------------------------ editor --
+
+CUR=0
+UNDO=()
+
+plan_snapshot() {
+  local n s=''
+  s="$DISC_ALBUM	$DISC_ALBUM_ARTIST	$DISC_YEAR"
+  for n in "${ORDER[@]}"; do
+    s="$s"$'\n'"$n	${DISC_TITLE[$n]}	${DISC_ARTIST[$n]}	${SEL[$n]}"
+  done
+  printf '%s' "$s"
+}
+
+plan_push() { UNDO+=("$(plan_snapshot)"); return 0; }
+
+plan_restore() {  # plan_restore <snapshot>
+  local first=1 line n t a s
+  while IFS= read -r line; do
+    if [ "$first" -eq 1 ]; then
+      first=0
+      IFS=$'\t' read -r DISC_ALBUM DISC_ALBUM_ARTIST DISC_YEAR <<< "$line"
+      continue
+    fi
+    IFS=$'\t' read -r n t a s <<< "$line"
+    [ -n "$n" ] || continue
+    DISC_TITLE[$n]=$t; DISC_ARTIST[$n]=$a; SEL[$n]=$s
+  done <<< "$1"
+  plan_build
+  resume_scan
+  return 0
+}
+
+plan_undo() {
+  local n=${#UNDO[@]}
+  [ "$n" -gt 0 ] || return 1
+  plan_restore "${UNDO[$(( n - 1 ))]}"
+  unset "UNDO[$(( n - 1 ))]"
+  UNDO=(${UNDO[@]+"${UNDO[@]}"})
+  return 0
+}
+
+# One line of typing, in the middle of the panel.
+tui_rename() {  # tui_rename <prompt> <current> -> $RENAMED
+  # Two statements, not one: `local a=$1 s=$a` expands $a before local runs, so
+  # it reads whatever a meant outside this function — which under set -u is
+  # nothing at all, and the rename dies the moment anybody presses ⏎.
+  local prompt=$1 cur=${2:-}
+  local s=$cur
+  RENAMED=''
+  while :; do
+    stage "$STAGE_META" "$STAGE_BODY" \
+      "$(printf '  %b%s%b %s%b_%b' "$ETCH" "$prompt" "$OFF" "$s" "$INV" "$OFF")"
+    wait_key || return 1
+    case "$KEY" in
+      $'\n')   RENAMED=$s; return 0 ;;
+      $'\033') return 1 ;;
+      $'\177'|$'\b') s=${s%?} ;;
+      *) case "$KEY" in
+           [[:print:]]*) s="$s$KEY" ;;
+         esac ;;
+    esac
+  done
+}
+RENAMED=''
+
+plan_rows() {
+  local n i=0 out='' mark text row
+  out=$(printf '  %b%s%b\n' "$ETCH" "$(fit 'TRACK' 6)$(fit 'TITLE' 40)$(fit 'TIME' 8)" "$OFF")
+  for n in "${ORDER[@]}"; do
+    mark=' '
+    [ "${HAVE[$n]}" -eq 1 ] && mark='✓'
+    # The whole row as plain text first, and only then coloured. fit() counts
+    # columns, and an escape sequence wrapped round the text before it gets there
+    # is counted as though somebody could see it — which is how a row ends up
+    # padded to the wrong width and the TIME column stops lining up.
+    text=$(printf ' %s %02d  %s %s' "$mark" "$n" \
+           "$(fit "${DISC_TITLE[$n]}" 40)" "$(mmss "${DUR[$n]}")")
+    # Every row says whether it is in the rip, including the one under the
+    # cursor: pressing x on the selected track and seeing nothing change is the
+    # one thing this screen must not do.
+    [ "${SEL[$n]}" -eq 0 ] && text="$text  (skipped)"
+    if [ "$i" -eq "$CUR" ]; then
+      row=$(printf '%b%s%b' "$INV" "$text" "$OFF")
+    elif [ "${SEL[$n]}" -eq 0 ]; then
+      row=$(printf '%b%s%b' "$DIM" "$text" "$OFF")
+    else
+      row="$text"
+    fi
+    out="$out"$'\n'"  $row"
+    i=$(( i + 1 ))
+  done
+  printf '%s' "$out"
+}
+
+# The plan, as an editor.
+#
+# burncd's screen with two keys taken out of it. A CD's running order is a
+# physical fact, so there is no reorder and no split here: offering to change the
+# order before ripping is offering to write files whose numbers disagree with the
+# disc they came off.
+#
+# What it is for is the other thing. MusicBrainz picks *a* release, and when the
+# disc is a compilation it sometimes picks the wrong pressing — and this is where
+# that is cheap to notice, rather than after a folder has been named after
+# somebody else's record.
+tui_plan() {
+  local body foot done_n
+  while :; do
+    done_n=$(have_count)
+    body=$(printf '%s\n\n%s' "$(plan_fields)" "$(plan_rows)")
+    foot=$(keys '↑↓' 'track' '⏎' 'title' 'a' 'artist' 'x' 'skip' \
+                'u' 'undo' 'R' 're-rip' 'b' 'rip' 'q' 'quit')
+    stage "PLAN · $NTRACKS TRACKS · $(mmss "$(total_secs)")$( [ "$done_n" -gt 0 ] \
+          && printf ' · %d ALREADY RIPPED' "$done_n" )" "$body" "$foot"
+    wait_key || return 1
+    case "$KEY" in
+      UP|k)    [ "$CUR" -gt 0 ] && CUR=$(( CUR - 1 )) ;;
+      DOWN|j)  [ "$CUR" -lt $(( NTRACKS - 1 )) ] && CUR=$(( CUR + 1 )) ;;
+      $'\n')   plan_push
+               if tui_rename 'TITLE' "${DISC_TITLE[${ORDER[$CUR]}]}"; then
+                 DISC_TITLE[${ORDER[$CUR]}]="$RENAMED"; plan_build; resume_scan
+               fi ;;
+      a)       plan_push
+               if tui_rename 'ARTIST' "${DISC_ARTIST[${ORDER[$CUR]}]}"; then
+                 DISC_ARTIST[${ORDER[$CUR]}]="$RENAMED"
+               fi ;;
+      x)       plan_push
+               if [ "${SEL[${ORDER[$CUR]}]}" -eq 1 ]; then SEL[${ORDER[$CUR]}]=0
+               else SEL[${ORDER[$CUR]}]=1; fi ;;
+      u)       plan_undo || true ;;
+      R)       REDO=1 ;;
+      b)       return 0 ;;
+      q)       return 1 ;;
+    esac
+  done
+}
+
+# The same thing printed once, for -n and for a window too small to edit in.
+show_plan() {
+  local n
+  printf '\n  %s — %s%s\n' "${DISC_ALBUM:-—}" "${DISC_ALBUM_ARTIST:-—}" \
+    "$( [ -n "$DISC_YEAR" ] && printf ' (%s)' "$DISC_YEAR" )"
+  printf '  %d tracks, %s, titles from %s\n' "$NTRACKS" "$(mmss "$(total_secs)")" "${DISC_SOURCE:-?}"
+  [ "$DISC_TOTAL" -gt 1 ] && printf '  disc %d of %d\n' "$DISC_NO" "$DISC_TOTAL"
+  printf '  into %s\n\n' "$OUT"
+  for n in "${ORDER[@]}"; do
+    printf '   %s %02d. %-44s %s%s\n' \
+      "$( [ "${HAVE[$n]}" -eq 1 ] && printf '✓' || printf ' ' )" \
+      "$n" "$(fit "${DISC_TITLE[$n]}" 44)" "$(mmss "${DUR[$n]}")" \
+      "$( [ "${SEL[$n]}" -eq 0 ] && printf '   (skipped)' )"
+  done
+  printf '\n'
+  return 0
+}
+
+# ------------------------------------------------------------------- main --
+
+media_check
+pick_engine
+detect_dev || true
+
+term_size
+if [ "$DRY_RUN" -eq 0 ] && [ -t 0 ] && [ -t 1 ] \
+   && [ "$TERM_LINES" -ge "$TUI_MIN_LINES" ] && [ "$TERM_COLS" -ge $(( PANEL + 2 )) ]; then
+  screen_on || true
+  trap 'int_nl; cleanup; exit 130' INT
+fi
+
+read_disc
+disc_identity
+parse_tracks
+plan_build
+resume_scan
+# The bands are the disc's own tracks end to end, worked out once because they do
+# not change: only the head moves after this. It is the same picture player draws
+# for the same disc, which is the point — the record looks the same in the tool
+# that reads it as it does in the tool that plays it.
+DURLIST=()
+for n in "${ORDER[@]}"; do DURLIST+=("${DUR[$n]}"); done
+bands $(( STRIP_WIDTH * 8 )) "${DURLIST[@]}"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  show_plan
+  printf '  dry run — nothing was written\n\n'
+  exit 0
+fi
+
+if [ "$SCREEN" -eq 1 ]; then
+  tui_plan || { screen_off; printf '\n  nothing was written\n\n'; exit 0; }
+else
+  show_plan
+  if [ "$(todo_count)" -eq 0 ]; then
+    printf '  every track is already here. Nothing to do.\n\n'
+    exit 0
+  fi
+fi
+
+if [ "$(todo_count)" -eq 0 ]; then
+  screen_off
+  printf '\n  every track is already here. Nothing to do.\n\n'
+  exit 0
+fi
+
+mkdir -p "$OUT" || die "cannot make $OUT"
+scratch
+: > "$FFLOG"
+# Anything a previous run left half-written. It could never have been burned —
+# burncd globs *.flac and these are .part — but a folder with rubbish in it is
+# still a folder with rubbish in it.
+rm -f "$OUT"/.ripper-*.flac.part 2>/dev/null || true
+
+cover_place
+
+RIP_DONE_SECS=0
+for n in "${ORDER[@]}"; do
+  [ "${SEL[$n]}" -eq 1 ] || continue
+  if [ "${HAVE[$n]}" -eq 1 ] && [ "$REDO" -eq 0 ]; then
+    RIP_DONE_SECS=$(( RIP_DONE_SECS + DUR[n] ))
+    continue
+  fi
+
+  if ! rip_track "$n"; then
+    FAILED+=("$n")
+    note "$(printf '  \033[31m✗\033[0m %02d  %s — %s' "$n" \
+          "$(fit "${DISC_TITLE[$n]}" 30)" "${ERRS[$n]:-failed}")"
+    RIP_DONE_SECS=$(( RIP_DONE_SECS + DUR[n] ))
+    continue
+  fi
+
+  # The previous track's encode, collected before this one's is started: one
+  # outstanding at a time is all bash 3.2 can attribute a failure to correctly.
+  encode_reap
+
+  # The sleeve may only have landed while track one was being read.
+  [ -z "$ART_EMBED" ] && cover_place
+
+  encode_track "$n" "$RIP_SRC" "$OUT/.ripper-$(printf '%02d' "$n").flac.part" &
+  ENC_PID=$!
+  ENC_TRK=$n
+  RIP_DONE_SECS=$(( RIP_DONE_SECS + DUR[n] ))
+done
+encode_reap
+
+# The audio is safe now, so the sleeve is worth a few seconds of waiting for.
+cover_wait
+cover_place
+cover_backfill
+
+# Scratch WAVs are the biggest thing here and there is no reason to hold them
+# once the FLACs exist.
+[ -n "$WORK" ] && rm -f "$WORK"/track-*.wav 2>/dev/null || true
+
+screen_off
+
+printf '\n  %s — %s\n' "${DISC_ALBUM:-—}" "${DISC_ALBUM_ARTIST:-—}"
+printf '  %s\n' "$OUT"
+if [ -f "$OUT/cover.jpg" ]; then
+  printf '  cover.jpg beside the tracks\n'
+fi
+n=$(have_count)
+printf '  %d of %d tracks\n' "$n" "$NTRACKS"
+for n in "${ORDER[@]}"; do
+  [ -n "${ERRS[$n]:-}" ] || continue
+  printf '   ! %02d  %s — %s\n' "$n" "${DISC_TITLE[$n]}" "${ERRS[$n]}"
+done
+
+if [ "$DO_EJECT" = 1 ] && [ "${#FAILED[@]}" -eq 0 ]; then
+  command -v drutil >/dev/null && (drutil eject >/dev/null 2>&1 || true)
+fi
+
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  printf '\n  %d track%s did not come off:' "${#FAILED[@]}" \
+    "$( [ "${#FAILED[@]}" -eq 1 ] || printf s )"
+  for n in "${FAILED[@]}"; do printf ' %02d' "$n"; done
+  printf '\n  ripper --tracks %s\n\n' "$(IFS=,; printf '%s' "${FAILED[*]}")"
+  exit 1
+fi
+printf '\n  burncd %s\n\n' "$(printf '%q' "$OUT")"
+exit 0

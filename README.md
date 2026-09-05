@@ -135,7 +135,7 @@ See also [`data/`](data/README.md) and [`vendor/`](vendor/README.md).
 
 ## Also in this repo
 
-Five tools, none part of the site — the rest of the hobby, in order:
+Six tools, none part of the site — the rest of the hobby, in order:
 
 - **[bandcamp-wishlist](scripts/bandcamp-wishlist/README.md)** — bookmarklet
   that prices a Bandcamp wishlist, cheapest first.
@@ -145,12 +145,17 @@ Five tools, none part of the site — the rest of the hobby, in order:
   to CD-R. Gapless, CD-Text, track order from tags.
 - **[player](scripts/player/README.md)** — `player album.zip` plays a zip,
   folder, or the disc in the drive. burncd's twin.
+- **[ripper](scripts/ripper/README.md)** — `ripper` reads the disc in the drive
+  into a folder of tagged FLAC. The third side of burncd and player.
 - **[aiff2flac](scripts/aiff2flac/README.md)** — `aiff2flac` repacks the AIFF
   zips in `~/Downloads` as FLAC. Half the bytes, same audio.
 
-burncd and player draw the same panel out of the same
-[`scripts/lib/panel.sh`](scripts/lib/panel.sh), so neither is a single file you
-can copy off on its own.
+burncd, player and ripper draw the same panel out of the same
+[`scripts/lib/panel.sh`](scripts/lib/panel.sh), and ripper and player ask the
+same [`scripts/lib/disc.sh`](scripts/lib/disc.sh) what album is in the drive — so
+none of the three is a single file you can copy off on its own. Between them they
+go round: ripper reads a disc to a folder, burncd writes a folder to a disc, and
+player plays either.
 
 [PapaParse]: https://www.papaparse.com/
 [MusicBrainz]: https://musicbrainz.org/
