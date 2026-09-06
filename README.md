@@ -7,12 +7,12 @@ no build step — it reads a published Google Sheet at load time and renders a
 grid of album covers with search, filters, sorting and shuffle. Installs as an
 app and works offline, which is the point: it's most useful in a record shop.
 
-| Page | What it's for |
-|------|---------------|
-| `index.html` | The collection — grid or list, search and filters. |
+| Page            | What it's for                                                               |
+| --------------- | --------------------------------------------------------------------------- |
+| `index.html`    | The collection — grid or list, search and filters.                          |
 | `wishlist.html` | Records not on the shelf yet, plus a shop check for whether one already is. |
-| `stats.html` | Breakdowns by decade, genre, artist and shelf. |
-| `labels.html` | Printable jewel-case inserts. The one page that doesn't read the sheet. |
+| `stats.html`    | Breakdowns by decade, genre, artist and shelf.                              |
+| `labels.html`   | Printable jewel-case inserts. The one page that doesn't read the sheet.     |
 
 ## Editing the collection
 
@@ -23,35 +23,35 @@ app and works offline, which is the point: it's most useful in a record shop.
 Row per disc. Keep the header row — those names are what the site reads. Tab 2
 is the wishlist. Every column is optional; blanks fall back.
 
-| Column | Notes |
-|--------|-------|
-| `Book` | Which binder (1, 2, 3…). |
-| `Number` | Slot **within that book**. Both blank → "Uncataloged." |
-| `Artist` | Blank → "Various Artists." |
-| `Title` | Blank → "Self-Titled" (wishlist: "Any release"). |
-| `Year` | |
-| `Parent Genre` | Drives Genre pills. Blank → "Uncategorized." |
-| `Tags` | Comma-separated in one cell: `essential, moody`. |
-| `Art URL` | Direct image URL. Always wins over lookup. |
-| `Notes` | Shown in the detail view. |
-| `Barcode` | UPC/EAN. Pins art + tracklist to that exact pressing, and is searchable. |
+| Column         | Notes                                                                    |
+| -------------- | ------------------------------------------------------------------------ |
+| `Book`         | Which binder (1, 2, 3…).                                                 |
+| `Number`       | Slot **within that book**. Both blank → "Uncataloged."                   |
+| `Artist`       | Blank → "Various Artists."                                               |
+| `Title`        | Blank → "Self-Titled" (wishlist: "Any release").                         |
+| `Year`         |                                                                          |
+| `Parent Genre` | Drives Genre pills. Blank → "Uncategorized."                             |
+| `Tags`         | Comma-separated in one cell: `essential, moody`.                         |
+| `Art URL`      | Direct image URL. Always wins over lookup.                               |
+| `Notes`        | Shown in the detail view.                                                |
+| `Barcode`      | UPC/EAN. Pins art + tracklist to that exact pressing, and is searchable. |
 
 Renaming a column means editing the sheet header **and** `CONFIG.COLUMNS` in
 [js/collection.js](js/collection.js).
 
-**Barcodes:** format the column as plain text *before* typing any in (Format →
+**Barcodes:** format the column as plain text _before_ typing any in (Format →
 Number → Plain text). Otherwise the sheet eats the leading zero and past twelve
 digits rewrites it as `7.5678E+11`, and the digits are gone for good. A wrong or
 missing barcode is harmless — the disc just falls back to artist + title search.
 
 **Multi-disc sets** stay one card. Put the span in the one `Number` cell:
 
-| Write | Shows |
-|-------|-------|
-| `42` | `#42` |
-| `42-43` | `#42–43` |
-| `42, 43, 44` | `#42–44` |
-| `24, 26` | `#24, 26` |
+| Write        | Shows     |
+| ------------ | --------- |
+| `42`         | `#42`     |
+| `42-43`      | `#42–43`  |
+| `42, 43, 44` | `#42–44`  |
+| `24, 26`     | `#24, 26` |
 
 ## How it works
 
@@ -106,11 +106,11 @@ otherwise ship and white-screen the page.
 
 Not build steps — nothing runs them for you, and their output must be committed.
 
-| Script | When |
-|--------|------|
-| `node scripts/snapshot.js` | Sheet changed enough that an offline visitor would notice. Writes every tab in `CONFIG.SOURCES`; add a name for just one. |
-| `node scripts/make-icons.js` | Palette changed. |
-| `node scripts/check-shell-assets.js` | Added a module or asset. Same check CI runs. |
+| Script                               | When                                                                                                                      |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `node scripts/snapshot.js`           | Sheet changed enough that an offline visitor would notice. Writes every tab in `CONFIG.SOURCES`; add a name for just one. |
+| `node scripts/make-icons.js`         | Palette changed.                                                                                                          |
+| `node scripts/check-shell-assets.js` | Added a module or asset. Same check CI runs.                                                                              |
 
 ### Code
 
@@ -119,14 +119,14 @@ acyclic** — a cycle breaks at load time as `Cannot access 'x' before
 initialization`, not at build time, because there is no build. Fix by turning an
 edge around, never by working around it.
 
-| Layer | Modules |
-|-------|---------|
-| Entry points | `app.js` (index + wishlist), `stats.js`, `labels.js` |
-| Data | `collection.js`, `musicbrainz.js`, `art.js`, `owned.js` |
-| State | `store.js`, `state.js`, `url.js`, `discs.js` (pure) |
-| View | `render.js`, `controls.js`, `detail.js`, `cover.js`, `color.js`, `dom.js` |
-| Wishlist | `shop.js` |
-| Shared | `util.js`, `config.js`, `errors.js`, `labelDraft.js` |
+| Layer        | Modules                                                                   |
+| ------------ | ------------------------------------------------------------------------- |
+| Entry points | `app.js` (index + wishlist), `stats.js`, `labels.js`                      |
+| Data         | `collection.js`, `musicbrainz.js`, `art.js`, `owned.js`                   |
+| State        | `store.js`, `state.js`, `url.js`, `discs.js` (pure)                       |
+| View         | `render.js`, `controls.js`, `detail.js`, `cover.js`, `color.js`, `dom.js` |
+| Wishlist     | `shop.js`                                                                 |
+| Shared       | `util.js`, `config.js`, `errors.js`, `labelDraft.js`                      |
 
 `styles.css` covers every page; `labels.css` is separate because the printed
 label is measured in inches and `@page` rules can't be scoped.
@@ -160,3 +160,5 @@ player plays either.
 [PapaParse]: https://www.papaparse.com/
 [MusicBrainz]: https://musicbrainz.org/
 [Cover Art Archive]: https://coverartarchive.org/
+
+`wget -r -np -nH --cut-dirs=1 -R "index.html*" https://example.com/some-directory/`
